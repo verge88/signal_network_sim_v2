@@ -1,0 +1,11 @@
+# Core scientific and GUI dependencies
+numpy
+pandas
+scipy
+networkx
+scikit-learn
+matplotlib
+openpyxl
+tabulate
+# Required by Diameter and SIP training modules
+torch
