@@ -48,7 +48,8 @@ from ss7.validate_calibrated_detectors import (
 
 TARGET_FPR = 0.01
 CONTEXT_CONFIDENCE = 0.70
-MIN_CONTEXT_VALIDATION = 300
+MIN_CONTEXT_VALIDATION = 40
+CONTEXT_SHRINKAGE_PRIOR = 100.0
 
 CONTEXT_RF = {
     "n_estimators": 500,
@@ -201,10 +202,27 @@ def calibrate_context_thresholds(
     confidence: np.ndarray,
     target_fpr: float,
 ) -> Tuple[float, Dict[str, float], Dict[str, dict]]:
+    """Estimate suppression-only context thresholds from validation negatives.
+
+    The global threshold remains the q(1-FPR) operating point.  Context samples
+    are too small for reliable per-context q99 estimates, so we estimate only a
+    location shift in the *median* INV score and shrink it toward zero:
+        lift = max(0, median_context - median_reference) * n/(n + prior).
+    A context can therefore only raise the global threshold, never lower it.
+    """
     neg = va["label"].to_numpy(int) == 0
     global_thr = fpr_threshold(inv_scores[neg], target_fpr)
     thresholds: Dict[str, float] = {}
     diagnostics: Dict[str, dict] = {}
+
+    ref_mask = (
+        neg
+        & (predicted_context == "background")
+        & (confidence >= CONTEXT_CONFIDENCE)
+    )
+    if int(ref_mask.sum()) < MIN_CONTEXT_VALIDATION:
+        ref_mask = neg
+    reference_median = float(np.median(inv_scores[ref_mask]))
 
     for context in sorted(set(predicted_context[neg])):
         eligible = (
@@ -219,20 +237,25 @@ def calibrate_context_thresholds(
                 "validation_rows": n,
                 "specific_threshold_used": False,
                 "threshold": float(global_thr),
+                "reference_median": reference_median,
             }
             continue
 
-        raw = fpr_threshold(inv_scores[eligible], target_fpr)
-        # Gating is suppression-only: known benign context may never lower the
-        # attack threshold below the globally calibrated operating point.
-        threshold = max(float(global_thr), float(raw))
+        context_median = float(np.median(inv_scores[eligible]))
+        raw_shift = max(0.0, context_median - reference_median)
+        shrinkage = float(n / (n + CONTEXT_SHRINKAGE_PRIOR))
+        lift = raw_shift * shrinkage
+        threshold = float(global_thr + lift)
         thresholds[context] = threshold
         diagnostics[context] = {
             "validation_rows": n,
-            "specific_threshold_used": bool(threshold > global_thr),
-            "raw_context_threshold": float(raw),
+            "specific_threshold_used": bool(lift > 0.0),
+            "reference_median": reference_median,
+            "context_median": context_median,
+            "raw_median_shift": raw_shift,
+            "shrinkage_factor": shrinkage,
             "threshold": threshold,
-            "threshold_lift": float(threshold - global_thr),
+            "threshold_lift": lift,
         }
 
     return float(global_thr), thresholds, diagnostics
@@ -557,9 +580,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             "global_target_fpr": TARGET_FPR,
             "context_confidence": CONTEXT_CONFIDENCE,
             "min_context_validation_rows": MIN_CONTEXT_VALIDATION,
+            "context_shrinkage_prior_rows": CONTEXT_SHRINKAGE_PRIOR,
             "context_threshold_rule": (
-                "context threshold = max(global threshold, context q99); "
-                "low-confidence/unknown -> global threshold"
+                "context threshold = global q99 + positive shrunk median "
+                "INV-score shift; low-confidence/unknown -> global threshold"
             ),
             "test_used_for_tuning": False,
         },
