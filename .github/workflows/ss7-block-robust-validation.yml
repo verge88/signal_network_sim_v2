@@ -1,0 +1,50 @@
+name: SS7 block-robust INV validation
+
+on:
+  push:
+    branches:
+      - ss7-final-validation-20261124
+    paths:
+      - ".github/workflows/ss7-block-robust-validation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-block-robust-inv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install scientific dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn joblib
+
+      - name: Validate block-robust INV threshold
+        run: |
+          set -o pipefail
+          mkdir -p results/ss7_block_robust_validation
+          python -m ss7.validate_block_robust_inv \
+            --seeds 6201 6202 6203 6204 6205 \
+            --days 1.25 \
+            --output-dir results/ss7_block_robust_validation \
+            2>&1 | tee results/ss7_block_robust_validation/validation.log
+
+      - name: Upload block-robust artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss7-block-robust-validation
+          path: results/ss7_block_robust_validation/
+          if-no-files-found: warn
+          retention-days: 30
