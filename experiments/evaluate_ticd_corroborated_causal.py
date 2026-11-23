@@ -107,8 +107,7 @@ def main():
                for name in models}
     selected=max(models,key=lambda k:(utilities[k],-list(models).index(k)))
     print("CORROBORATION_SELECTED",json.dumps({
-        "selected":selected,"utilities":utilities,"threshold":thresholds[selected]},
-        flush=True)
+        "selected":selected,"utilities":utilities,"threshold":thresholds[selected]},ensure_ascii=False),flush=True)
 
     final={};per_seed={}
     for kind,seeds in TEST.items():
