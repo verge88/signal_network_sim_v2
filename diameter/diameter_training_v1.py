@@ -82,8 +82,8 @@ class TrainingConfig:
     # Unsupervised models
     iso_forest_trees: int = 500
     iso_forest_contamination: float = 0.05  # retained for experiment metadata
-    iso_forest_max_features: float = 0.75
-    iso_forest_bootstrap: bool = True
+    iso_forest_max_features: float = 1.0
+    iso_forest_bootstrap: bool = False
     iso_forest_clip_lower_q: float = 0.001
     iso_forest_clip_upper_q: float = 0.999
     ocsvm_nu: float = 0.05
@@ -1056,8 +1056,7 @@ def main():
     )
     iso_result["robustness_method"] = (
         "benign-train-only 0.1/99.9% winsorization + "
-        "feature-subsampled bootstrap IsolationForest + "
-        "benign-validation percentile threshold"
+        "full-feature IsolationForest + benign-validation percentile threshold"
     )
     results_list.append(iso_result)
 
