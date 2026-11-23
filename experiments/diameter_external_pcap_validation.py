@@ -429,8 +429,8 @@ def evaluate_full_feature_isolation_forest(
     robust = IsolationForest(
         n_estimators=500,
         contamination="auto",
-        max_features=0.75,
-        bootstrap=True,
+        max_features=1.0,
+        bootstrap=False,
         random_state=seed,
         n_jobs=-1,
     ).fit(winsor(normal_train))
