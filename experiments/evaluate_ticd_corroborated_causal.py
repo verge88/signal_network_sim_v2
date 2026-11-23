@@ -96,7 +96,7 @@ def main():
         nominal_fprs[name]={"fpr":f,"p99":q}
     print("CORROBORATION_NORMAL_REFERENCE",json.dumps({
         "thresholds":thresholds,
-        "fpr_by_loss":{k:v["fpr"] for k,v in nominal_fprs.items()}},flush=True)
+        "fpr_by_loss":{k:v["fpr"] for k,v in nominal_fprs.items()}},ensure_ascii=False),flush=True)
 
     dev={}
     for kind,seeds in DEV.items():
