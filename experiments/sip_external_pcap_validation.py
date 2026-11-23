@@ -25,7 +25,7 @@ def decode(path):
         temp = Path(td) / ("capture" + path.suffix)
         shutil.copyfile(path, temp)
         command = ["tshark", "-r", str(temp), "-Y", "sip", "-T", "fields",
-                   "-E", "occurrence=f", "-E", "separator=\t"]
+                   "-E", "occurrence=f", "-E", "separator=/t"]
         for field in FIELDS:
             command += ["-e", field]
         p = subprocess.run(command, text=True, capture_output=True, check=True)
