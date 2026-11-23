@@ -1,23 +1,20 @@
 """External validity check for the canonical SS7 model on independent real telecom data.
 
-This module intentionally does NOT claim that Telecom Italia CDRs are packet-level SS7
-traces or that they contain attack labels.  It uses the public, non-synthetic Milan CDR
-dataset only for the subset of SS7 observables that can be reconstructed without
-inventing packet-level events.  The check therefore measures synthetic-to-real
-distribution shift and real-data rejection/false-alarm propensity of an unsupervised
-detector.  Attack recall cannot be estimated from this dataset.
+The real-data side uses the public Hugging Face mirror of the Telecom Italia Milan
+CDR dataset.  These are measured, non-synthetic network activity records.  The mirror
+is already aggregated by grid square and time, so this check uses only SS7 own-report
+features that can be reconstructed from observed SMS/call activity without inventing
+DPCs, TCAP state, transit traffic, cross-node invariants, integrity failures, or attack
+labels.
 
-Source:
-  Telecom Italia (2015), Telecommunications - SMS, Call, Internet - MI
-  Harvard Dataverse, DOI 10.7910/DVN/EGZHFV.
+This is therefore an external normal-traffic transfer / rejection-rate test.  It does
+NOT estimate attack recall, precision, or AUC on real attacks.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import math
-import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 from urllib.request import Request, urlopen
@@ -32,100 +29,71 @@ from sklearn.preprocessing import StandardScaler
 from ss7.fix import SimConfig, build_dataset
 
 
-DATASET_DOI = "doi:10.7910/DVN/EGZHFV"
-DATAVERSE = "https://dataverse.harvard.edu"
-RAW_COLUMNS = [
-    "cell_id", "timestamp_ms", "country_code",
-    "sms_in", "sms_out", "call_in", "call_out", "internet",
-]
+ORIGINAL_DATASET_DOI = "10.7910/DVN/EGZHFV"
+MIRROR_REPO = "GreatLove/CellularTrafficPrediction"
+MIRROR_REVISION = "main"
+MIRROR_FILE_SHA256 = {
+    "2013-11-01": "eeaf3352af1bb076ba05fe20cfd964bfd9a55b3a1ce82019e6502714ef2b8fa9",
+}
 
-# These are the canonical SS7 own-report features for which the CDR release has a
-# defensible external proxy.  transit_share, dlg_closure_ratio and all cross-node
-# invariants are deliberately excluded because CDRs do not observe them.
+# The mirror exposes one row per grid square/time with these measured fields:
+# datetime, squareid, sms-in, sms-out, call-in, call-out, internet.
+# Only features defensibly derivable from SMS/call activity are evaluated.
 FULL_PROXY_FEATURES = [
     "total_messages",
     "mtype_entropy",
-    "dest_entropy",
-    "n_unique_dest",
-    "dest_top1_ratio",
-    "dest_top2_ratio",
     "map_share",
     "isup_share",
     "in_out_ratio",
 ]
 RATIO_PROXY_FEATURES = [
     "mtype_entropy",
-    "dest_entropy",
-    "dest_top1_ratio",
-    "dest_top2_ratio",
     "map_share",
     "isup_share",
     "in_out_ratio",
 ]
 
 
-def _get_json(url: str) -> dict:
-    req = Request(url, headers={"User-Agent": "signal-network-sim-v2-external-validation/1.0"})
-    with urlopen(req, timeout=60) as r:
-        return json.load(r)
-
-
-def dataverse_file_id(filename: str) -> int:
-    url = (
-        f"{DATAVERSE}/api/datasets/:persistentId/"
-        f"?persistentId={DATASET_DOI.replace('/', '%2F').replace(':', '%3A')}"
+def mirror_url(date: str) -> str:
+    return (
+        "https://huggingface.co/datasets/"
+        f"{MIRROR_REPO}/resolve/{MIRROR_REVISION}/"
+        f"sms-call-internet-mi/{date}.csv"
     )
-    meta = _get_json(url)
-    files = meta["data"]["latestVersion"]["files"]
-    for item in files:
-        df = item.get("dataFile", {})
-        if df.get("filename") == filename or df.get("label") == filename:
-            return int(df["id"])
-    available = sorted(
-        (x.get("dataFile", {}).get("filename") or x.get("dataFile", {}).get("label") or "")
-        for x in files
-    )
-    raise RuntimeError(f"Dataverse file {filename!r} not found; first entries={available[:5]}")
 
 
-def download_prefix(file_id: int, dst: Path, max_bytes: int) -> Tuple[int, str]:
-    """Download at most max_bytes from the real Dataverse file and trim partial line.
+def download_prefix(url: str, dst: Path, max_bytes: int) -> Tuple[int, str]:
+    """Download at most max_bytes and trim the final partial CSV line.
 
-    A byte prefix is used so CI does not need to transfer a 300+ MB daily file.
-    Harvard Dataverse rejects Range requests for this endpoint, so the client opens
-    the normal stream and stops reading after max_bytes.  No rows are generated or
-    altered; only the final incomplete line is discarded.
+    The client stops the stream after max_bytes.  No rows are generated or modified;
+    only a possibly incomplete final record is discarded.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
-    url = f"{DATAVERSE}/api/access/datafile/{file_id}"
     req = Request(
         url,
         headers={"User-Agent": "signal-network-sim-v2-external-validation/1.0"},
     )
     remaining = int(max_bytes)
     h = hashlib.sha256()
-    written = 0
-    with urlopen(req, timeout=120) as r, dst.open("wb") as out:
+    with urlopen(req, timeout=120) as response, dst.open("wb") as out:
         while remaining > 0:
-            chunk = r.read(min(1024 * 1024, remaining))
+            chunk = response.read(min(1024 * 1024, remaining))
             if not chunk:
                 break
             out.write(chunk)
             h.update(chunk)
-            written += len(chunk)
             remaining -= len(chunk)
 
-    # Ensure pandas never sees a truncated final record.
     with dst.open("rb+") as f:
         data = f.read()
         end = data.rfind(b"\n")
         if end <= 0:
-            raise RuntimeError("Downloaded prefix contains no complete CDR rows")
+            raise RuntimeError("Downloaded mirror prefix contains no complete CSV rows")
         f.seek(0)
         f.write(data[: end + 1])
         f.truncate()
-    trimmed = dst.stat().st_size
-    return trimmed, h.hexdigest()
+
+    return int(dst.stat().st_size), h.hexdigest()
 
 
 def _shannon_rows(parts: np.ndarray) -> np.ndarray:
@@ -141,99 +109,108 @@ def _shannon_rows(parts: np.ndarray) -> np.ndarray:
     return terms.sum(axis=1)
 
 
-def load_real_cdr_features(path: Path, max_windows: int, seed: int) -> Tuple[pd.DataFrame, dict]:
-    usecols = RAW_COLUMNS[:7]
-    dtypes = {
-        "cell_id": "Int32",
-        "timestamp_ms": "Int64",
-        "country_code": "Float64",
-        "sms_in": "float64",
-        "sms_out": "float64",
-        "call_in": "float64",
-        "call_out": "float64",
+def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
+    aliases = {
+        "datetime": "datetime",
+        "date": "datetime",
+        "time": "datetime",
+        "squareid": "cell_id",
+        "square_id": "cell_id",
+        "cellid": "cell_id",
+        "cell_id": "cell_id",
+        "sms-in": "sms_in",
+        "sms_in": "sms_in",
+        "smsin": "sms_in",
+        "sms-out": "sms_out",
+        "sms_out": "sms_out",
+        "smsout": "sms_out",
+        "call-in": "call_in",
+        "call_in": "call_in",
+        "callin": "call_in",
+        "call-out": "call_out",
+        "call_out": "call_out",
+        "callout": "call_out",
+        "internet": "internet",
     }
-    raw = pd.read_csv(
-        path,
-        sep="\t",
-        names=RAW_COLUMNS,
-        usecols=usecols,
-        dtype=dtypes,
-        header=None,
-        on_bad_lines="skip",
-        low_memory=False,
-    )
-    raw = raw.dropna(subset=["cell_id", "timestamp_ms"]).copy()
+    rename = {}
+    for c in df.columns:
+        key = str(c).strip().lower()
+        if key in aliases:
+            rename[c] = aliases[key]
+    out = df.rename(columns=rename)
+    required = {"datetime", "cell_id", "sms_in", "sms_out", "call_in", "call_out"}
+    missing = sorted(required - set(out.columns))
+    if missing:
+        raise RuntimeError(
+            f"Unexpected mirror schema; missing {missing}; columns={list(df.columns)}"
+        )
+    return out
+
+
+def load_real_cdr_features(
+    path: Path, max_windows: int, seed: int
+) -> Tuple[pd.DataFrame, dict]:
+    raw = _normalise_columns(pd.read_csv(path, low_memory=False))
+    raw = raw[["datetime", "cell_id", "sms_in", "sms_out", "call_in", "call_out"]].copy()
+
     activity_cols = ["sms_in", "sms_out", "call_in", "call_out"]
-    raw[activity_cols] = raw[activity_cols].fillna(0.0).clip(lower=0.0)
-    raw["country_code"] = raw["country_code"].fillna(-1.0)
-    raw["dest_weight"] = raw[activity_cols].sum(axis=1)
+    for c in activity_cols:
+        raw[c] = pd.to_numeric(raw[c], errors="coerce").fillna(0.0).clip(lower=0.0)
+    raw["cell_id"] = pd.to_numeric(raw["cell_id"], errors="coerce")
+    raw = raw.dropna(subset=["cell_id", "datetime"]).copy()
+    raw["cell_id"] = raw["cell_id"].astype("int64")
 
-    keys = ["cell_id", "timestamp_ms"]
-    agg = raw.groupby(keys, sort=False)[activity_cols].sum()
+    sms_in = raw["sms_in"].to_numpy(float)
+    sms_out = raw["sms_out"].to_numpy(float)
+    call_in = raw["call_in"].to_numpy(float)
+    call_out = raw["call_out"].to_numpy(float)
+    call_total = call_in + call_out
 
-    # Country code is NOT an SS7 DPC.  It is used only as an independently observed
-    # destination-diversity proxy, and this limitation is carried into the report.
-    dest = (
-        raw.groupby(keys + ["country_code"], sort=False)["dest_weight"]
-        .sum()
-        .reset_index()
-    )
-    dest = dest[dest["dest_weight"] > 0].copy()
-    if dest.empty:
-        raise RuntimeError("No positive call/SMS activity in downloaded CDR prefix")
-    dest["dest_total"] = dest.groupby(keys)["dest_weight"].transform("sum")
-    dest["p"] = dest["dest_weight"] / dest["dest_total"]
-    dest["entropy_term"] = -dest["p"] * np.log2(dest["p"])
-    dest["rank"] = dest.groupby(keys)["dest_weight"].rank(method="first", ascending=False)
-
-    dest_metrics = pd.DataFrame({
-        "dest_entropy": dest.groupby(keys)["entropy_term"].sum(),
-        "n_unique_dest": dest.groupby(keys).size().astype(float),
-        "dest_top1_ratio": dest.loc[dest["rank"] == 1].set_index(keys)["p"],
-        "dest_top2_ratio": dest.loc[dest["rank"] <= 2].groupby(keys)["p"].sum(),
-    })
-
-    out = agg.join(dest_metrics, how="inner").reset_index()
-    call_total = (out["call_in"] + out["call_out"]).to_numpy(float)
-    sms_in = out["sms_in"].to_numpy(float)
-    sms_out = out["sms_out"].to_numpy(float)
-
-    # CDR activity values are anonymised activity measures, not literal MSU counts.
-    # We therefore construct "signalling-equivalent units" only to preserve the
-    # canonical service template proportions: ISUP call = 5 message types,
-    # MO-SMS = 1 MAP operation, MT-SMS = 2 MAP operations.
+    # Signalling-equivalent units preserve the canonical service templates only:
+    # one call contributes five ISUP message-type units; an outgoing SMS one MAP
+    # operation; an incoming SMS two MAP operations.  Telecom Italia activity values
+    # remain anonymised activity measures, not literal MSU/message counts.
     parts = np.column_stack([
-        call_total, call_total, call_total, call_total, call_total,
-        sms_out, sms_in, sms_in,
+        call_total,
+        call_total,
+        call_total,
+        call_total,
+        call_total,
+        sms_out,
+        sms_in,
+        sms_in,
     ])
     total = parts.sum(axis=1)
-    out["total_messages"] = total
-    out["mtype_entropy"] = _shannon_rows(parts)
     map_units = sms_out + 2.0 * sms_in
     isup_units = 5.0 * call_total
-    denom = np.maximum(total, 1.0)
-    out["map_share"] = map_units / denom
-    out["isup_share"] = isup_units / denom
-    incoming = 5.0 * out["call_in"].to_numpy(float) + 2.0 * sms_in
-    outgoing = 5.0 * out["call_out"].to_numpy(float) + sms_out
-    out["in_out_ratio"] = incoming / np.maximum(outgoing, 1.0)
+    denom = np.maximum(total, 1e-12)
 
-    out = out.replace([np.inf, -np.inf], np.nan)
-    out = out.dropna(subset=FULL_PROXY_FEATURES)
+    out = pd.DataFrame({
+        "cell_id": raw["cell_id"].to_numpy(),
+        "datetime": raw["datetime"].astype(str).to_numpy(),
+        "total_messages": total,
+        "mtype_entropy": _shannon_rows(parts),
+        "map_share": map_units / denom,
+        "isup_share": isup_units / denom,
+        "in_out_ratio": (
+            5.0 * call_in + 2.0 * sms_in
+        ) / np.maximum(5.0 * call_out + sms_out, 1e-12),
+    })
+
+    out = out.replace([np.inf, -np.inf], np.nan).dropna(subset=FULL_PROXY_FEATURES)
     out = out[out["total_messages"] > 0].copy()
     if len(out) < 100:
         raise RuntimeError(f"Only {len(out)} usable real CDR windows; need at least 100")
 
     if len(out) > max_windows:
-        out = out.sample(n=max_windows, random_state=seed).sort_values(keys)
+        out = out.sample(n=max_windows, random_state=seed)
 
     meta = {
-        "raw_rows": int(len(raw)),
+        "raw_rows_in_prefix": int(len(raw)),
         "usable_windows": int(len(out)),
         "unique_cells": int(out["cell_id"].nunique()),
-        "unique_intervals": int(out["timestamp_ms"].nunique()),
-        "timestamp_min_ms": int(out["timestamp_ms"].min()),
-        "timestamp_max_ms": int(out["timestamp_ms"].max()),
+        "timestamp_min": str(out["datetime"].min()),
+        "timestamp_max": str(out["datetime"].max()),
     }
     return out, meta
 
@@ -251,21 +228,23 @@ def synthetic_normal(seed: int, days: float) -> pd.DataFrame:
     return out
 
 
-def time_split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def time_split(
+    df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     ts = np.sort(df["t"].unique())
     if len(ts) < 10:
         raise RuntimeError("Synthetic sample has too few time intervals")
-    a = ts[max(1, int(len(ts) * 0.60)) - 1]
-    b = ts[max(2, int(len(ts) * 0.80)) - 1]
-    tr = df[df["t"] <= a]
-    va = df[(df["t"] > a) & (df["t"] <= b)]
-    te = df[df["t"] > b]
+    cut1 = ts[max(1, int(len(ts) * 0.60)) - 1]
+    cut2 = ts[max(2, int(len(ts) * 0.80)) - 1]
+    tr = df[df["t"] <= cut1]
+    va = df[(df["t"] > cut1) & (df["t"] <= cut2)]
+    te = df[df["t"] > cut2]
     if min(len(tr), len(va), len(te)) < 100:
         raise RuntimeError("Synthetic temporal split is too small")
     return tr, va, te
 
 
-def _feature_shift(
+def feature_shift(
     train: pd.DataFrame,
     real: pd.DataFrame,
     cols: List[str],
@@ -280,12 +259,11 @@ def _feature_shift(
         r = rx[:, j]
         ks = ks_2samp(s, r, alternative="two-sided", mode="auto")
         lo, hi = np.quantile(s, [0.005, 0.995])
-        coverage = float(np.mean((r >= lo) & (r <= hi)))
         out[c] = {
             "ks_stat": float(ks.statistic),
             "ks_pvalue": float(ks.pvalue),
             "median_shift_sigma": float(abs(np.median(r) - np.median(s))),
-            "real_inside_synth_99pct": coverage,
+            "real_inside_synth_99pct": float(np.mean((r >= lo) & (r <= hi))),
         }
     return out
 
@@ -312,35 +290,31 @@ def validate_profile(
         random_state=seed,
         n_jobs=-1,
     ).fit(xtr)
-    sva = -model.score_samples(xva)
-    ste = -model.score_samples(xte)
-    sreal = -model.score_samples(xreal)
-    threshold = float(np.quantile(sva, 1.0 - target_fpr))
-    synth_test_fpr = float(np.mean(ste > threshold))
-    real_rejection = float(np.mean(sreal > threshold))
 
-    shift = _feature_shift(tr, real, cols, imp, scaler)
+    score_val = -model.score_samples(xva)
+    score_test = -model.score_samples(xte)
+    score_real = -model.score_samples(xreal)
+    threshold = float(np.quantile(score_val, 1.0 - target_fpr))
+
+    synth_test_fpr = float(np.mean(score_test > threshold))
+    real_rejection = float(np.mean(score_real > threshold))
+    shift = feature_shift(tr, real, cols, imp, scaler)
+
     ks_values = np.array([v["ks_stat"] for v in shift.values()], dtype=float)
-    cover = np.array([v["real_inside_synth_99pct"] for v in shift.values()], dtype=float)
-    med_shift = np.array([v["median_shift_sigma"] for v in shift.values()], dtype=float)
+    coverage = np.array(
+        [v["real_inside_synth_99pct"] for v in shift.values()], dtype=float
+    )
+    med_shift = np.array(
+        [v["median_shift_sigma"] for v in shift.values()], dtype=float
+    )
 
-    # Diagnostic, not a theorem: it flags a clear external-validity problem when
-    # unlabeled real windows are rejected far above the calibration rate or when
-    # the common-feature distributions barely overlap.
     transfer_warning = bool(
         real_rejection > max(0.05, 5.0 * target_fpr)
         or float(np.median(ks_values)) > 0.50
-        or float(np.median(cover)) < 0.50
+        or float(np.median(coverage)) < 0.50
     )
-
     top_shift = sorted(
-        (
-            {
-                "feature": c,
-                **vals,
-            }
-            for c, vals in shift.items()
-        ),
+        ({"feature": c, **vals} for c, vals in shift.items()),
         key=lambda x: (x["ks_stat"], x["median_shift_sigma"]),
         reverse=True,
     )
@@ -352,10 +326,10 @@ def validate_profile(
         "synthetic_test_fpr": synth_test_fpr,
         "real_rejection_rate_unlabeled": real_rejection,
         "median_ks_stat": float(np.median(ks_values)),
-        "median_real_inside_synth_99pct": float(np.median(cover)),
+        "median_real_inside_synth_99pct": float(np.median(coverage)),
         "median_abs_shift_sigma": float(np.median(med_shift)),
         "transfer_warning": transfer_warning,
-        "top_feature_shift": top_shift[:5],
+        "top_feature_shift": top_shift,
     }
 
 
@@ -371,13 +345,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     ap.add_argument("--output", default="results/ss7_real_cdr_validation.json")
     args = ap.parse_args(list(argv) if argv is not None else None)
 
-    filename = f"sms-call-internet-mi-{args.date}.txt"
-    file_id = dataverse_file_id(filename)
+    url = mirror_url(args.date)
     cache = Path(args.cache_dir)
-    raw_path = cache / filename
-    downloaded, sha256 = download_prefix(file_id, raw_path, args.max_bytes)
+    raw_path = cache / f"{args.date}.csv"
+    downloaded, prefix_sha256 = download_prefix(url, raw_path, args.max_bytes)
 
-    real, real_meta = load_real_cdr_features(raw_path, args.max_real_windows, args.seed)
+    real, real_meta = load_real_cdr_features(
+        raw_path, args.max_real_windows, args.seed
+    )
     syn = synthetic_normal(args.seed, args.synthetic_days)
     tr, va, te = time_split(syn)
 
@@ -393,28 +368,33 @@ def main(argv: Iterable[str] | None = None) -> int:
     report = {
         "status": "completed",
         "interpretation": (
-            "External non-synthetic normal-traffic check only. "
-            "No attack recall/precision is claimed because the public CDR dataset "
-            "has no SS7 attack labels and does not expose cross-node SS7 invariants."
+            "Independent non-synthetic normal-traffic external-validity check. "
+            "No real attack recall/precision/AUC is claimed because this public CDR "
+            "mirror contains no SS7 attack labels and no packet-level/cross-node "
+            "SS7 invariants."
         ),
         "source": {
-            "dataset": "Telecom Italia Milan telecommunications activity",
-            "doi": "10.7910/DVN/EGZHFV",
-            "provider": "Harvard Dataverse",
-            "file": filename,
-            "dataverse_file_id": file_id,
+            "original_dataset": "Telecom Italia Milan telecommunications activity",
+            "original_doi": ORIGINAL_DATASET_DOI,
+            "mirror": f"https://huggingface.co/datasets/{MIRROR_REPO}",
+            "mirror_file": f"sms-call-internet-mi/{args.date}.csv",
+            "mirror_revision": MIRROR_REVISION,
+            "full_file_sha256_from_mirror": MIRROR_FILE_SHA256.get(args.date),
             "downloaded_prefix_bytes": downloaded,
-            "download_sha256_before_final_line_trim": sha256,
+            "downloaded_prefix_sha256": prefix_sha256,
             "non_synthetic": True,
             "independent_of_repository_generator": True,
         },
         "proxy_mapping": {
-            "country_code_as_destination_proxy": True,
             "signalling_equivalent_units": (
                 "call activity -> five ISUP message-type units; "
                 "SMS-out -> one MAP unit; SMS-in -> two MAP units"
             ),
-            "excluded_as_unobservable": [
+            "excluded_as_unobservable_in_mirror": [
+                "dest_entropy",
+                "n_unique_dest",
+                "dest_top1_ratio",
+                "dest_top2_ratio",
                 "transit_share",
                 "dlg_closure_ratio",
                 "recon_mean",
@@ -439,12 +419,16 @@ def main(argv: Iterable[str] | None = None) -> int:
             "test_rows": int(len(te)),
         },
         "profiles": profiles,
-        "overall_transfer_warning": bool(any(p["transfer_warning"] for p in profiles.values())),
+        "overall_transfer_warning": bool(
+            any(p["transfer_warning"] for p in profiles.values())
+        ),
     }
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    out.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
