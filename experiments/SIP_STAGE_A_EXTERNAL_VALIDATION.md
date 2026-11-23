@@ -149,3 +149,31 @@ real-world SIP attack *events* have both been checked in reproducible CI.
 An external **full TICD** test still requires synchronized node reports,
 zonal telemetry, and independently verified compromise intervals; the real
 honeypot evidence does not contain those fields.
+
+
+### Raw real-world SIP request audit (23 November 2026)
+
+A separate GitHub Actions execution successfully **streamed the raw original
+Elasticsearch JSON exports**, rather than relying only on the cleaned CSV:
+`https://github.com/verge88/signal_network_sim_v2/actions/runs/45231259252`.
+Source records are independent observed inbound traffic at a SentryPeer SIP
+honeypot, not reconstructed synthetic PCAP.
+
+Across the three raw batches (204,086 log records in total) the parser
+identified **61,963 SIP message entries**:
+- 44,446 `INVITE` entries;
+- 17,308 `REGISTER` entries;
+- 209 `OPTIONS` entries.
+
+All 61,963 SIP request entries included original SIP message text, `Call-ID`
+and `CSeq`; no response messages were present in those entries.
+There were **61,377 unique hashed Call-IDs**. The 586 surplus raw
+occurrences are under separate reproducible duplicate-record analysis; it
+would be scientifically incorrect to present raw occurrences as 61,963
+unique SIP calls. The cleaned CSV has 61,377 SIP events.
+
+These real SIP request samples do not supply any matching trusted
+`cu_*` reports or zonal telemetry and cannot produce a defensible TICD
+ROC-AUC, recall or FPR. They *can* establish that the method-distribution
+and 5-minute temporal counts are observed in independent non-simulator
+traffic.
