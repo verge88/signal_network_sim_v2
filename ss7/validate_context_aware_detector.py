@@ -145,6 +145,45 @@ def purge_cross_split_benign_events(
     )
 
 
+def audit_reroute_controls(sim, episodes: Sequence) -> dict:
+    """Verify every generated reroute control changes at least one multipath flow."""
+    rows = []
+    for event_id, ep in enumerate(episodes):
+        if ep.kind != "reroute":
+            continue
+        changed = 0
+        touched = 0
+        for flow in sim.flows:
+            route = sim.topo.route(flow.src, flow.dst)
+            if len(route.paths) < 2:
+                continue
+            if not any(int(ep.nid) in path for path in route.paths):
+                continue
+            touched += 1
+            effective = sim._effective_route_shares(
+                route, flow.src, flow.dst, int(ep.t0), [ep]
+            )
+            if not np.allclose(effective, route.shares):
+                changed += 1
+        rows.append({
+            "event_id": int(event_id),
+            "nid": int(ep.nid),
+            "t0": int(ep.t0),
+            "t1": int(ep.t1),
+            "multipath_flows_touched": int(touched),
+            "multipath_flows_changed": int(changed),
+        })
+        if changed <= 0:
+            raise AssertionError(
+                f"reroute event {event_id} at node {ep.nid} has no routing effect"
+            )
+    return {
+        "reroute_events": int(len(rows)),
+        "all_effective": bool(all(r["multipath_flows_changed"] > 0 for r in rows)),
+        "events": rows,
+    }
+
+
 def add_attack_parameters(frame: pd.DataFrame, episodes: Sequence) -> pd.DataFrame:
     out = frame.copy()
     rate = {
@@ -377,7 +416,7 @@ def bootstrap_ci(values: Sequence[float], seed: int = 321, n_boot: int = 3000) -
 
 def evaluate_seed(seed: int, days: float) -> Tuple[dict, List[dict], List[dict], List[dict], dict]:
     cfg = SimConfig(seed=int(seed), days=float(days))
-    frame, _, episodes = build_dataset(
+    frame, sim, episodes = build_dataset(
         cfg,
         episodes_kw={
             "n_compromise": 18,
@@ -385,6 +424,7 @@ def evaluate_seed(seed: int, days: float) -> Tuple[dict, List[dict], List[dict],
             "n_ext": 6,
         },
     )
+    reroute_audit = audit_reroute_controls(sim, episodes)
     frame = annotate_context(frame, episodes)
     frame = add_attack_parameters(frame, episodes)
 
@@ -448,6 +488,7 @@ def evaluate_seed(seed: int, days: float) -> Tuple[dict, List[dict], List[dict],
         "context_thresholds": ctx_thr,
         "context_threshold_diagnostics": ctx_diag,
         "benign_event_split_audit": benign_split_audit,
+        "reroute_control_audit": reroute_audit,
     }
     comparison_rows = [
         {
