@@ -14,7 +14,7 @@ OUT=Path("results_stage_a");OUT.mkdir(exist_ok=True)
 methods=collections.Counter();methods_payload=collections.Counter();src_sensors=collections.Counter()
 payload_shapes=collections.Counter();raw_keys=collections.Counter()
 total=0;sip=0;w_message=0;w_callid=0;w_cseq=0;responses=0;empty_payload=0
-callids=set();request_line_types=collections.Counter();file_results=[]
+callids=set();seen_event_ids=set();unique_method_by_callid=collections.Counter();unique_method_by_event_id=collections.Counter();duplicate_event_ids=0;request_line_types=collections.Counter();file_results=[]
 # Never log actual raw SIP data.
 CALLID=re.compile(r'(?im)^(?:Call-ID|i)\s*:\s*([^\r\n]+)')
 CSEQ=re.compile(r'(?im)^CSeq\s*:\s*(\d+)\s+([A-Za-z]+)')
@@ -44,6 +44,15 @@ with zipfile.ZipFile(DATA) as archive:
                 payload=node.get('sip_message') or fields.get('sip_message')
                 if not method and not payload and not any(x in typ for x in ['sentry','sip']):
                     continue
+                # Elasticsearch export pages may overlap. Deduplicate only using
+                # validated native identifiers, separately from SIP dialog keys.
+                eid=(str(record.get('_index') or ''),str(record.get('_id') or ''))
+                if eid[1]:
+                    if eid in seen_event_ids:
+                        duplicate_event_ids+=1
+                    else:
+                        seen_event_ids.add(eid)
+                        if method:unique_method_by_event_id[method]+=1
                 counts['possible_sip']+=1
                 sip+=1
                 if sensor:src_sensors[sensor]+=1
@@ -59,7 +68,10 @@ with zipfile.ZipFile(DATA) as archive:
                     c=CALLID.search(payload[:20000])
                     if c:
                         w_callid+=1
-                        callids.add(hashlib.sha256(c.group(1).strip().encode()).digest())
+                        digest=hashlib.sha256(c.group(1).strip().encode()).digest()
+                        if digest not in callids:
+                            unique_method_by_callid[method or (m.group(1).upper() if m else 'UNCLASSIFIED')]+=1
+                        callids.add(digest)
                     if CSEQ.search(payload[:20000]):w_cseq+=1
                 else:
                     empty_payload+=1
@@ -77,6 +89,10 @@ r={"dataset":"MURHCAD real-world public-internet SentryPeer data",
    "sip_messages_with_call_id":w_callid,
    "sip_messages_with_cseq":w_cseq,
    "unique_hashed_call_ids":len(callids),
+   "unique_elasticsearch_events":len(seen_event_ids),
+   "duplicate_elasticsearch_record_occurrences":duplicate_event_ids,
+   "method_counts_deduplicated_by_call_id":dict(unique_method_by_callid),
+   "method_counts_deduplicated_by_elasticsearch_id":dict(unique_method_by_event_id),
    "sip_response_records_in_raw":responses,
    "batch_counts":file_results,
    "raw_schema_fields":dict(raw_keys),
