@@ -1,0 +1,56 @@
+name: SS7 real CDR external validation
+
+on:
+  push:
+    branches:
+      - validate-ss7-real-cdr
+    paths:
+      - "ss7/validate_real_cdr.py"
+      - "ss7/fix.py"
+      - ".github/workflows/ss7-real-cdr-validation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-real-cdr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install minimal scientific dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn
+
+      - name: Validate canonical SS7 model on independent real CDR data
+        run: |
+          mkdir -p results
+          python -m ss7.validate_real_cdr \
+            --date 2013-11-01 \
+            --max-bytes 67108864 \
+            --max-real-windows 60000 \
+            --synthetic-days 0.5 \
+            --target-fpr 0.01 \
+            --seed 42 \
+            --output results/ss7_real_cdr_validation.json \
+            2>&1 | tee results/validation.log
+
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss7-real-cdr-validation
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
