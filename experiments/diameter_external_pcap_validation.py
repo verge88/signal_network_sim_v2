@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -44,6 +45,7 @@ from diameter.diameter_sim_v1 import (
     NormalScenario,
     SimulationConfig,
     add_zone_deviation_features,
+    apply_external_calibration,
 )
 
 S6A_COMMANDS = ["AIR", "ULR", "CLR", "IDR", "DSR", "PUR", "RSR", "NOR"]
@@ -115,6 +117,10 @@ def build_training_frame(seed: int = 42) -> pd.DataFrame:
         n_mme=4, n_hss=2, n_pcrf=2, n_sgw=2, n_pgw=2,
         n_dra=3, n_dea=2, master_node_ids=[0, 1], seed=seed,
     )
+    calibration_path = os.environ.get("DIAMETER_CALIBRATION_PROFILE", "").strip()
+    if calibration_path:
+        apply_external_calibration(config, calibration_path)
+
     attacks = [
         AttackScenario(AttackType.SUBSCRIBER_LOCATION_TRACKING, [7], 180, 250, 6.0),
         AttackScenario(AttackType.SMS_DATA_INTERCEPTION, [8, 9], 360, 450, 7.0),
