@@ -198,6 +198,18 @@ def main() -> None:
     print("\nPer-capture predictions:")
     print(out.to_string(index=False))
 
+    # External attack-transfer acceptance gates.  A detector that catches every
+    # attack by flagging every benign S6a session is not considered robust.
+    if summary["iso_robust_external_attack_tpr"] < 0.75:
+        raise SystemExit("Robust IF external attack TPR below 75%")
+    if summary["iso_robust_external_benign_fpr"] > 0.25:
+        raise SystemExit("Robust IF external benign FPR above 25%")
+    if (
+        summary["iso_robust_external_balanced_accuracy"] + 0.05
+        < summary["iso_legacy_external_balanced_accuracy"]
+    ):
+        raise SystemExit("Robust IF materially underperforms legacy balanced accuracy")
+
 
 if __name__ == "__main__":
     main()
