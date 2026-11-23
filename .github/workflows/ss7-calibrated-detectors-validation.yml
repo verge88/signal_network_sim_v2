@@ -1,0 +1,62 @@
+name: SS7 calibrated detector full validation
+
+on:
+  push:
+    branches:
+      - validate-ss7-real-cdr
+    paths:
+      - "ss7/validate_calibrated_detectors.py"
+      - "ss7/calibrate_full_model.py"
+      - "ss7/fix.py"
+      - ".github/workflows/ss7-calibrated-detectors-validation.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "ss7/validate_calibrated_detectors.py"
+      - "ss7/calibrate_full_model.py"
+      - "ss7/fix.py"
+      - ".github/workflows/ss7-calibrated-detectors-validation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-calibrated-detectors:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install scientific dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn joblib
+
+      - name: Full validation of calibrated SS7 detectors
+        run: |
+          set -o pipefail
+          mkdir -p results/ss7_calibrated_detector_validation
+          python -m ss7.validate_calibrated_detectors \
+            --seeds 42 1337 2026 7 31415 \
+            --days 1.25 \
+            --output-dir results/ss7_calibrated_detector_validation \
+            2>&1 | tee results/ss7_calibrated_detector_validation/validation.log
+
+      - name: Upload validation artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss7-calibrated-detector-validation
+          path: results/ss7_calibrated_detector_validation/
+          if-no-files-found: warn
+          retention-days: 30
