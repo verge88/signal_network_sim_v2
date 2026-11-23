@@ -65,22 +65,70 @@ def annotate_context(frame: pd.DataFrame, episodes: Sequence) -> pd.DataFrame:
     """
     out = frame.copy()
     labels = np.full(len(out), "background", dtype=object)
+    event_ids = np.full(len(out), -1, dtype=int)
     hits = np.zeros(len(out), dtype=int)
     nid = out["nid"].to_numpy(int)
     t = out["t"].to_numpy(int)
 
-    for e in episodes:
+    for event_id, e in enumerate(episodes):
         if e.kind not in NORMAL_EVENTS or e.nid is None:
             continue
         mask = (nid == int(e.nid)) & (t >= int(e.t0)) & (t <= int(e.t1))
         first = mask & (hits == 0)
         labels[first] = str(e.kind)
-        labels[mask & (hits > 0)] = "multi_event"
+        event_ids[first] = int(event_id)
+        overlap = mask & (hits > 0)
+        labels[overlap] = "multi_event"
+        event_ids[overlap] = -2
         hits[mask] += 1
 
     out["benign_context_truth"] = labels
+    out["benign_event_id"] = event_ids
     out["benign_context_overlap_count"] = hits
     return out
+
+
+def purge_cross_split_benign_events(
+    tr: pd.DataFrame,
+    va: pd.DataFrame,
+    te: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    """Ensure a benign event instance cannot occur in more than one partition.
+
+    Rows belonging to overlapping normal events (benign_event_id=-2) are removed
+    as ambiguous context examples.  Any normal event represented in multiple
+    partitions is removed from all of them. Background rows are retained.
+    """
+    parts = {"train": tr.copy(), "validation": va.copy(), "test": te.copy()}
+    membership: Dict[int, set] = {}
+    for name, part in parts.items():
+        for eid in part.loc[part["benign_event_id"] >= 0, "benign_event_id"].unique():
+            membership.setdefault(int(eid), set()).add(name)
+    crossing = {eid for eid, names in membership.items() if len(names) > 1}
+
+    removed = {}
+    clean = {}
+    for name, part in parts.items():
+        ambiguous = part["benign_event_id"] == -2
+        crossed = part["benign_event_id"].isin(crossing)
+        drop = ambiguous | crossed
+        removed[name] = {
+            "rows": int(drop.sum()),
+            "ambiguous_overlap_rows": int(ambiguous.sum()),
+            "cross_split_event_rows": int(crossed.sum()),
+        }
+        clean[name] = part.loc[~drop].copy()
+
+    return (
+        clean["train"],
+        clean["validation"],
+        clean["test"],
+        {
+            "crossing_event_ids": sorted(int(x) for x in crossing),
+            "n_crossing_events": int(len(crossing)),
+            "removed": removed,
+        },
+    )
 
 
 def add_attack_parameters(frame: pd.DataFrame, episodes: Sequence) -> pd.DataFrame:
@@ -300,6 +348,7 @@ def evaluate_seed(seed: int, days: float) -> Tuple[dict, List[dict], List[dict],
     frame = add_attack_parameters(frame, episodes)
 
     tr, va, te = blocked_split(frame, cfg, RngBook(seed)["split"])
+    tr, va, te, benign_split_audit = purge_cross_split_benign_events(tr, va, te)
     own_cols = all_derived(frame, FEATURE_SETS["OWN_only"])
     inv_cols = all_derived(frame, FEATURE_SETS["INV_only"])
 
@@ -357,6 +406,7 @@ def evaluate_seed(seed: int, days: float) -> Tuple[dict, List[dict], List[dict],
         "global_threshold": global_thr,
         "context_thresholds": ctx_thr,
         "context_threshold_diagnostics": ctx_diag,
+        "benign_event_split_audit": benign_split_audit,
     }
     comparison_rows = [
         {
