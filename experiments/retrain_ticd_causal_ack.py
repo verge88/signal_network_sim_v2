@@ -106,19 +106,17 @@ def objective(dev):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument("--prior",required=True,type=Path)
+    p.add_argument("--calibration",required=True,type=Path)
     p.add_argument("--output",type=Path,default=Path("results_ticd_causal_ack"))
     a=p.parse_args();a.output.mkdir(parents=True,exist_ok=True)
     started=time.time()
     with (a.prior/"ticd_loss_adaptive_model.pkl").open("rb") as f:old=pickle.load(f)
     if old["calibration_source_sha256"]!=CHECKSUM or old["selected_name"]!="loss_node":
         raise RuntimeError("Wrong provenance of original loss-aware trained TICD")
-    existing=old["model"];cal=old["original_model"].base_model.base_model if False else None
-    # The original simulation's benign method calibration was saved in the
-    # previous training artifact to pin exact external provenance.
-    if "normal_calibration" in old:
-        calibration=old["normal_calibration"]
-    else:
-        raise RuntimeError("Missing calibrated simulator parameters")
+    existing=old["model"]
+    calibration=json.loads(a.calibration.read_text())
+    if calibration.get("calibration_kind")!="partial_benign_SIP_method_profile":
+        raise RuntimeError("Expected exactly the independent LTE-A SIP calibration manifest")
     if calibration["source_archive_sha256"]!=CHECKSUM:
         raise RuntimeError("External-calibration checksum mismatch")
     seeds_by_group={
