@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - validation/diameter-external-pcap
+      - improve/diameter-isolation-forest-robustness
     paths:
       - "diameter/**"
       - "experiments/diameter_external_pcap_validation.py"
