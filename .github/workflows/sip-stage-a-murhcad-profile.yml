@@ -1,0 +1,41 @@
+name: SIP stage A real internet attack event profile
+on:
+  push:
+    branches: [validation/sip-stage-a-independent]
+    paths:
+      - '.github/workflows/sip-stage-a-murhcad-profile.yml'
+      - 'experiments/sip_stage_a_murhcad_profile.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  honeypot-profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and verify independent real Internet dataset
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --retry-delay 3 --max-time 600 \
+            'https://zenodo.org/records/15716735/files/CloudHoneyNetDataset.zip?download=1' \
+            -o CloudHoneyNetDataset.zip
+          echo '9902cf514bcc9cf6983a28bf55c7526c  CloudHoneyNetDataset.zip' | md5sum -c
+      - name: Analyze SIP-only events with privacy-safe aggregation
+        run: python3 experiments/sip_stage_a_murhcad_profile.py CloudHoneyNetDataset.zip
+      - name: Publish attack profile
+        if: always()
+        run: |
+          if [ -f results_stage_a/murhcad_sip_attack_profile.json ]; then
+            echo '## SIP public-internet honeypot event profile' >> "$GITHUB_STEP_SUMMARY"
+            echo 'No packet-level SIP and no full TICD labels; do not infer detection metrics.' >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+            python3 -c 'import json; d=json.load(open("results_stage_a/murhcad_sip_attack_profile.json")); d.pop("raw_batch_schema",None); print(json.dumps(d,indent=2))' >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-murhcad-real-attack-profile
+          path: results_stage_a/murhcad_sip_attack_profile.json
+          if-no-files-found: warn

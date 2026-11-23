@@ -1,0 +1,24 @@
+name: SIP stage A Alvares folder availability
+on:
+  push:
+    branches: [validation/sip-stage-a-independent]
+    paths: ['.github/workflows/sip-stage-a-alvares.yml', 'experiments/sip_stage_a_alvares_discovery.py']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install requests
+        run: python -m pip install requests
+      - name: Inspect public research dataset folder metadata
+        run: python experiments/sip_stage_a_alvares_discovery.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-stage-a-alvares-metadata
+          path: results_stage_a/alvares_detailed_probe.json
+          if-no-files-found: warn

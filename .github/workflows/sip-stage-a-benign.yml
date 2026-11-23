@@ -1,0 +1,64 @@
+name: SIP stage A external benign PCAP audit
+
+on:
+  push:
+    branches: [validation/sip-stage-a-independent]
+    paths:
+      - '.github/workflows/sip-stage-a-benign.yml'
+      - 'experiments/sip_stage_a_benign.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+jobs:
+  benign-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install tools
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+          python -m pip install 'gdown>=6.1,<7'
+      - name: Download independent cellular trace archive
+        run: |
+          gdown 1-r2Xd1VK6r7O_1KaXVYPus1Rcj6TF9DF -O LTE_Pcap.zip --no-cookies
+          test "$(stat -c '%s' LTE_Pcap.zip)" -gt 1000000
+          sha256sum LTE_Pcap.zip
+      - name: Download independent Wireshark reference SIP captures
+        env:
+          REF: a2ae37cbc3152fab55c1a3cca754c7397148e755
+        run: |
+          set -euo pipefail
+          mkdir -p wireshark_benign
+          base="https://raw.githubusercontent.com/NormB/sipnab/${REF}/tests/pcap-samples"
+          for name in Asterisk_ZFONE_XLITE.pcap DTMFsipinfo.pcap b2bua-asterisk.pcapng codec-negotiation.pcap sip-over-tcp.pcap register-invite-reinvite-bye.pcap sip-rtp-g711.pcap sip-proxy.pcap; do
+            curl --fail --location --retry 3 "${base}/${name}" -o "wireshark_benign/${name}"
+          done
+          sha256sum wireshark_benign/* > results_ws_hashes.txt
+      - name: Audit observed real SIP messages and ACK coverage
+        run: |
+          python experiments/sip_stage_a_benign.py --dimauro-zip LTE_Pcap.zip --wireshark-dir wireshark_benign --out-dir results_stage_a
+      - name: Publish
+        if: always()
+        run: |
+          if test -f results_stage_a/benign_coverage.json; then
+            echo '## Stage A benign external SIP coverage' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Not a full TICD false-positive-rate estimate: the PCAPs have no CU/zone reports.' >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+            python -c 'import json; d=json.load(open("results_stage_a/benign_coverage.json")); d.pop("captures",None);print(json.dumps(d,indent=2))' >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-stage-a-benign-metrics
+          path: |
+            results_stage_a/
+            results_ws_hashes.txt
+          if-no-files-found: warn

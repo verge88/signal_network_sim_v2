@@ -1,0 +1,48 @@
+name: SIP stage A external attack scenario controls
+on:
+  push:
+    branches: [validation/sip-stage-a-independent]
+    paths: ['.github/workflows/sip-stage-a-attacks.yml', 'experiments/sip_stage_a_attack_controls.py']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  attack-inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tshark
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+      - name: Download external SIP attack-scenario traces (without republishing payload)
+        env:
+          HONE_SHA: c01dd3924502c4a53a502407df3616d166695c08
+          WIRESHARK_SHA: a2ae37cbc3152fab55c1a3cca754c7397148e755
+        run: |
+          set -euo pipefail
+          mkdir -p attack_pcaps
+          curl -fLsS --retry 3 "https://raw.githubusercontent.com/mihir252731/VOIP_Analyzer/${HONE_SHA}/VOIP%20Analyzer/data/captures/Forensic_challenge_4.pcap" -o attack_pcaps/Forensic_challenge_4.pcap
+          base="https://raw.githubusercontent.com/NormB/sipnab/${WIRESHARK_SHA}"
+          curl -fLsS --retry 3 "${base}/tests/pcap-samples/metasploit-sip-invite-spoof.pcap" -o attack_pcaps/metasploit-sip-invite-spoof.pcap
+          curl -fLsS --retry 3 "${base}/tests/fixtures/sip-scanner-and-register-flood.pcap" -o attack_pcaps/sip-scanner-and-register-flood.pcap
+          sha256sum attack_pcaps/*.pcap > attack_sha256.txt
+      - name: Run honest network-observable attack diagnostics
+        run: python -m experiments.sip_stage_a_attack_controls --input-dir attack_pcaps --out-dir results_stage_a
+      - name: Publish
+        if: always()
+        run: |
+          if [ -f results_stage_a/attack_controls.json ]; then
+            echo '## External attack scenarios — protocol-only controls, not TICD recall' >> "$GITHUB_STEP_SUMMARY"
+            python -c 'import json;x=json.load(open("results_stage_a/attack_controls.json")); print(json.dumps({k:v for k,v in x.items() if k!="captures"},indent=2))' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-stage-a-attack-controls
+          path: |
+            results_stage_a/attack_controls.json
+            attack_sha256.txt
+          if-no-files-found: warn

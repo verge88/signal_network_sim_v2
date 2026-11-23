@@ -1,0 +1,41 @@
+name: SIP stage A real internet honeypot inventory
+on:
+  push:
+    branches: [validation/sip-stage-a-independent]
+    paths:
+      - 'experiments/sip_stage_a_murhcad_inventory.py'
+      - '.github/workflows/sip-stage-a-murhcad.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  honeypot-inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download original peer-reviewed Zenodo dataset
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --retry-delay 3 --max-time 600 \
+            'https://zenodo.org/records/15716735/files/CloudHoneyNetDataset.zip?download=1' \
+            -o CloudHoneyNetDataset.zip
+          test "$(stat -c %s CloudHoneyNetDataset.zip)" -gt 30000000
+      - name: Verify checksum and inventory sources
+        run: python3 experiments/sip_stage_a_murhcad_inventory.py CloudHoneyNetDataset.zip
+      - name: Publish provenance
+        if: always()
+        run: |
+          if [ -f results_stage_a/murhcad_schema.json ]; then
+            echo "## Real Internet SIP honeypot data inventory" >> "$GITHUB_STEP_SUMMARY"
+            echo "Zenodo 10.5281/zenodo.15716735; NOT raw SIP PCAP / full TICD inputs" >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+            cat results_stage_a/murhcad_schema.json >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-murhcad-inventory
+          path: results_stage_a/murhcad_schema.json
+          if-no-files-found: warn
