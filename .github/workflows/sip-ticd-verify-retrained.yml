@@ -28,10 +28,13 @@ jobs:
         run: |
           mkdir -p trained
           gh run download 45234641925 --repo "${{ github.repository }}" --name sip-ticd-calibrated-retrained-model-and-evidence --dir trained
-          test -f trained/ticd_model.pkl
-          test -f trained/retraining_report.json
+          model_path="$(find trained -type f -name ticd_model.pkl -print -quit)"
+          test -n "$model_path"
+          artifact_dir="$(dirname "$model_path")"
+          test -f "$artifact_dir/retraining_report.json"
+          echo "ARTIFACT_DIR=$artifact_dir" >> "$GITHUB_ENV"
       - name: Check no scoring-batch dependence, rederive threshold, report per attack
-        run: python -m experiments.check_retrained_ticd --artifact-dir trained --out-dir verified_ticd
+        run: python -m experiments.check_retrained_ticd --artifact-dir "$ARTIFACT_DIR" --out-dir verified_ticd
       - name: Publish scientifically relevant subgroups
         run: |
           echo '## TICD original training and held-out test verification' >> "$GITHUB_STEP_SUMMARY"
