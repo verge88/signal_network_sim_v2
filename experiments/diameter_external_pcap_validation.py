@@ -29,6 +29,8 @@ import pandas as pd
 from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -358,6 +360,95 @@ def train_portable_models(df: pd.DataFrame, seed: int = 42):
         metrics,
     )
 
+
+def evaluate_full_feature_isolation_forest(
+    df: pd.DataFrame,
+    seed: int = 42,
+) -> Dict[str, float]:
+    """Evaluate legacy vs robust IF on the complete 56-feature simulator view.
+
+    This is an internal sensitivity guardrail for the robustness change.  It
+    does not turn the external PCAP test into a full-feature validation.
+    """
+    missing = [c for c in FULL_FEATURES if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"Missing full-model features: {missing}")
+
+    y = df["is_anomaly"].astype(int).to_numpy()
+    idx = np.arange(len(df))
+    train_idx, temp_idx = train_test_split(
+        idx, test_size=0.40, stratify=y, random_state=seed
+    )
+    calib_idx, test_idx = train_test_split(
+        temp_idx, test_size=0.50, stratify=y[temp_idx], random_state=seed + 1
+    )
+
+    train_rows = df.iloc[train_idx]
+    calib_rows = df.iloc[calib_idx]
+    test_rows = df.iloc[test_idx]
+    y_train, y_calib, y_test = y[train_idx], y[calib_idx], y[test_idx]
+
+    imputer = SimpleImputer(strategy="median")
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(
+        imputer.fit_transform(
+            train_rows[FULL_FEATURES].replace([np.inf, -np.inf], np.nan)
+        )
+    )
+    X_calib = scaler.transform(
+        imputer.transform(
+            calib_rows[FULL_FEATURES].replace([np.inf, -np.inf], np.nan)
+        )
+    )
+    X_test = scaler.transform(
+        imputer.transform(
+            test_rows[FULL_FEATURES].replace([np.inf, -np.inf], np.nan)
+        )
+    )
+
+    normal_train = X_train[y_train == 0]
+    legacy = IsolationForest(
+        n_estimators=300,
+        contamination="auto",
+        random_state=seed,
+        n_jobs=-1,
+    ).fit(normal_train)
+    legacy_calib = -legacy.score_samples(X_calib)
+    legacy_threshold = float(np.percentile(legacy_calib[y_calib == 0], 95.0))
+    legacy_test = -legacy.score_samples(X_test)
+    legacy_pred = (legacy_test >= legacy_threshold).astype(int)
+
+    low = np.nanquantile(normal_train, 0.001, axis=0)
+    high = np.nanquantile(normal_train, 0.999, axis=0)
+
+    def winsor(X):
+        return np.minimum(np.maximum(X, low), high)
+
+    robust = IsolationForest(
+        n_estimators=500,
+        contamination="auto",
+        max_features=0.75,
+        bootstrap=True,
+        random_state=seed,
+        n_jobs=-1,
+    ).fit(winsor(normal_train))
+    robust_calib = -robust.score_samples(winsor(X_calib))
+    robust_threshold = float(np.percentile(robust_calib[y_calib == 0], 95.0))
+    robust_test = -robust.score_samples(winsor(X_test))
+    robust_pred = (robust_test >= robust_threshold).astype(int)
+
+    benign = y_test == 0
+    return {
+        "full_iso_legacy_internal_auc": float(roc_auc_score(y_test, legacy_test)),
+        "full_iso_legacy_internal_f1": float(f1_score(y_test, legacy_pred)),
+        "full_iso_legacy_internal_benign_fpr": float(legacy_pred[benign].mean()),
+        "full_iso_legacy_threshold": legacy_threshold,
+        "full_iso_robust_internal_auc": float(roc_auc_score(y_test, robust_test)),
+        "full_iso_robust_internal_f1": float(f1_score(y_test, robust_pred)),
+        "full_iso_robust_internal_benign_fpr": float(robust_pred[benign].mean()),
+        "full_iso_robust_threshold": robust_threshold,
+    }
+
 def _run_tshark(path: Path) -> List[Dict[str, str]]:
     # Ubuntu 26.04 confines tshark with AppArmor. A user-owned copy in /tmp
     # is readable while an identical file under the GitHub workspace may not be.
@@ -498,6 +589,7 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     train_df = build_training_frame(args.seed)
+    full_iso_metrics = evaluate_full_feature_isolation_forest(train_df, args.seed)
     (
         rf,
         iso_legacy,
@@ -517,6 +609,7 @@ def main() -> None:
         robust_transform,
     )
 
+    metrics.update(full_iso_metrics)
     metrics.update({
         "external_capture_count": int(len(ext)),
         "external_total_pdus": int(ext["decoded_pdus"].sum()),
