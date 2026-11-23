@@ -1,0 +1,107 @@
+name: Two-tier SIP TICD alerts vs early warnings
+on:
+  push:
+    branches: [improve/ticd-two-level-detection]
+    paths:
+      - '.github/workflows/sip-ticd-two-tier.yml'
+      - 'sip/ticd_two_tier.py'
+      - 'experiments/evaluate_ticd_two_tier.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  tiered-evaluation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+      PYTHONHASHSEED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install and compile scientific pipeline
+        run: |
+          set -euo pipefail
+          python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+          python -m compileall -q sip/ticd_two_tier.py experiments/evaluate_ticd_two_tier.py
+          python -m pip freeze > tiered_ticd_environment.txt
+      - name: Retrieve immutable previously trained causal SIP TICD
+        run: |
+          set -euo pipefail
+          mkdir -p previous
+          gh run download 45247020460 --repo "${{ github.repository }}" --name sip-ticd-causal-ack-retrained-heldout --dir previous
+          saved="$(find previous -type f -name ticd_causal_ack_model.pkl -print -quit)"
+          test -n "$saved"
+          echo "PREVIOUS_DIR=$(dirname "$saved")" >> "$GITHUB_ENV"
+      - name: Fit benign-only thresholds, select warning budget on development and evaluate unseen simulation seeds
+        run: |
+          python -m experiments.evaluate_ticd_two_tier --frozen "$PREVIOUS_DIR" --out results_ticd_two_tier
+      - name: Verify decision levels and independent seed partitions
+        run: |
+          python - <<'PY'
+          import json,pickle,sys
+          from pathlib import Path
+          sys.path.insert(0,'sip')
+          p=Path('results_ticd_two_tier')
+          d=json.loads((p/'two_tier_ticd_report.json').read_text())
+          with (p/'ticd_two_tier_model.pkl').open('rb') as f:
+              artifact=pickle.load(f)
+          model=artifact['model']
+          assert model.fitted
+          assert d['test_batch_label_invariance'] and d['reloaded_model_verified']
+          assert model.confirmed_threshold==artifact['conservative_alarm_threshold']
+          assert model.warning_threshold==artifact['warning_threshold']
+          assert not d['real_world_SIP_detector_validation']
+          new={s for group in ('normal_validation_seeds','development_seeds','heldout_seeds')
+               for values in d[group].values() for s in values}
+          assert len(new)==sum(len(a) for group in ('normal_validation_seeds','development_seeds','heldout_seeds')
+                               for a in d[group].values())
+          for cohort,results in d['untouched_test_metrics'].items():
+              m=results['two_tier']
+              assert m['confirmed_FP']+m['warning_only_FP']<=m['normal']
+              assert m['confirmed_TP']+m['warning_only_TP']==m['covered_attack_rows']
+              if m['attack']==0:
+                  assert m['confirmed_recall'] is None and m['combined_attack_coverage'] is None
+          print('TWO_TIER_MODEL_RELOAD_AND_FPR_ACCOUNTING_SUCCESS')
+          PY
+      - name: Display separate warning and confirmed-alert statistics
+        if: always()
+        run: |
+          if [ -f results_ticd_two_tier/two_tier_ticd_report.json ]; then
+            echo '## SIP TICD separate confirmed alarms and causal early warnings' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Warning detections are NOT confirmed detections. All attack tests are simulated, NOT external real SIP validation.' >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d=json.load(open('results_ticd_two_tier/two_tier_ticd_report.json'))
+          print('Selected warning budget:',d['selected_warning_budget'])
+          print('Alarm threshold:',d['new_confirmed_alarm_threshold'])
+          print('Separate warning threshold:',d['selected_model_manifest']['warning_threshold'])
+          for name,models in d['untouched_test_metrics'].items():
+              row=models['two_tier']
+              print(name,'Confirmed FPR',row['confirmed_alert_FPR'],
+                    'warning FWR',row['false_warning_rate'],
+                    'combined normal FPR',row['combined_normal_signal_rate'],
+                    'confirmed recall',row['confirmed_recall'],
+                    'incremental warning coverage',row['warning_only_incremental_attack_coverage'],
+                    'combined coverage',row['combined_attack_coverage'],
+                    'statistical',row['by_sophistication']['statistical'])
+          PY
+            echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-ticd-two-tier-trained-thresholds-and-holdout
+          path: |
+            results_ticd_two_tier/
+            tiered_ticd_environment.txt
+          if-no-files-found: warn
+          retention-days: 30

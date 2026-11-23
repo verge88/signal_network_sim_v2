@@ -1,0 +1,51 @@
+name: Audit two-tier SIP TICD warning episodes by seed
+on:
+  push:
+    branches: [improve/ticd-two-level-detection]
+    paths:
+      - 'experiments/audit_ticd_two_tier.py'
+      - '.github/workflows/sip-ticd-two-tier-audit.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Retrieve immutable two-tier CI evaluation
+        run: |
+          set -euo pipefail
+          mkdir -p source
+          gh run download 45249660732 --repo "${{ github.repository }}" --name sip-ticd-two-tier-trained-thresholds-and-holdout --dir source
+          f="$(find source -type f -name two_tier_ticd_report.json -print -quit)"
+          test -n "$f"
+          echo "REPORT_FILE=$f" >> "$GITHUB_ENV"
+      - name: Verify heldout per-seed alert and warning accounting, episodes and split isolation
+        run: |
+          python3 -m experiments.audit_ticd_two_tier --source "$REPORT_FILE" --out results_two_tier_verified
+      - name: Summarize independent simulation seeds
+        run: |
+          echo '## Two-tier TICD validation: separate false alerts and false warnings' >> "$GITHUB_STEP_SUMMARY"
+          echo 'This is a read-only audit of a SIMULATION study. A warning is not a confirmed detection.' >> "$GITHUB_STEP_SUMMARY"
+          echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r=json.load(open('results_two_tier_verified/two_tier_seed_audit.json'))
+          for name,m in r["cohorts"].items():
+              print(name,"FPR alert",m["pooled_FPR_confirmed"],
+                    "FWR warning",m["pooled_FWR_warning"],
+                    "warning rate seed range",m["min_seed_FWR"],m["max_seed_FWR"],
+                    "false warning episodes in three 2-hour seeds",
+                    m["false_warning_episodes_per_2h_run"])
+          PY
+          echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sip-ticd-two-tier-paired-seed-audit
+          path: results_two_tier_verified/two_tier_seed_audit.json
+          retention-days: 30
