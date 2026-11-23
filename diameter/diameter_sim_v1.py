@@ -38,6 +38,7 @@ from typing import Dict, List, Optional, Tuple, Set
 from collections import defaultdict, deque
 import warnings
 import os
+import json
 
 warnings.filterwarnings("ignore")
 
@@ -312,8 +313,55 @@ class SimulationConfig:
     ar_phi: float = 0.85               # Same AR(1) autocorrelation
     ar_sigma: float = 0.18
     avg_message_size_bytes: int = 500  # Diameter msg avg (vs 100 for SS7)
+    # PCAP-calibratable request/answer balance.  Defaults preserve the
+    # original Uniform(0.8, 1.2) behaviour.
+    io_ratio_center: float = 1.0
+    io_ratio_halfspan: float = 0.20
+    # Optional externally calibrated conditional S6a command mixture.
+    calibrated_s6a_command_dist: Optional[Dict[str, float]] = None
+    calibration_source: str = ""
     seed: int = 42
     cu_config: ControlUnitConfig = field(default_factory=ControlUnitConfig)
+
+
+def apply_external_calibration(config: SimulationConfig, path: str) -> Dict:
+    """Apply a calibration profile estimated from independent Diameter PCAPs.
+
+    Only PCAP-observable parameters are changed.  Topology, operator-scale
+    rates, time-of-day dynamics, CU behaviour and attack intensities remain the
+    simulator priors unless a future profile explicitly models them.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        profile = json.load(f)
+
+    if int(profile.get("schema_version", 0)) != 1:
+        raise ValueError(f"Unsupported Diameter calibration schema: {profile.get('schema_version')}")
+
+    msg_size = int(profile["avg_message_size_bytes"])
+    if not 100 <= msg_size <= 2000:
+        raise ValueError(f"Invalid calibrated Diameter message size: {msg_size}")
+    config.avg_message_size_bytes = msg_size
+
+    center = float(profile.get("io_ratio_center", 1.0))
+    halfspan = float(profile.get("io_ratio_halfspan", 0.20))
+    config.io_ratio_center = float(np.clip(center, 0.5, 1.5))
+    config.io_ratio_halfspan = float(np.clip(halfspan, 0.0, 0.5))
+
+    dist = profile.get("s6a_command_dist")
+    if dist:
+        missing = [c for c in S6A_COMMANDS if c not in dist]
+        if missing:
+            raise ValueError(f"Calibration S6a distribution missing commands: {missing}")
+        vals = {c: max(0.0, float(dist[c])) for c in S6A_COMMANDS}
+        total = sum(vals.values())
+        if total <= 0:
+            raise ValueError("Calibrated S6a distribution is empty")
+        config.calibrated_s6a_command_dist = {
+            c: vals[c] / total for c in S6A_COMMANDS
+        }
+
+    config.calibration_source = str(profile.get("source", path))
+    return profile
 
 
 # ──────────────────────────────────────────────────────────
@@ -455,6 +503,15 @@ class DiameterNetworkTopology:
             self.graph.add_node(node_id)
             pgw_ids.append(node_id)
             node_id += 1
+
+        # Apply one conditional S6a command distribution consistently across
+        # all S6a-capable nodes.  Node-specific interface shares are retained.
+        if self.config.calibrated_s6a_command_dist:
+            for node in self.nodes.values():
+                if node.s6a_command_dist:
+                    node.s6a_command_dist = dict(
+                        self.config.calibrated_s6a_command_dist
+                    )
 
         # ── Build links ──
         # DRA full-mesh (high-speed backbone)
@@ -690,7 +747,14 @@ class DiameterTrafficGenerator:
                     if len(sorted_r) > 2 else 0.0)
         s6a_gini = self._gini(s6a_ratio_vals)
 
-        inbound_outbound_ratio = 0.8 + 0.4 * self.rng.random()
+        inbound_outbound_ratio = (
+            self.config.io_ratio_center
+            + self.rng.uniform(
+                -self.config.io_ratio_halfspan,
+                self.config.io_ratio_halfspan,
+            )
+        )
+        inbound_outbound_ratio = max(0.05, float(inbound_outbound_ratio))
         if override_params and "inbound_outbound_ratio" in override_params:
             inbound_outbound_ratio = override_params[
                 "inbound_outbound_ratio"]
@@ -1438,6 +1502,11 @@ def main():
         seed=42,
     )
 
+    calibration_path = os.environ.get("DIAMETER_CALIBRATION_PROFILE", "").strip()
+    calibration_profile = None
+    if calibration_path:
+        calibration_profile = apply_external_calibration(config, calibration_path)
+
     n_intervals = int(config.duration_hours * 3600 / config.interval_s)
 
     # Node IDs: DRA 0-2, DEA 3-4, HSS 5-6, MME 7-10,
@@ -1519,6 +1588,20 @@ def main():
     print(f"Intervals: {n_intervals} ({config.duration_hours}h, "
           f"Δt={config.interval_s}s)")
     print(f"Attacks: {len(attacks)}, Normal events: {len(normal_events)}")
+    if calibration_profile is not None:
+        print(
+            "External calibration: "
+            f"{config.calibration_source}; "
+            f"message_size={config.avg_message_size_bytes} B; "
+            f"io={config.io_ratio_center:.3f}±{config.io_ratio_halfspan:.3f}"
+        )
+        print(
+            "Calibrated S6a mix: "
+            + ", ".join(
+                f"{k}={v:.3f}"
+                for k, v in config.calibrated_s6a_command_dist.items()
+            )
+        )
     print()
 
     sim = DiameterSimulator(config, attacks, normal_events)
