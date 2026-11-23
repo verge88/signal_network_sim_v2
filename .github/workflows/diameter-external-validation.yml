@@ -80,6 +80,10 @@ jobs:
             rm -rf "${td}"
           done
 
+      - name: Compile Diameter training pipeline
+        run: |
+          python -m py_compile diameter/diameter_training_v1.py experiments/diameter_external_pcap_validation.py
+
       - name: Run independent validation
         run: |
           PYTHONPATH=. python experiments/diameter_external_pcap_validation.py             external_pcaps/s6a.pcap             external_pcaps/gy.pcap             external_pcaps/rx.pcap             external_pcaps/gy_mscc.pcap             --out-dir results_external_diameter
