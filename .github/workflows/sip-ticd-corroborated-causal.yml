@@ -1,0 +1,88 @@
+name: Validate corroborated causal SIP TICD without test tuning
+on:
+  push:
+    branches: [improve/ticd-causal-persistent-ack]
+    paths:
+      - '.github/workflows/sip-ticd-corroborated-causal.yml'
+      - 'sip/ticd_corroborated_causal.py'
+      - 'experiments/evaluate_ticd_corroborated_causal.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  corroborated:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install and syntax check
+        run: |
+          python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+          python -m compileall -q sip/ticd_corroborated_causal.py experiments/evaluate_ticd_corroborated_causal.py
+          python -m pip freeze > corroborated_environment.txt
+      - name: Download immutable source model from successful earlier train
+        run: |
+          set -euo pipefail
+          mkdir -p prior
+          gh run download 45247020460 --repo "${{ github.repository }}" --name sip-ticd-causal-ack-retrained-heldout --dir prior
+          model="$(find prior -type f -name ticd_causal_ack_model.pkl -print -quit)"
+          test -n "$model"
+          echo "PRIOR_DIR=$(dirname "$model")" >> "$GITHUB_ENV"
+      - name: Choose agreement gate on development, calibrate only normal and test on disjoint seeds
+        run: |
+          python -m experiments.evaluate_ticd_corroborated_causal --prior "$PRIOR_DIR" --out results_ticd_causal_gated
+      - name: Verify saved model and seed split provenance
+        run: |
+          python - <<'PY'
+          import json,pickle,sys
+          sys.path.insert(0,'sip')
+          d=json.load(open('results_ticd_causal_gated/corroborated_causal_report.json'))
+          with open('results_ticd_causal_gated/ticd_corroborated_model.pkl','rb') as f: p=pickle.load(f)
+          assert d['model_reloaded'] and d['batch_independence_max_diff']<=1e-12
+          assert p['threshold']==d['validation_thresholds'][d['selected']]
+          assert 'clean_loss20' in d['heldout']
+          old={x for values in p['seed_partitions']['old'].values() for a in values.values() for x in a}
+          new={x for part in ('validation','development','test') for a in p['seed_partitions'][part].values() for x in a}
+          assert old.isdisjoint(new)
+          assert not d['real_attack_ticd_validation']
+          print('GATED_TICD_MODEL_RELOAD_AND_DISJOINT_TEST_OK',d['selected'])
+          PY
+      - name: Show honest scientific conclusions
+        if: always()
+        run: |
+          if [ -f results_ticd_causal_gated/corroborated_causal_report.json ]; then
+            echo '## SIP TICD: corroborated causal vs original frozen one-class detector' >> "$GITHUB_STEP_SUMMARY"
+            echo 'All attack and loss test evidence is simulator-generated; no real TICD validation.' >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d=json.load(open('results_ticd_causal_gated/corroborated_causal_report.json'))
+          print('Selected:',d['selected'])
+          print('Architecture utilities:',d['development_model_utility'])
+          for name,models in d['heldout'].items():
+              print('COHORT',name)
+              for model in models:
+                  m=models[model]
+                  print(model,'FPR',m['fpr'],'RECALL',m['recall'],
+                        'STATISTICAL',m['by_sophistication']['statistical']['recall'])
+          PY
+            echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-ticd-corroborated-causal-holdout
+          path: |
+            results_ticd_causal_gated/
+            corroborated_environment.txt
+          if-no-files-found: warn
+          retention-days: 30
