@@ -172,7 +172,7 @@ def diagnostic_false_warning_context(df,mod):
         # Dataframe produced by cohort has zero-to-N-1 RangeIndex.
         summary[str(event)]={
           "normal_rows":len(g),
-          "false_warning_rows":int(warned[idx.to_numpy()]),
+          "false_warning_rows":int(warned[idx.to_numpy()].sum()),
         }
     return summary
 
