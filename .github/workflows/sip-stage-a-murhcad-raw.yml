@@ -1,0 +1,40 @@
+name: SIP stage A raw real attack evidence
+on:
+  push:
+    branches: [validation/sip-stage-a-independent]
+    paths: ['experiments/sip_stage_a_murhcad_raw.py', '.github/workflows/sip-stage-a-murhcad-raw.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  raw-honeypot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch verified real Internet SIP logs
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --retry-delay 3 --max-time 600 \
+            'https://zenodo.org/records/15716735/files/CloudHoneyNetDataset.zip?download=1' \
+            -o CloudHoneyNetDataset.zip
+          echo '9902cf514bcc9cf6983a28bf55c7526c  CloudHoneyNetDataset.zip' | md5sum -c
+      - name: Install streaming JSON library
+        run: python -m pip install 'ijson>=3.2,<4'
+      - name: Analyze genuine SIP request payloads without revealing PII
+        run: python3 experiments/sip_stage_a_murhcad_raw.py CloudHoneyNetDataset.zip
+      - name: Publish evidence summary
+        if: always()
+        run: |
+          if test -f results_stage_a/murhcad_sip_raw_evidence.json; then
+            echo '## Real SIP request evidence (SentryPeer)' >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+            python -c 'import json;d=json.load(open("results_stage_a/murhcad_sip_raw_evidence.json"));d.pop("raw_schema_fields",None);print(json.dumps(d,indent=2))' >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-stage-a-raw-attacker-evidence
+          path: results_stage_a/murhcad_sip_raw_evidence.json
+          if-no-files-found: warn
