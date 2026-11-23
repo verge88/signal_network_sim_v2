@@ -91,18 +91,16 @@ def dataverse_file_id(filename: str) -> int:
 def download_prefix(file_id: int, dst: Path, max_bytes: int) -> Tuple[int, str]:
     """Download at most max_bytes from the real Dataverse file and trim partial line.
 
-    A byte prefix is used so CI does not need to transfer a 300+ MB daily file.  If the
-    server ignores Range, the client still stops reading at max_bytes.  No rows are
-    generated or altered; only the final incomplete line is discarded.
+    A byte prefix is used so CI does not need to transfer a 300+ MB daily file.
+    Harvard Dataverse rejects Range requests for this endpoint, so the client opens
+    the normal stream and stops reading after max_bytes.  No rows are generated or
+    altered; only the final incomplete line is discarded.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
     url = f"{DATAVERSE}/api/access/datafile/{file_id}"
     req = Request(
         url,
-        headers={
-            "User-Agent": "signal-network-sim-v2-external-validation/1.0",
-            "Range": f"bytes=0-{max_bytes - 1}",
-        },
+        headers={"User-Agent": "signal-network-sim-v2-external-validation/1.0"},
     )
     remaining = int(max_bytes)
     h = hashlib.sha256()
