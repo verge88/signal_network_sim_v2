@@ -1,0 +1,46 @@
+name: Verify trained SIP TICD model breakdown
+on:
+  push:
+    branches: [training/ticd-sip-pcap-calibrated]
+    paths:
+      - 'experiments/check_retrained_ticd.py'
+      - '.github/workflows/sip-ticd-verify-retrained.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install relevant dependencies
+        run: python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2'
+      - name: Retrieve successfully trained model and reports
+        run: |
+          mkdir -p trained
+          gh run download 45234641925 --repo "${{ github.repository }}" --name sip-ticd-calibrated-retrained-model-and-evidence --dir trained
+          test -f trained/ticd_model.pkl
+          test -f trained/retraining_report.json
+      - name: Check no scoring-batch dependence, rederive threshold, report per attack
+        run: python -m experiments.check_retrained_ticd --artifact-dir trained --out-dir verified_ticd
+      - name: Publish scientifically relevant subgroups
+        run: |
+          echo '## TICD original training and held-out test verification' >> "$GITHUB_STEP_SUMMARY"
+          echo 'These are SIMULATION test metrics, not real-world TICD detection metrics.' >> "$GITHUB_STEP_SUMMARY"
+          echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+          cat verified_ticd/verified_model_breakdown.json >> "$GITHUB_STEP_SUMMARY"
+          echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sip-ticd-calibrated-verified-metrics
+          path: verified_ticd/verified_model_breakdown.json
+          retention-days: 30
