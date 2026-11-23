@@ -1,0 +1,308 @@
+name: Diameter calibrated full ML experiment
+
+on:
+  push:
+    branches:
+      - main
+      - calibrate/diameter-independent-data
+    paths:
+      - "diameter/**"
+      - "experiments/diameter_calibrate_from_independent_pcaps.py"
+      - "experiments/diameter_verify_calibrated_dataset.py"
+      - "experiments/diameter_external_pcap_validation.py"
+      - "experiments/diameter_external_attack_validation.py"
+      - "experiments/diameter_external_attack_driver.dart"
+      - ".github/workflows/diameter-calibrated-full-experiment.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diameter-calibrated-full-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  calibrated-full-experiment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      CALIBRATION_DIR: independent_calibration_pcaps
+      CALIBRATION_OUT: results_diameter_calibration
+      DIAMETER_CALIBRATION_PROFILE: results_diameter_calibration/calibration_profile.json
+      ORANGE_COMMIT: 75b350c22cc744d5742fcb71777cd3c9b131c19c
+      KELLY_COMMIT: 8917b2d8d4ab16a2877a7c2c1bccb1bc2e789864
+
+    steps:
+      - name: Checkout detector repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: Install system dependencies
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update -o Acquire::Retries=3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark tcpdump netcat-openbsd
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Compile calibration and experiment code
+        run: |
+          python -m py_compile             diameter/diameter_sim_v1.py             diameter/diameter_training_v1.py             experiments/diameter_calibrate_from_independent_pcaps.py             experiments/diameter_verify_calibrated_dataset.py             experiments/diameter_external_pcap_validation.py             experiments/diameter_external_attack_validation.py
+
+      - name: Download independent calibration corpus from Orange diafuzzer
+        run: |
+          set -euo pipefail
+          mkdir -p "${CALIBRATION_DIR}"
+          base="https://raw.githubusercontent.com/Orange-OpenSource/diafuzzer/${ORANGE_COMMIT}/captures"
+          curl -fL --retry 4 -o "${CALIBRATION_DIR}/orange_S6a.pcap" "${base}/S6a.pcap"
+          curl -fL --retry 4 -o "${CALIBRATION_DIR}/orange_S6a_perso.pcap" "${base}/S6a_perso.pcap"
+          curl -fL --retry 4 -o "${CALIBRATION_DIR}/orange_Cx.pcap" "${base}/Cx.pcap"
+          sha256sum "${CALIBRATION_DIR}"/*.pcap | tee "${CALIBRATION_DIR}/SHA256SUMS"
+          {
+            echo "Calibration source: Orange-OpenSource/diafuzzer"
+            echo "Pinned commit: ${ORANGE_COMMIT}"
+            echo "Files: captures/S6a.pcap, captures/S6a_perso.pcap, captures/Cx.pcap"
+            echo "Role: calibration only; never used as external holdout below"
+          } > "${CALIBRATION_DIR}/PROVENANCE.txt"
+
+      - name: Calibrate simulator on independent PCAP evidence
+        run: |
+          python experiments/diameter_calibrate_from_independent_pcaps.py             "${CALIBRATION_DIR}/orange_S6a.pcap"             "${CALIBRATION_DIR}/orange_S6a_perso.pcap"             "${CALIBRATION_DIR}/orange_Cx.pcap"             --out-dir "${CALIBRATION_OUT}"             --source "Orange-OpenSource/diafuzzer"             --source-commit "${ORANGE_COMMIT}"             --prior-strength 40
+
+      - name: Generate 24-hour calibrated Diameter dataset
+        run: |
+          rm -f diameter_dataset_v1.csv
+          python diameter/diameter_sim_v1.py
+          test -s diameter_dataset_v1.csv
+
+      - name: Verify calibration propagated into synthetic training data
+        run: |
+          python experiments/diameter_verify_calibrated_dataset.py             --dataset diameter_dataset_v1.csv             --profile "${DIAMETER_CALIBRATION_PROFILE}"             --out "${CALIBRATION_OUT}/calibrated_dataset_verification.json"
+
+      - name: Train and evaluate all Diameter ML models
+        run: |
+          rm -rf results_diameter_v1
+          python diameter/diameter_training_v1.py
+
+      - name: Check full model inventory
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          p = "results_diameter_v1/full_comparison_diameter.csv"
+          df = pd.read_csv(p)
+          required = {
+              "Isolation Forest", "One-Class SVM", "Autoencoder", "VAE",
+              "LSTM-Autoencoder", "Temporal-Attention-AE",
+              "Random Forest", "Gradient Boosting", "Cascade",
+              "Meta-Ensemble",
+          }
+          missing = sorted(required - set(df["name"]))
+          if missing:
+              raise SystemExit(f"Missing trained/evaluated models: {missing}")
+          ens = sorted(x for x in df["name"] if str(x).startswith("Ens:"))
+          if not ens:
+              raise SystemExit("Specialized ensemble models were not evaluated")
+          print(df.to_string(index=False))
+          print(f"\nModel rows: {len(df)}; specialized ensemble rows: {len(ens)}")
+          PY
+
+      - name: Download untouched Kelly benign holdout traces
+        run: |
+          set -euo pipefail
+          mkdir -p holdout_benign_pcaps
+          base="https://raw.githubusercontent.com/KellyKinyama/diameter-protocol/${KELLY_COMMIT}"
+          for f in s6a.pcap gy.pcap rx.pcap gy_mscc.pcap; do
+            curl -fL --retry 4 -o "holdout_benign_pcaps/${f}" "${base}/${f}"
+          done
+          sha256sum holdout_benign_pcaps/*.pcap | tee holdout_benign_pcaps/SHA256SUMS
+          {
+            echo "Holdout source: KellyKinyama/diameter-protocol"
+            echo "Pinned commit: ${KELLY_COMMIT}"
+            echo "Role: untouched holdout; not used to fit calibration profile"
+          } > holdout_benign_pcaps/PROVENANCE.txt
+
+      - name: Revalidate calibrated portable branch on untouched benign holdout
+        run: |
+          python experiments/diameter_external_pcap_validation.py             holdout_benign_pcaps/s6a.pcap             holdout_benign_pcaps/gy.pcap             holdout_benign_pcaps/rx.pcap             holdout_benign_pcaps/gy_mscc.pcap             --out-dir results_calibrated_external_benign
+
+      - name: Checkout pinned independent Diameter stack for attack holdout
+        run: |
+          git clone --filter=blob:none https://github.com/KellyKinyama/diameter-protocol.git external_diameter
+          git -C external_diameter checkout "${KELLY_COMMIT}"
+          cp experiments/diameter_external_attack_driver.dart external_diameter/bin/external_attack_driver.dart
+          cd external_diameter
+          dart pub get
+          dart analyze bin/external_attack_driver.dart
+
+      - name: Start independent S6a HSS
+        run: |
+          (
+            cd external_diameter
+            HSS_BIND=127.0.0.1             HSS_PORT=3868             HSS_ORIGIN_HOST=hss.open5gs.org             HSS_ORIGIN_REALM=open5gs.org             dart run bin/hss_stub.dart
+          ) > external_hss.log 2>&1 &
+          echo $! > /tmp/external_hss.pid
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 3868; then exit 0; fi
+            sleep 1
+          done
+          cat external_hss.log
+          exit 1
+
+      - name: Capture independent benign controls and reproduced attacks
+        env:
+          S6A_HOST: 127.0.0.1
+          S6A_PORT: "3868"
+          S6A_DEST_REALM: open5gs.org
+          S6A_IMSI: "999700000000001"
+        run: |
+          set -euo pipefail
+          mkdir -p holdout_attack_pcaps
+          manifest="holdout_attack_pcaps/manifest.csv"
+          echo "capture,expected_label,scenario" > "${manifest}"
+
+          capture_case() {
+            name="$1"; label="$2"; scenario="$3"; count="$4"; delay_ms="$5"
+            out="$GITHUB_WORKSPACE/holdout_attack_pcaps/${name}"
+            sudo tcpdump -i lo -U -s 0 -w "${out}" 'tcp port 3868' >/tmp/tcpdump.log 2>&1 &
+            cap_pid=$!
+            sleep 1.25
+            (
+              cd external_diameter
+              dart run bin/external_attack_driver.dart "${scenario}" "${count}" "${delay_ms}"
+            )
+            sleep 0.75
+            sudo pkill -INT -x tcpdump || true
+            wait "${cap_pid}" || true
+            sudo chown "$USER":"$USER" "${out}"
+            test -s "${out}"
+            echo "${name},${label},${scenario}" >> "${manifest}"
+          }
+
+          capture_case benign_attach_1.pcap benign benign_attach 1 800
+          capture_case benign_attach_2.pcap benign benign_attach 2 1200
+          capture_case benign_reauth_2.pcap benign benign_reauth 2 1200
+          capture_case benign_reauth_3.pcap benign benign_reauth 3 1500
+          capture_case attack_air_flood_20.pcap attack air_flood 20 0
+          capture_case attack_air_flood_80.pcap attack air_flood 80 0
+          capture_case attack_ulr_flood_20.pcap attack ulr_flood 20 0
+          capture_case attack_ulr_flood_80.pcap attack ulr_flood 80 0
+          capture_case attack_mixed_flood_20.pcap attack mixed_flood 20 0
+          capture_case attack_mixed_flood_60.pcap attack mixed_flood 60 0
+          capture_case attack_tracking_burst_10.pcap attack tracking_burst 10 0
+          capture_case attack_tracking_burst_30.pcap attack tracking_burst 30 0
+
+          {
+            echo "Holdout stack: KellyKinyama/diameter-protocol"
+            echo "Pinned commit: ${KELLY_COMMIT}"
+            echo "Transport: real TCP loopback captured with tcpdump"
+            echo "Calibration corpus: none of these captures"
+          } > holdout_attack_pcaps/PROVENANCE.txt
+          sha256sum holdout_attack_pcaps/*.pcap | tee holdout_attack_pcaps/SHA256SUMS
+
+      - name: Revalidate calibrated portable branch on attack holdout
+        run: |
+          python experiments/diameter_external_attack_validation.py             --manifest holdout_attack_pcaps/manifest.csv             --pcap-dir holdout_attack_pcaps             --out-dir results_calibrated_external_attacks
+
+      - name: Stop independent HSS
+        if: always()
+        run: |
+          if [ -f /tmp/external_hss.pid ]; then
+            kill "$(cat /tmp/external_hss.pid)" || true
+          fi
+          tail -n 100 external_hss.log || true
+
+      - name: Build consolidated experiment summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import pandas as pd
+
+          out = {}
+          def load_json(path, key):
+              p = Path(path)
+              if p.exists():
+                  out[key] = json.loads(p.read_text(encoding="utf-8"))
+          load_json("results_diameter_calibration/calibration_profile.json", "calibration")
+          load_json("results_diameter_calibration/calibrated_dataset_verification.json", "dataset_verification")
+          load_json("results_calibrated_external_benign/summary.json", "external_benign")
+          load_json("results_calibrated_external_attacks/summary.json", "external_attacks")
+
+          p = Path("results_diameter_v1/full_comparison_diameter.csv")
+          if p.exists():
+              df = pd.read_csv(p)
+              out["all_model_metrics"] = df.to_dict(orient="records")
+              out["best_by_f1"] = df.sort_values("f1", ascending=False).head(5).to_dict(orient="records")
+
+          Path("calibrated_full_experiment_summary.json").write_text(
+              json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8"
+          )
+          print(json.dumps(out, indent=2, ensure_ascii=False))
+          PY
+
+      - name: Publish key results
+        if: always()
+        run: |
+          {
+            echo "## Diameter calibrated full ML experiment"
+            echo
+            if [ -f "${CALIBRATION_OUT}/calibration_profile.json" ]; then
+              echo "### Calibration profile"
+              echo '~~~json'
+              cat "${CALIBRATION_OUT}/calibration_profile.json"
+              echo '~~~'
+            fi
+            if [ -f results_diameter_v1/full_comparison_diameter.csv ]; then
+              echo "### All ML model metrics"
+              echo '~~~'
+              cat results_diameter_v1/full_comparison_diameter.csv
+              echo '~~~'
+            fi
+            if [ -f results_calibrated_external_benign/summary.json ]; then
+              echo "### Untouched benign holdout"
+              echo '~~~json'
+              cat results_calibrated_external_benign/summary.json
+              echo '~~~'
+            fi
+            if [ -f results_calibrated_external_attacks/summary.json ]; then
+              echo "### Independent attack holdout"
+              echo '~~~json'
+              cat results_calibrated_external_attacks/summary.json
+              echo '~~~'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full calibrated experiment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diameter-calibrated-full-experiment
+          path: |
+            calibrated_full_experiment_summary.json
+            diameter_dataset_v1.csv
+            results_diameter_calibration/
+            results_diameter_v1/
+            results_calibrated_external_benign/
+            results_calibrated_external_attacks/
+            independent_calibration_pcaps/
+            holdout_benign_pcaps/
+            holdout_attack_pcaps/
+            external_hss.log
+          if-no-files-found: warn
+          compression-level: 6
