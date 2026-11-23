@@ -14,7 +14,7 @@ for label,url in sources.items():
     result={"dataset":label,"url":url,"status":"blocked","entries":[]}
     try:
         if label=="alvares":
-            paths=gdown.download_folder(url=url,skip_download=True,remaining_ok=True,quiet=True,use_cookies=False,timeout=40)
+            paths=gdown.download_folder(url=url,skip_download=True,quiet=True,use_cookies=False,timeout=40)
         else:
             x=gdown.download(url=url,skip_download=True,quiet=True,use_cookies=False,timeout=40)
             paths=[x] if x is not None else []
