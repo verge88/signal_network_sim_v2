@@ -1,0 +1,49 @@
+name: Audit loss-adaptive SIP TICD paired seed results
+on:
+  push:
+    branches: [improve/ticd-loss-adaptive-normalization]
+    paths:
+      - 'experiments/audit_sip_ticd_loss_adaptive.py'
+      - '.github/workflows/sip-ticd-loss-aware-audit.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get untouched test reports from prior successful training
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          gh run download 45241995039 --repo "${{ github.repository }}" --name sip-ticd-loss-aware-retrained-evaluation --dir artifacts
+          src="$(find artifacts -type f -name loss_aware_experiment_report.json -print -quit)"
+          test -n "$src"
+          echo "AUDIT_SOURCE=$src" >> "$GITHUB_ENV"
+      - name: Cross-check per-seed paired FPR changes and no reused seed
+        run: |
+          python3 -m experiments.audit_sip_ticd_loss_adaptive --source "$AUDIT_SOURCE" --out audited_ticd_loss
+      - name: Summarize per-simulation-run uncertainty
+        run: |
+          echo "## Paired held-out simulation seed audit — no real TICD validation" >> "$GITHUB_STEP_SUMMARY"
+          echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d=json.load(open("audited_ticd_loss/paired_seed_audit.json"))
+          for k,v in d["cohort_level_audit"].items():
+              print(k, "all FPR improved:",v["all_three_seeds_improve_FPR"],
+                    "mean delta FPR (pp):",v["mean_FPR_change_percentage_points"],
+                    "mean delta recall (pp):",v["mean_recall_change_percentage_points"],
+                    "SD delta FPR (pp):",v["sd_FPR_change_percentage_points"])
+          PY
+          echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sip-ticd-loss-aware-paired-seed-audit
+          path: audited_ticd_loss/paired_seed_audit.json
+          retention-days: 30
