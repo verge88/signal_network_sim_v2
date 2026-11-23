@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import Dict, Iterable, List
@@ -172,16 +174,19 @@ def train_portable_models(df: pd.DataFrame, seed: int = 42):
 
 
 def _run_tshark(path: Path) -> List[Dict[str, str]]:
-    cmd = [
-        "tshark", "-r", str(path), "-Y", "diameter", "-T", "fields",
-        "-E", "separator=\\t", "-E", "occurrence=f",
-        "-e", "frame.time_epoch", "-e", "diameter.cmd.code",
-        "-e", "diameter.applicationId", "-e", "diameter.CC-Request-Type",
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0 and "permission" in proc.stderr.lower():
-        proc = subprocess.run(["sudo", *cmd], capture_output=True, text=True)
-    proc.check_returncode()
+    # Ubuntu 26.04 confines tshark with AppArmor. A user-owned copy in /tmp
+    # is readable while an identical file under the GitHub workspace may not be.
+    with tempfile.TemporaryDirectory(prefix="diameter-pcap-", dir="/tmp") as td:
+        safe_path = Path(td) / path.name
+        shutil.copy2(path, safe_path)
+        cmd = [
+            "tshark", "-r", str(safe_path), "-Y", "diameter", "-T", "fields",
+            "-E", "separator=\\t", "-E", "occurrence=f",
+            "-e", "frame.time_epoch", "-e", "diameter.cmd.code",
+            "-e", "diameter.applicationId", "-e", "diameter.CC-Request-Type",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc.check_returncode()
     rows = []
     for line in proc.stdout.splitlines():
         parts = line.split("\t")
