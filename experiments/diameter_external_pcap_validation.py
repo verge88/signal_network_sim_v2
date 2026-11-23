@@ -634,6 +634,18 @@ def main() -> None:
     if metrics["feature_coverage_fraction"] < 0.25:
         raise SystemExit("Portable feature coverage unexpectedly too small")
 
+    # Pre-declared robustness acceptance guardrails.  A domain-transfer fix is
+    # rejected if it merely suppresses anomaly scores at the cost of material
+    # sensitivity loss on the complete feature space.
+    if metrics["iso_robust_external_benign_fpr"] > metrics["iso_legacy_external_benign_fpr"]:
+        raise SystemExit("Robust IF worsened external benign FPR")
+    if metrics["iso_robust_external_benign_fpr"] > 0.25:
+        raise SystemExit("Robust IF external benign FPR remains above 25%")
+    if metrics["full_iso_robust_internal_auc"] + 0.01 < metrics["full_iso_legacy_internal_auc"]:
+        raise SystemExit("Robust full-feature IF lost more than 0.01 AUC")
+    if metrics["full_iso_robust_internal_f1"] + 0.02 < metrics["full_iso_legacy_internal_f1"]:
+        raise SystemExit("Robust full-feature IF lost more than 0.02 F1")
+
 
 if __name__ == "__main__":
     main()
