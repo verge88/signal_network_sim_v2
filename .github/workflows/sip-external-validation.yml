@@ -1,0 +1,86 @@
+name: SIP independent external PCAP audit
+
+on:
+  push:
+    branches:
+      - validation/sip-independent-pcap
+    paths:
+      - 'experiments/sip_external_pcap_validation.py'
+      - '.github/workflows/sip-external-validation.yml'
+  pull_request:
+    paths:
+      - 'experiments/sip_external_pcap_validation.py'
+      - '.github/workflows/sip-external-validation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sip-external:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install packet analyzer
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+      - name: Download independently recorded SIP sample captures
+        env:
+          UPSTREAM_SHA: a2ae37cbc3152fab55c1a3cca754c7397148e755
+        run: |
+          set -euo pipefail
+          mkdir -p external_sip_pcaps
+          for name in Asterisk_ZFONE_XLITE.pcap DTMFsipinfo.pcap; do
+            curl --fail --location --retry 3 \
+              "https://raw.githubusercontent.com/NormB/sipnab/${UPSTREAM_SHA}/tests/pcap-samples/${name}" \
+              -o "external_sip_pcaps/${name}"
+          done
+          sha256sum external_sip_pcaps/*.pcap | tee external_sip_pcaps/SHA256SUMS
+          cat > external_sip_pcaps/PROVENANCE.txt <<EOF
+          Original catalog: Wireshark Wiki SampleCaptures, SIP and RTP section
+          Mirror: NormB/sipnab/tests/pcap-samples
+          Mirror revision: ${UPSTREAM_SHA}
+          Captures: Asterisk_ZFONE_XLITE.pcap, DTMFsipinfo.pcap
+          Independent of signal_network_sim_v2 simulator source.
+          Sample network captures; exact acquisition circumstances are not
+          independently audited. Not a labeled attack corpus or production
+          operator dataset. Do not claim a fully independent TICD test.
+          EOF
+      - name: Inspect capture metadata
+        run: |
+          for p in external_sip_pcaps/*.pcap; do
+            capinfos -c -u "$p"
+          done
+      - name: Audit network-observable SIP transaction invariant
+        run: |
+          python3 experiments/sip_external_pcap_validation.py \
+            external_sip_pcaps/Asterisk_ZFONE_XLITE.pcap \
+            external_sip_pcaps/DTMFsipinfo.pcap \
+            --out-dir results_external_sip
+      - name: Publish summary
+        if: always()
+        run: |
+          if test -f results_external_sip/summary.json; then
+            {
+              echo '## SIP external network-capture audit'
+              echo
+              echo 'This is NOT full TICD validation (no slave reports or attack ground truth).'
+              echo
+              echo '~~~json'
+              cat results_external_sip/summary.json
+              echo '~~~'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload reproducibility artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sip-independent-pcap-audit
+          path: |
+            results_external_sip/
+            external_sip_pcaps/SHA256SUMS
+            external_sip_pcaps/PROVENANCE.txt
+          if-no-files-found: warn
