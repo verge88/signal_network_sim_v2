@@ -73,7 +73,10 @@ jobs:
           for pcap in external_pcaps/*.pcap; do
             echo "=== ${pcap} ==="
             capinfos -c -u -a -e "${pcap}" || true
-            sudo tshark -r "${pcap}" -Y diameter -T fields               -e diameter.cmd.code -e diameter.applicationId | head -n 30
+            td=$(mktemp -d)
+            cp "${pcap}" "${td}/input.pcap"
+            tshark -r "${td}/input.pcap" -Y diameter -T fields               -e diameter.cmd.code -e diameter.applicationId | head -n 30
+            rm -rf "${td}"
           done
 
       - name: Run independent validation
