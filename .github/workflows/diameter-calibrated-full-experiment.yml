@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - calibrate/diameter-independent-data
+      - regularize/diameter-overfit-guard
     paths:
       - "diameter/**"
       - "experiments/diameter_calibrate_from_independent_pcaps.py"
