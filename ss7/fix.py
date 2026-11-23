@@ -796,6 +796,57 @@ class Ss7Sim:
                     off[k] = off.get(k, 0.0) + f.rate * bits * sh
         return off
 
+    def _effective_route_shares(
+        self,
+        route: Route,
+        src: int,
+        dst: int,
+        t: int,
+        episodes: List[Episode],
+    ) -> np.ndarray:
+        """Return load-sharing weights after an active benign reroute event.
+
+        Baseline ECMP uses route.shares.  A reroute is a benign operational
+        control: total offered traffic is unchanged, but for a node touched by
+        the route the load is moved to one deterministic alternative shortest
+        path for the duration of the event.  If the event node is an
+        intermediate hop, prefer a shortest path that avoids it; for an
+        endpoint, choose an alternate egress path.  The choice is fixed for the
+        whole episode (nid+t0), not re-randomised every interval.
+        """
+        shares = np.asarray(route.shares, dtype=float).copy()
+        if len(route.paths) < 2:
+            return shares
+
+        active = [
+            ep for ep in episodes
+            if ep.kind == "reroute"
+            and ep.nid is not None
+            and ep.t0 <= t <= ep.t1
+            and any(int(ep.nid) in path for path in route.paths)
+        ]
+        if not active:
+            return shares
+
+        # Deterministic precedence when rare overlapping reroutes affect a route.
+        ep = sorted(active, key=lambda e: (int(e.t0), int(e.nid)))[0]
+        nid = int(ep.nid)
+        internal_touch = any(nid in path[1:-1] for path in route.paths)
+        if internal_touch:
+            candidates = [
+                i for i, path in enumerate(route.paths)
+                if nid not in path[1:-1]
+            ]
+        else:
+            candidates = list(range(len(route.paths)))
+        if not candidates:
+            candidates = list(range(len(route.paths)))
+
+        chosen = candidates[(nid + int(ep.t0)) % len(candidates)]
+        out = np.zeros(len(route.paths), dtype=float)
+        out[chosen] = 1.0
+        return out
+
     # ---- один интервал -----------------------------------------------------
     def step_true(self, t: int, episodes: List[Episode]
                   ) -> Tuple[Dict[int, NodeState], Dict[int, Dict], Dict]:
@@ -844,7 +895,10 @@ class Ss7Sim:
             r = topo.route(f.src, f.dst)
             if not r.paths:
                 continue
-            split = rng.multinomial(n_txn, r.shares)
+            route_shares = self._effective_route_shares(
+                r, f.src, f.dst, t, episodes
+            )
+            split = rng.multinomial(n_txn, route_shares)
             for path, cnt in zip(r.paths, split):
                 if cnt <= 0 or any((min(u, v), max(u, v)) in failed_links
                                    for u, v in zip(path[:-1], path[1:])):
