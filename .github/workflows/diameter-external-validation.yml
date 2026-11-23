@@ -3,11 +3,14 @@ name: Diameter external PCAP validation
 on:
   push:
     branches:
+      - main
       - validation/diameter-external-pcap
     paths:
       - "diameter/**"
       - "experiments/diameter_external_pcap_validation.py"
       - ".github/workflows/diameter-external-validation.yml"
+  issue_comment:
+    types: [created]
   workflow_dispatch:
 
 permissions:
@@ -15,6 +18,10 @@ permissions:
 
 jobs:
   external-validation:
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request &&
+       github.event.comment.body == '/run-diameter-external-validation')
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
