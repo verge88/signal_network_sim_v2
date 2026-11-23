@@ -26,7 +26,7 @@ from retrain_sip_ticd_calibrated import evaluate
 
 STRESS_GROUPS=("weak_covert","weak_covert_loss5","truthful_compromised_reports")
 
-def simulate_stress(seed,cal,condition,hours=2.):
+def simulate_stress(seed,cal,condition,hours=2.,loss_multiplier=None):
     cfg=SimulationConfig(seed=seed,duration_hours=hours,interval_s=20.,
         n_sbc=2,n_proxy=3,n_registrar=2,n_ua_gw=4,n_redirect=2,
         master_node_ids=[0,1])
@@ -62,9 +62,14 @@ def simulate_stress(seed,cal,condition,hours=2.):
         freq={m:float(node.method_dist[m])*float(weights.get(m,1.)) for m in SIP_METHODS}
         total=sum(freq.values())
         node.method_dist={k:v/total for k,v in freq.items()}
-    if condition=="weak_covert_loss5":
+    effective_loss_multiplier = (5.0 if condition=="weak_covert_loss5" else 1.0)
+    if loss_multiplier is not None:
+        effective_loss_multiplier=float(loss_multiplier)
+    if not 0.1 <= effective_loss_multiplier <= 25.0:
+        raise ValueError("Invalid independent network-loss multiplier")
+    if effective_loss_multiplier!=1.0:
         for link in sim.topology.links.values():
-            link.base_loss_prob*=5.
+            link.base_loss_prob*=effective_loss_multiplier
     if condition=="truthful_compromised_reports":
         # Deliberately change threat assumption. _honest_report reports actual
         # traffic and so no intentional tampering with CU; attack still modifies
@@ -77,7 +82,7 @@ def simulate_stress(seed,cal,condition,hours=2.):
     if not ((d.is_anomaly==1)&(d.attack_type=="proxy_compromise")).sum():
         raise RuntimeError("No compromise labels in stress output")
     return d,{"seed":seed,"condition":condition,"redirect_fractions":redirect_fractions,
-              "link_loss_multiplier":5 if condition=="weak_covert_loss5" else 1,
+              "link_loss_multiplier":effective_loss_multiplier,
               "corrupted_reports":condition!="truthful_compromised_reports",
               "attack_schedule":[{"node":a.target_nodes[0],"start":a.start_interval,
                                   "sophistication":a.sophistication.value,
