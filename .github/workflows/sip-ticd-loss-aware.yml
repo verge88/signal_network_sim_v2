@@ -1,0 +1,98 @@
+name: SIP TICD loss-adaptive normalization and heldout robustness
+on:
+  push:
+    branches: [improve/ticd-loss-adaptive-normalization]
+    paths:
+      - '.github/workflows/sip-ticd-loss-aware.yml'
+      - 'sip/ticd_loss_conditioned.py'
+      - 'experiments/evaluate_sip_ticd_loss_adaptive.py'
+      - 'experiments/test_ticd_loss_conditioned.py'
+      - 'experiments/stress_sip_ticd_multiscale.py'
+      - 'experiments/retrain_sip_ticd_calibrated.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  loss-aware:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+      PYTHONHASHSEED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install runtime
+        run: |
+          python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+          python -m pip freeze > loss_adaptive_environment.txt
+      - name: Check source code syntax and score behavior before simulations
+        run: |
+          python -m compileall -q experiments/evaluate_sip_ticd_loss_adaptive.py experiments/test_ticd_loss_conditioned.py sip/ticd_loss_conditioned.py experiments/stress_sip_ticd_multiscale.py experiments/retrain_sip_ticd_calibrated.py
+          python -m experiments.test_ticd_loss_conditioned
+      - name: Retrieve pinned previously trained physical TICD
+        run: |
+          set -euo pipefail
+          mkdir -p previous
+          gh run download 45239668351 --repo "${{ github.repository }}" --name sip-ticd-master-physical-closure-retrained --dir previous
+          saved="$(find previous -type f -name ticd_physical_closure_model.pkl -print -quit)"
+          test -n "$saved"
+          echo "PRIOR_DIR=$(dirname "$saved")" >> "$GITHUB_ENV"
+      - name: Train loss-aware benign reference and test on new disjoint seeds
+        run: |
+          python -m experiments.evaluate_sip_ticd_loss_adaptive --source "$PRIOR_DIR" --out results_ticd_loss_adaptive
+      - name: Verify model is reloadable with preserved reference manifest
+        run: |
+          python - <<'PY'
+          import sys,json,pickle
+          sys.path.insert(0,'sip')
+          with open('results_ticd_loss_adaptive/ticd_loss_adaptive_model.pkl','rb') as f:
+              saved=pickle.load(f)
+          report=json.load(open('results_ticd_loss_adaptive/loss_aware_experiment_report.json'))
+          assert saved['selected_name']==report['selected_model']
+          assert saved['model'].fitted or saved['selected_name']=='physical_robust'
+          assert report['reload_success']
+          assert report['max_batch_score_difference']<=1e-12
+          assert report['real_calibration_source_sha256']=='e455d66eef30d9399ba3beefc36ad2a4a7e2fac0684aa1ae405a30a2371af9a7'
+          assert not report['external_real_world_ticd_validation']
+          print('LOSS_AWARE_RELOAD_AND_REFERENCE_OK',saved['selected_name'])
+          PY
+      - name: Publish results
+        if: always()
+        run: |
+          if [ -f results_ticd_loss_adaptive/loss_aware_experiment_report.json ]; then
+            echo '## Loss-conditional SIP TICD — normal-only calibration; independent synthetic holdout' >> "$GITHUB_STEP_SUMMARY"
+            echo 'No claim of real-world proxy-compromise performance. Loss is a CU-path proxy, not direct SIP packet loss.' >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d=json.load(open('results_ticd_loss_adaptive/loss_aware_experiment_report.json'))
+          print('Selected:',d['selected_model'])
+          print('Normal calibration reference validation FPR:',d['normal_validation_fpr'])
+          print('Architecture selection utility (synthetic development):',d['selection_utilities'])
+          for cohort,models in d['heldout_metrics'].items():
+              print('\nCOHORT',cohort)
+              for name in ('old_physical_1pc','physical_robust','old_temporal_1pc',d['selected_model']):
+                  m=models[name]
+                  print(name,'Recall',m['recall'],'FPR',m['fpr'],
+                        'Statistical',m['by_sophistication']['statistical']['recall'],
+                        'Adaptive',m['by_sophistication']['adaptive']['recall'])
+          PY
+            echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-ticd-loss-aware-retrained-evaluation
+          path: |
+            results_ticd_loss_adaptive/
+            loss_adaptive_environment.txt
+          if-no-files-found: warn
+          retention-days: 30
