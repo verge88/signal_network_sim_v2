@@ -46,12 +46,13 @@ jobs:
           mkdir -p results
           python -m ss7.validate_real_cdr \
             --date 2013-11-01 \
-            --max-bytes 33554432 \
-            --max-real-windows 30000 \
-            --synthetic-days 0.25 \
+            --max-bytes 67108864 \
+            --max-real-windows 120000 \
+            --synthetic-days 0.5 \
             --target-fpr 0.01 \
             --seed 42 \
-            --output results/ss7_real_cdr_validation.json \
+            --output results/ss7_real_cdr_calibration.json \
+            --summary-csv results/ss7_real_cdr_calibration.csv \
             2>&1 | tee results/validation.log
 
       - name: Upload validation report
