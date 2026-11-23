@@ -8,6 +8,13 @@ on:
       - "ss7/validate_real_cdr.py"
       - "ss7/fix.py"
       - ".github/workflows/ss7-real-cdr-validation.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "ss7/validate_real_cdr.py"
+      - "ss7/fix.py"
+      - ".github/workflows/ss7-real-cdr-validation.yml"
   workflow_dispatch:
 
 permissions:
