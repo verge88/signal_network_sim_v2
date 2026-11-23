@@ -145,7 +145,7 @@ def main():
     print("PHYSICAL_ARCHITECTURE_CHOSEN",json.dumps({
        "selected":selected,"dev_utility":development_utility,
        "dev_compromise_by_model":{k:{n:v["by_sophistication"]
-            for n,v in dev_results[k].items()} for k in dev_results}},flush=True)
+            for n,v in dev_results[k].items()} for k in dev_results}},ensure_ascii=False),flush=True)
 
     # Only now generate previously unobserved heldout records.
     result={};seed_rows={}
