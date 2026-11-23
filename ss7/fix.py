@@ -1267,6 +1267,17 @@ def make_episodes(sim: Ss7Sim, cfg: SimConfig, rng: np.random.Generator,
                            budget=float(rng.uniform(0.7, 1.0)),
                            sophistication=soph,
                            params=rng.random(2)))
+    reroute_candidates = []
+    for candidate in sim.topo.slaves:
+        if any(
+            len(sim.topo.route(f.src, f.dst).paths) > 1
+            and any(candidate in path for path in sim.topo.route(f.src, f.dst).paths)
+            for f in sim.flows
+        ):
+            reroute_candidates.append(int(candidate))
+    if not reroute_candidates:
+        reroute_candidates = [int(n) for n in sim.topo.slaves]
+
     for _ in range(n_normal):
         k = str(rng.choice(NORMAL_EVENTS))
         t0 = int(rng.integers(cfg.feat_window + 5, max(T - 120, cfg.feat_window + 6)))
@@ -1275,7 +1286,8 @@ def make_episodes(sim: Ss7Sim, cfg: SimConfig, rng: np.random.Generator,
                 "scale_in": rng.uniform(0.5, 0.8),
                 "campaign": rng.uniform(1.8, 4.0),
                 "link_failure": 1.0, "reroute": 1.0}[k]
-        eps.append(Episode(kind=k, nid=int(rng.choice(sim.topo.slaves)), t0=t0,
+        event_nodes = reroute_candidates if k == "reroute" else sim.topo.slaves
+        eps.append(Episode(kind=k, nid=int(rng.choice(event_nodes)), t0=t0,
                            t1=min(T - 1, t0 + dur(20, 150)), mult=float(mult)))
     for _ in range(n_ext):
         t0 = int(rng.integers(cfg.feat_window + 5, max(T - 120, cfg.feat_window + 6)))
