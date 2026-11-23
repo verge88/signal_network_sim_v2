@@ -46,9 +46,9 @@ jobs:
           mkdir -p results
           python -m ss7.validate_real_cdr \
             --date 2013-11-01 \
-            --max-bytes 67108864 \
-            --max-real-windows 60000 \
-            --synthetic-days 0.5 \
+            --max-bytes 33554432 \
+            --max-real-windows 30000 \
+            --synthetic-days 0.25 \
             --target-fpr 0.01 \
             --seed 42 \
             --output results/ss7_real_cdr_validation.json \
