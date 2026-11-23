@@ -1,0 +1,50 @@
+name: SS7 context-aware INV screening
+
+on:
+  push:
+    branches:
+      - validate-ss7-real-cdr
+    paths:
+      - ".github/workflows/ss7-context-aware-screen.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  screen-context-aware-inv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install scientific dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn joblib
+
+      - name: Screening run
+        run: |
+          set -o pipefail
+          mkdir -p results/ss7_context_aware_screen
+          python -m ss7.validate_context_aware_detector \
+            --seeds 6101 6102 \
+            --days 0.65 \
+            --output-dir results/ss7_context_aware_screen \
+            2>&1 | tee results/ss7_context_aware_screen/validation.log
+
+      - name: Upload screening artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss7-context-aware-screen
+          path: results/ss7_context_aware_screen/
+          if-no-files-found: warn
+          retention-days: 30
