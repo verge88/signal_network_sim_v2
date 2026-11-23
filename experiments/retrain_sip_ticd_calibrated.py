@@ -27,7 +27,7 @@ from sip_sim_v4_claude import (SIPSimulator,SimulationConfig,AttackScenario,
     SIP_METHODS,add_zone_deviation_features,NodeRole)
 from ticd_recalibrated import FrozenReferenceTICD
 
-def simulation(seed:int,calibration:dict,duration_hours:float,attacks_enabled:bool):
+def simulation(seed:int,calibration:dict,duration_hours:float,attacks_enabled:bool,loss_multiplier:float=1.0):
     cfg=SimulationConfig(seed=seed,duration_hours=duration_hours,interval_s=20.,
                          n_sbc=2,n_proxy=3,n_registrar=2,n_ua_gw=4,n_redirect=2,
                          master_node_ids=[0,1])
@@ -66,6 +66,11 @@ def simulation(seed:int,calibration:dict,duration_hours:float,attacks_enabled:bo
         total=sum(dist.values())
         node.method_dist={m:float(v/total) for m,v in dist.items()}
         orig[node.node_id]=node.method_dist
+    if not (0.1 <= float(loss_multiplier) <= 25.0):
+        raise ValueError("Loss multiplier must be within [0.1,25]")
+    if float(loss_multiplier)!=1.0:
+        for link in sim.topology.links.values():
+            link.base_loss_prob*=float(loss_multiplier)
     sim.run()
     df=add_zone_deviation_features(sim.to_dataframe())
     if df.empty:raise RuntimeError("Simulated data empty")
@@ -81,6 +86,7 @@ def simulation(seed:int,calibration:dict,duration_hours:float,attacks_enabled:bo
     return df,{"seed":seed,"hours":duration_hours,"intervals":n,"rows":len(df),
        "attack_count":int(df["is_anomaly"].sum()),
        "normal_count":int((df["is_anomaly"]==0).sum()),
+       "link_loss_multiplier":float(loss_multiplier),
        "attack_schedules":[{"type":x.attack_type.value,"target_nodes":x.target_nodes,
                             "start":x.start_interval,"end":x.end_interval,
                             "sophistication":x.sophistication.value} for x in a],
