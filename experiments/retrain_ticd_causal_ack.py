@@ -161,7 +161,7 @@ def main():
     best=max(candidates,key=lambda n:(scores[n],-list(candidates).index(n)))
     print("CAUSAL_ACK_SELECTED_ON_DEV",json.dumps({
         "selected":best,"utilities":scores,
-        "baseline_utility":objective({x:development[x]["baseline"] for x in DEV})},flush=True)
+        "baseline_utility":objective({x:development[x]["baseline"] for x in DEV})},ensure_ascii=False),flush=True)
 
     # Never use final test data to refit threshold, choose weight or span.
     final={};by_seed={}
