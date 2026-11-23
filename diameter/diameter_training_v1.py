@@ -80,8 +80,12 @@ class TrainingConfig:
     seed: int = 42
 
     # Unsupervised models
-    iso_forest_trees: int = 300
-    iso_forest_contamination: float = 0.05
+    iso_forest_trees: int = 500
+    iso_forest_contamination: float = 0.05  # retained for experiment metadata
+    iso_forest_max_features: float = 0.75
+    iso_forest_bootstrap: bool = True
+    iso_forest_clip_lower_q: float = 0.001
+    iso_forest_clip_upper_q: float = 0.999
     ocsvm_nu: float = 0.05
     ocsvm_kernel: str = "rbf"
 
@@ -607,6 +611,24 @@ class VAETrainer:
 
 
 # ══════════════════════════════════════════════════════════
+#  Robust Isolation-Forest preprocessing
+# ══════════════════════════════════════════════════════════
+
+def fit_iso_robust_bounds(X_normal, lower_q=0.001, upper_q=0.999):
+    """Fit wide winsorization bounds on benign TRAINING observations only."""
+    X = np.asarray(X_normal, dtype=float)
+    low = np.nanquantile(X, lower_q, axis=0)
+    high = np.nanquantile(X, upper_q, axis=0)
+    return low, high
+
+
+def apply_iso_robust_bounds(X, low, high):
+    """Clip representation artifacts without using validation/test statistics."""
+    X = np.asarray(X, dtype=float)
+    return np.minimum(np.maximum(X, low), high)
+
+
+# ══════════════════════════════════════════════════════════
 #  Evaluation Utilities
 # ══════════════════════════════════════════════════════════
 
@@ -1000,17 +1022,44 @@ def main():
     print("  Training Models — Diameter v1")
     print("=" * 60)
 
-    # ── 1. Isolation Forest ──
-    print("\n[1] Isolation Forest...")
-    iso = IsolationForest(n_estimators=config.iso_forest_trees,
-                          contamination=config.iso_forest_contamination,
-                          random_state=config.seed)
-    iso.fit(X_train_normal)
-    iso_sv = -iso.score_samples(X_val)
-    iso_st = -iso.score_samples(X_test)
-    th_iso, _ = find_threshold(iso_sv, y_val, config.threshold_percentile)
-    results_list.append(evaluate_model("Isolation Forest", iso_st, y_test,
-                                       attack_types_test, threshold=th_iso))
+    # ── 1. Robust Isolation Forest ──
+    print("\n[1] Robust Isolation Forest...")
+    iso_low, iso_high = fit_iso_robust_bounds(
+        X_train_normal,
+        config.iso_forest_clip_lower_q,
+        config.iso_forest_clip_upper_q,
+    )
+    X_train_iso = apply_iso_robust_bounds(X_train, iso_low, iso_high)
+    X_train_normal_iso = apply_iso_robust_bounds(X_train_normal, iso_low, iso_high)
+    X_val_iso = apply_iso_robust_bounds(X_val, iso_low, iso_high)
+    X_test_iso = apply_iso_robust_bounds(X_test, iso_low, iso_high)
+
+    iso = IsolationForest(
+        n_estimators=config.iso_forest_trees,
+        contamination="auto",
+        max_features=config.iso_forest_max_features,
+        bootstrap=config.iso_forest_bootstrap,
+        random_state=config.seed,
+        n_jobs=-1,
+    )
+    iso.fit(X_train_normal_iso)
+    iso_sv = -iso.score_samples(X_val_iso)
+    iso_st = -iso.score_samples(X_test_iso)
+    # Calibrate only on benign validation observations.  This avoids selecting
+    # the threshold with attack labels and makes the intended FPR explicit.
+    th_iso = float(np.percentile(
+        iso_sv[y_val == 0], config.threshold_percentile
+    ))
+    iso_result = evaluate_model(
+        "Isolation Forest", iso_st, y_test,
+        attack_types_test, threshold=th_iso
+    )
+    iso_result["robustness_method"] = (
+        "benign-train-only 0.1/99.9% winsorization + "
+        "feature-subsampled bootstrap IsolationForest + "
+        "benign-validation percentile threshold"
+    )
+    results_list.append(iso_result)
 
     # ── 2. One-Class SVM ──
     print("\n[2] One-Class SVM...")
@@ -1172,7 +1221,7 @@ def main():
         return np.clip((s - p1) / (p99 - p1 + 1e-9), 0, 1)
 
     meta_train = np.column_stack([
-        norm_score(-iso.score_samples(X_train)),
+        norm_score(-iso.score_samples(X_train_iso)),
         norm_score(-svm.score_samples(X_train)),
         norm_score(ae_trainer.reconstruction_error(X_train)),
         norm_score(vae_trainer.anomaly_score(X_train)),
@@ -1292,6 +1341,15 @@ def main():
             "feature_groups": {k: [c for c in v
                                    if c in pipeline.feature_cols]
                                for k, v in FEATURE_GROUPS.items()},
+            "isolation_forest_robustness": {
+                "trees": config.iso_forest_trees,
+                "max_features": config.iso_forest_max_features,
+                "bootstrap": config.iso_forest_bootstrap,
+                "clip_lower_q": config.iso_forest_clip_lower_q,
+                "clip_upper_q": config.iso_forest_clip_upper_q,
+                "threshold_percentile": config.threshold_percentile,
+                "threshold_calibration": "benign validation only",
+            },
         }, f, indent=2)
 
     # Summary
