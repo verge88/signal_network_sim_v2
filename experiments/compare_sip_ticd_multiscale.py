@@ -106,7 +106,7 @@ def run(args):
     print("ARCHITECTURE_SELECTED_ON_DEV",json.dumps({
          "selected":selected,"utilities":utilities,
          "development_compromise":{k:v["by_compromise_sophistication"]
-                                    for k,v in developmental.items()}},flush=True)
+                                    for k,v in developmental.items()}},ensure_ascii=False),flush=True)
 
     # Exactly one final held-out evaluation pass across five new seeds.
     test=data["untouched_test"]
