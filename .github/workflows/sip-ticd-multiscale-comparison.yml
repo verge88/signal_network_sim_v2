@@ -1,0 +1,98 @@
+name: Compare improved SIP TICD on independent synthetic holdout
+on:
+  push:
+    branches: [improve/ticd-temporal-invariant-consensus]
+    paths:
+      - '.github/workflows/sip-ticd-multiscale-comparison.yml'
+      - 'sip/ticd_temporal_invariants.py'
+      - 'experiments/compare_sip_ticd_multiscale.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      PYTHONHASHSEED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install scientific packages
+        run: |
+          python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+          python -m pip freeze > multiscale_environment.txt
+      - name: Retrieve checksum-verified real-PCAP SIP calibration artifact
+        run: |
+          set -euo pipefail
+          mkdir -p prior
+          gh run download 45234641925 --repo "${{ github.repository }}" --name sip-ticd-calibrated-retrained-model-and-evidence --dir prior
+          cal="$(find prior -type f -name sip_real_method_calibration.json -print -quit)"
+          test -n "$cal"
+          cp "$cal" real_sip_calibration.json
+          python - <<'PY'
+          import json
+          d=json.load(open('real_sip_calibration.json'))
+          assert d['source_archive_sha256']=='e455d66eef30d9399ba3beefc36ad2a4a7e2fac0684aa1ae405a30a2371af9a7'
+          assert d['calibration_kind']=='partial_benign_SIP_method_profile'
+          print("CALIBRATION_PROVENANCE_VERIFIED",d['method_weights'])
+          PY
+      - name: Retrain baseline and candidate architectures on shared normal seeds
+        run: |
+          python -m experiments.compare_sip_ticd_multiscale --calibration real_sip_calibration.json --out-dir results_ticd_multiscale --hours 2
+      - name: Verify saved model can be loaded and scored
+        run: |
+          python - <<'PY'
+          import sys,json,pickle
+          import pandas as pd
+          from pathlib import Path
+          sys.path.insert(0,'sip')
+          from ticd_temporal_invariants import MultiScaleInvariantTICD
+          p=Path('results_ticd_multiscale')
+          with (p/'ticd_multiscale_model.pkl').open('rb') as f:pack=pickle.load(f)
+          r=json.loads((p/'comparison_report.json').read_text())
+          assert pack['model'].fitted
+          assert pack['decision_threshold']==r['validation_thresholds'][r['selected_mode']]
+          d=pd.read_csv(p/'untouched_test.csv.gz',nrows=10)
+          assert len(pack['model'].score(d))==10
+          assert r['synthetic_test_attack_count']>1000
+          assert set(r['train_val_dev_test_seeds']['train']).isdisjoint(r['train_val_dev_test_seeds']['untouched_test'])
+          print('MULTISCALE_MODEL_RELOAD_OK',r['selected_mode'])
+          PY
+      - name: Summarize independent simulated holdout
+        if: always()
+        run: |
+          if [ -f results_ticd_multiscale/comparison_report.json ]; then
+            echo '## Multi-scale TICD vs frozen-original TICD' >> "$GITHUB_STEP_SUMMARY"
+            echo 'This is calibration-adjusted SIMULATION TEST ONLY. Not real-world detector validation.' >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d=json.load(open('results_ticd_multiscale/comparison_report.json'))
+          print(json.dumps({k:d[k] for k in [
+             'selected_mode','train_val_dev_test_seeds','development_selection_utilities',
+             'validation_thresholds','actual_validation_fpr',
+             'synthetic_test_attack_count','multiscale_mean_sd',
+             'comparison_on_unseen_simulated_test'
+          ]},indent=2)[:40000])
+          PY
+            echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-ticd-multiscale-retrained-and-comparison
+          path: |
+            results_ticd_multiscale/
+            real_sip_calibration.json
+            multiscale_environment.txt
+          if-no-files-found: warn
+          retention-days: 30
