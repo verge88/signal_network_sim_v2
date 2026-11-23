@@ -1,0 +1,63 @@
+name: SS7 calibrated detector stress validation
+
+on:
+  push:
+    branches:
+      - validate-ss7-real-cdr
+    paths:
+      - "ss7/validate_calibrated_stress.py"
+      - "ss7/validate_calibrated_detectors.py"
+      - "ss7/fix.py"
+      - ".github/workflows/ss7-calibrated-detector-stress.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "ss7/validate_calibrated_stress.py"
+      - "ss7/validate_calibrated_detectors.py"
+      - "ss7/fix.py"
+      - ".github/workflows/ss7-calibrated-detector-stress.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stress-calibrated-detectors:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install scientific dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn
+
+      - name: Run exhaustive calibrated detector stress validation
+        run: |
+          set -o pipefail
+          mkdir -p results/ss7_calibrated_detector_stress
+          python -m ss7.validate_calibrated_stress \
+            --base-seed 42 \
+            --base-days 1.25 \
+            --stress-days 0.55 \
+            --output-dir results/ss7_calibrated_detector_stress \
+            2>&1 | tee results/ss7_calibrated_detector_stress/stress.log
+
+      - name: Upload stress validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss7-calibrated-detector-stress
+          path: results/ss7_calibrated_detector_stress/
+          if-no-files-found: warn
+          retention-days: 30
