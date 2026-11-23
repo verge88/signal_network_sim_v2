@@ -30,7 +30,7 @@ from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -132,6 +132,8 @@ def build_training_frame(seed: int = 42) -> pd.DataFrame:
     sim = DiameterSimulator(config, attacks, normal_events)
     sim.run()
     df = add_zone_deviation_features(sim.to_dataframe())
+    if "node_type" in df.columns and "node_type_enc" not in df.columns:
+        df["node_type_enc"] = LabelEncoder().fit_transform(df["node_type"])
     missing = [c for c in PORTABLE_FEATURES if c not in df.columns]
     if missing:
         raise RuntimeError(f"Simulator did not produce portable features: {missing}")
