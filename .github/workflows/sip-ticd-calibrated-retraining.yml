@@ -1,0 +1,105 @@
+name: Retrain SIP TICD on real-PCAP calibrated simulator
+
+on:
+  push:
+    branches: [training/ticd-sip-pcap-calibrated]
+    paths:
+      - ".github/workflows/sip-ticd-calibrated-retraining.yml"
+      - "experiments/calibrate_sip_ticd_method_profile.py"
+      - "experiments/retrain_sip_ticd_calibrated.py"
+      - "sip/ticd_recalibrated.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  calibration-and-retraining:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      PYTHONHASHSEED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install scientific pipeline and PCAP decoder
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+          python -m pip install --upgrade pip
+          python -m pip install 'gdown>=6.1,<7' 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+          python -m pip freeze > python_requirements_resolved.txt
+      - name: Download independent benign real LTE-A SIP traces
+        run: |
+          set -euo pipefail
+          gdown 1-r2Xd1VK6r7O_1KaXVYPus1Rcj6TF9DF -O LTE_Pcap.zip --no-cookies
+          echo "e455d66eef30d9399ba3beefc36ad2a4a7e2fac0684aa1ae405a30a2371af9a7  LTE_Pcap.zip" | sha256sum -c
+      - name: Estimate bounded method-profile calibration on real PCAP
+        run: |
+          python -m experiments.calibrate_sip_ticd_method_profile --lte-zip LTE_Pcap.zip --out-dir results_ticd_calibrated
+      - name: Train TICD only on normal calibrated simulation and evaluate on disjoint seeds
+        run: |
+          python -m experiments.retrain_sip_ticd_calibrated --calibration results_ticd_calibrated/sip_real_method_calibration.json --out-dir results_ticd_calibrated --duration-hours 2
+      - name: Verify saved model reload and split isolation
+        run: |
+          python - <<'PY'
+          import sys,pickle,json
+          from pathlib import Path
+          import pandas as pd
+          sys.path.insert(0,'sip')
+          from ticd_recalibrated import FrozenReferenceTICD
+          root=Path('results_ticd_calibrated')
+          with (root/'ticd_model.pkl').open('rb') as f: obj=pickle.load(f)
+          report=json.loads((root/'retraining_report.json').read_text())
+          train=pd.read_csv(root/'train.csv.gz')
+          val=pd.read_csv(root/'threshold_validation.csv.gz')
+          test=pd.read_csv(root/'test.csv.gz')
+          assert obj['detector'].fitted
+          assert train.is_anomaly.sum()==0 and val.is_anomaly.sum()==0
+          assert len(set(train.simulation_seed)&set(test.simulation_seed))==0
+          assert len(set(val.simulation_seed)&set(test.simulation_seed))==0
+          assert len(set(train.simulation_seed)&set(val.simulation_seed))==0
+          assert obj['threshold']==report['normal_validation_threshold']
+          assert test.is_anomaly.sum()>0
+          assert len(obj['detector'].score(test.head(50)))==50
+          assert report['test_attack_count']==int(test.is_anomaly.sum())
+          print('MODEL_RELOAD_SUCCESS')
+          print('Splits:', report['train_seed_partition'])
+          print('Test ROC-AUC:',report['overall_pooled_synthetic_test']['auc_roc'])
+          print('Test recall:',report['overall_pooled_synthetic_test']['tpr_recall'])
+          print('Test FPR:',report['overall_pooled_synthetic_test']['fpr'])
+          PY
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -s results_ticd_calibrated/retraining_report.json ]; then
+            echo '## TICD retrained on partially PCAP-calibrated SIP simulator' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Simulation-to-simulation metrics only, NOT externally validated TICD.' >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d=json.load(open('results_ticd_calibrated/retraining_report.json'))
+          for key in ['training_rows','threshold_validation_rows','test_rows','test_attack_count',
+                      'test_normal_count','normal_validation_threshold','validation_fpr_at_threshold',
+                      'context_covariance_fitted','mean_and_sd_over_independent_test_seeds']:
+              print(key+':',json.dumps(d[key]))
+          PY
+            echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-ticd-calibrated-retrained-model-and-evidence
+          path: |
+            results_ticd_calibrated/
+            python_requirements_resolved.txt
+          if-no-files-found: warn
+          retention-days: 30
