@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - validation/diameter-external-pcap
+      - improve/diameter-isolation-forest-robustness
     paths:
       - "diameter/**"
       - "experiments/diameter_external_pcap_validation.py"
@@ -15,6 +16,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: diameter-external-validation-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   external-validation:
@@ -78,6 +83,10 @@ jobs:
             tshark -r "${td}/input.pcap" -Y diameter -T fields               -e diameter.cmd.code -e diameter.applicationId | head -n 30
             rm -rf "${td}"
           done
+
+      - name: Compile Diameter training pipeline
+        run: |
+          python -m py_compile diameter/diameter_training_v1.py experiments/diameter_external_pcap_validation.py
 
       - name: Run independent validation
         run: |
