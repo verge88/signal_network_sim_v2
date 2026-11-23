@@ -89,37 +89,70 @@ class TrainingConfig:
     ocsvm_nu: float = 0.05
     ocsvm_kernel: str = "rbf"
 
-    # Autoencoder
-    ae_hidden_dims: List[int] = field(default_factory=lambda: [64, 32])
-    ae_latent_dim: int = 12
-    ae_epochs: int = 100
+    # Autoencoder — deliberately compact + explicit regularization.
+    ae_hidden_dims: List[int] = field(default_factory=lambda: [48, 24])
+    ae_latent_dim: int = 8
+    ae_epochs: int = 80
     ae_batch: int = 256
-    ae_lr: float = 1e-3
+    ae_lr: float = 7e-4
+    ae_dropout: float = 0.20
+    ae_weight_decay: float = 1e-4
+    ae_patience: int = 8
+    ae_min_delta: float = 1e-4
 
-    # VAE
-    vae_hidden_dims: List[int] = field(default_factory=lambda: [64, 32])
-    vae_latent_dim: int = 12
-    vae_epochs: int = 120
+    # VAE — lower capacity and deterministic validation scoring.
+    vae_hidden_dims: List[int] = field(default_factory=lambda: [48, 24])
+    vae_latent_dim: int = 8
+    vae_epochs: int = 100
     vae_batch: int = 256
-    vae_lr: float = 1e-3
+    vae_lr: float = 7e-4
     vae_kl_weight: float = 0.5
+    vae_dropout: float = 0.15
+    vae_weight_decay: float = 1e-4
+    vae_patience: int = 10
+    vae_min_delta: float = 1e-4
 
-    # LSTM-AE
-    lstm_hidden: int = 48
+    # LSTM-AE — reduced hidden width, stronger recurrent dropout.
+    lstm_hidden: int = 32
     lstm_layers: int = 2
     lstm_seq_len: int = 10
-    lstm_epochs: int = 80
+    lstm_epochs: int = 60
     lstm_batch: int = 256
-    lstm_lr: float = 1e-3
+    lstm_lr: float = 7e-4
+    lstm_dropout: float = 0.30
+    lstm_weight_decay: float = 1e-4
+    lstm_patience: int = 8
+    lstm_min_delta: float = 1e-4
 
-    # Supervised
-    rf_trees: int = 300
-    gb_estimators: int = 300
-    gb_lr: float = 0.05
+    # Temporal-attention AE — smaller transformer with stronger dropout.
+    tat_hidden: int = 48
+    tat_heads: int = 4
+    tat_layers: int = 1
+    tat_dropout: float = 0.25
+    tat_epochs: int = 80
+    tat_batch: int = 256
+    tat_lr: float = 3e-4
+    tat_weight_decay: float = 1e-4
+    tat_patience: int = 8
+    tat_min_delta: float = 1e-4
+
+    # Supervised models — constrain tree capacity to reduce memorisation.
+    rf_trees: int = 400
+    rf_max_depth: int = 14
+    rf_min_samples_leaf: int = 4
+    rf_min_samples_split: int = 8
+    rf_max_features: str = "sqrt"
+    rf_max_samples: float = 0.80
+
+    gb_estimators: int = 220
+    gb_lr: float = 0.03
+    gb_max_depth: int = 3
+    gb_min_samples_leaf: int = 20
+    gb_subsample: float = 0.80
 
     # Cascade
     cascade_rf_trees: int = 500
-    cascade_gb_estimators: int = 500
+    cascade_gb_estimators: int = 300
 
     threshold_percentile: float = 95.0
 
@@ -372,19 +405,25 @@ ATTACK_LABELS = {
 # ══════════════════════════════════════════════════════════
 
 class Autoencoder(nn.Module):
-    def __init__(self, input_dim, hidden_dims, latent_dim):
+    def __init__(self, input_dim, hidden_dims, latent_dim, dropout=0.0):
         super().__init__()
         enc = []
         prev = input_dim
         for h in hidden_dims:
-            enc.extend([nn.Linear(prev, h), nn.ReLU(), nn.BatchNorm1d(h)])
+            enc.extend([
+                nn.Linear(prev, h), nn.ReLU(), nn.BatchNorm1d(h),
+                nn.Dropout(dropout),
+            ])
             prev = h
         enc.append(nn.Linear(prev, latent_dim))
         self.encoder = nn.Sequential(*enc)
         dec = []
         prev = latent_dim
         for h in reversed(hidden_dims):
-            dec.extend([nn.Linear(prev, h), nn.ReLU(), nn.BatchNorm1d(h)])
+            dec.extend([
+                nn.Linear(prev, h), nn.ReLU(), nn.BatchNorm1d(h),
+                nn.Dropout(dropout),
+            ])
             prev = h
         dec.append(nn.Linear(prev, input_dim))
         self.decoder = nn.Sequential(*dec)
@@ -394,12 +433,15 @@ class Autoencoder(nn.Module):
 
 
 class VAE(nn.Module):
-    def __init__(self, input_dim, hidden_dims, latent_dim):
+    def __init__(self, input_dim, hidden_dims, latent_dim, dropout=0.0):
         super().__init__()
         enc = []
         prev = input_dim
         for h in hidden_dims:
-            enc.extend([nn.Linear(prev, h), nn.ReLU(), nn.BatchNorm1d(h)])
+            enc.extend([
+                nn.Linear(prev, h), nn.ReLU(), nn.BatchNorm1d(h),
+                nn.Dropout(dropout),
+            ])
             prev = h
         self.encoder = nn.Sequential(*enc)
         self.fc_mu = nn.Linear(prev, latent_dim)
@@ -407,7 +449,10 @@ class VAE(nn.Module):
         dec = []
         prev = latent_dim
         for h in reversed(hidden_dims):
-            dec.extend([nn.Linear(prev, h), nn.ReLU(), nn.BatchNorm1d(h)])
+            dec.extend([
+                nn.Linear(prev, h), nn.ReLU(), nn.BatchNorm1d(h),
+                nn.Dropout(dropout),
+            ])
             prev = h
         dec.append(nn.Linear(prev, input_dim))
         self.decoder = nn.Sequential(*dec)
@@ -467,18 +512,22 @@ class TemporalAttentionAE(nn.Module):
 
 class AETrainer:
     def __init__(self, model, lr, epochs, batch_size, patience=15,
+                 weight_decay=1e-4, min_delta=1e-4, grad_clip=1.0,
                  device=None):
         self.model = model
         self.lr, self.epochs, self.batch_size = lr, epochs, batch_size
         self.patience = patience
+        self.weight_decay = weight_decay
+        self.min_delta = min_delta
+        self.grad_clip = grad_clip
         self.device = device or ("cuda" if torch.cuda.is_available()
                                  else "cpu")
         self.model.to(self.device)
         self.train_losses, self.val_losses = [], []
 
     def fit(self, X_train, X_val=None):
-        opt = torch.optim.Adam(self.model.parameters(), lr=self.lr,
-                               weight_decay=1e-5)
+        opt = torch.optim.AdamW(self.model.parameters(), lr=self.lr,
+                                weight_decay=self.weight_decay)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, self.epochs)
         crit = nn.MSELoss()
         dl = DataLoader(TensorDataset(torch.FloatTensor(X_train)),
@@ -492,7 +541,12 @@ class AETrainer:
             for (batch,) in dl:
                 batch = batch.to(self.device)
                 loss = crit(self.model(batch), batch)
-                opt.zero_grad(); loss.backward(); opt.step()
+                opt.zero_grad()
+                loss.backward()
+                if self.grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.grad_clip)
+                opt.step()
                 tl += loss.item() * len(batch)
             tl /= len(X_train)
             sched.step()
@@ -501,7 +555,7 @@ class AETrainer:
             if X_val is not None:
                 vl = self._eval(X_val, crit)
                 self.val_losses.append(vl)
-                if vl < best_val:
+                if vl < best_val - self.min_delta:
                     best_val, pat_cnt = vl, 0
                     best_state = {k: v.cpu().clone()
                                   for k, v in self.model.state_dict().items()}
@@ -536,10 +590,14 @@ class AETrainer:
 
 class VAETrainer:
     def __init__(self, model, lr, epochs, batch_size, kl_weight=0.5,
-                 patience=15, device=None):
+                 patience=15, weight_decay=1e-4, min_delta=1e-4,
+                 grad_clip=1.0, device=None):
         self.model = model
         self.lr, self.epochs, self.batch_size = lr, epochs, batch_size
         self.kl_weight, self.patience = kl_weight, patience
+        self.weight_decay = weight_decay
+        self.min_delta = min_delta
+        self.grad_clip = grad_clip
         self.device = device or ("cuda" if torch.cuda.is_available()
                                  else "cpu")
         self.model.to(self.device)
@@ -551,8 +609,8 @@ class VAETrainer:
         return recon + self.kl_weight * kl, recon, kl
 
     def fit(self, X_train, X_val=None):
-        opt = torch.optim.Adam(self.model.parameters(), lr=self.lr,
-                               weight_decay=1e-5)
+        opt = torch.optim.AdamW(self.model.parameters(), lr=self.lr,
+                                weight_decay=self.weight_decay)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, self.epochs)
         dl = DataLoader(TensorDataset(torch.FloatTensor(X_train)),
                         batch_size=self.batch_size, shuffle=True)
@@ -566,7 +624,12 @@ class VAETrainer:
                 batch = batch.to(self.device)
                 x_hat, mu, lv = self.model(batch)
                 loss, _, _ = self._loss(batch, x_hat, mu, lv)
-                opt.zero_grad(); loss.backward(); opt.step()
+                opt.zero_grad()
+                loss.backward()
+                if self.grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.grad_clip)
+                opt.step()
                 tl += loss.item() * len(batch)
             tl /= len(X_train)
             sched.step()
@@ -575,7 +638,7 @@ class VAETrainer:
             if X_val is not None:
                 vl = self._eval_val(X_val)
                 self.val_losses.append(vl)
-                if vl < best_val:
+                if vl < best_val - self.min_delta:
                     best_val, pat_cnt = vl, 0
                     best_state = {k: v.cpu().clone()
                                   for k, v in self.model.state_dict().items()}
@@ -593,18 +656,24 @@ class VAETrainer:
             self.model.to(self.device)
 
     def _eval_val(self, X):
+        # Validation is deterministic: use the posterior mean instead of
+        # resampling z on every early-stopping check.
         self.model.eval()
         with torch.no_grad():
             t = torch.FloatTensor(X).to(self.device)
-            x_hat, mu, lv = self.model(t)
+            mu, lv = self.model.encode(t)
+            x_hat = self.model.decoder(mu)
             loss, _, _ = self._loss(t, x_hat, mu, lv)
         return loss.item()
 
     def anomaly_score(self, X):
+        # Deterministic score improves reproducibility and avoids adding
+        # Monte-Carlo noise to threshold selection.
         self.model.eval()
         with torch.no_grad():
             t = torch.FloatTensor(X).to(self.device)
-            x_hat, mu, lv = self.model(t)
+            mu, lv = self.model.encode(t)
+            x_hat = self.model.decoder(mu)
             recon = torch.mean((t - x_hat) ** 2, dim=-1)
             kl = -0.5 * torch.sum(1 + lv - mu.pow(2) - lv.exp(), dim=-1)
         return (recon + self.kl_weight * kl).cpu().numpy()
@@ -721,8 +790,16 @@ class SpecializedDetector:
         self.models["svm"] = OneClassSVM(
             nu=0.05, kernel="rbf", gamma="scale").fit(X)
         ae = CompactAE(n, max(2, n // 3))
-        trainer = AETrainer(ae, 1e-3, 120, 256, patience=20)
-        trainer.fit(X)
+        # Keep a benign-only validation slice for the specialized AE instead
+        # of training to a fixed epoch budget with no stopping signal.
+        rng = np.random.default_rng(self.seed)
+        perm = rng.permutation(len(X))
+        n_val = max(1, int(round(0.10 * len(X))))
+        val_idx, fit_idx = perm[:n_val], perm[n_val:]
+        trainer = AETrainer(
+            ae, 7e-4, 80, 256, patience=8,
+            weight_decay=1e-4, min_delta=1e-4)
+        trainer.fit(X[fit_idx], X[val_idx])
         self.models["ae"], self.models["ae_trainer"] = ae, trainer
 
     def score(self, X):
@@ -768,14 +845,22 @@ class CascadeCompromiseDetector:
     def __init__(self, config, seed=42):
         self.stage1_rf = RandomForestClassifier(
             n_estimators=config.cascade_rf_trees, random_state=seed,
-            class_weight="balanced", n_jobs=-1)
+            class_weight="balanced_subsample", n_jobs=-1,
+            max_depth=config.rf_max_depth,
+            min_samples_leaf=config.rf_min_samples_leaf,
+            min_samples_split=config.rf_min_samples_split,
+            max_features=config.rf_max_features,
+            bootstrap=True, max_samples=config.rf_max_samples)
         self.stage2_gb = GradientBoostingClassifier(
             n_estimators=config.cascade_gb_estimators, learning_rate=0.03,
-            max_depth=4, min_samples_leaf=20, random_state=seed)
+            max_depth=3, min_samples_leaf=30, subsample=0.80,
+            random_state=seed)
         self.stage2_rf = RandomForestClassifier(
             n_estimators=config.cascade_rf_trees, random_state=seed,
             class_weight="balanced_subsample", max_depth=8,
-            min_samples_leaf=10, n_jobs=-1)
+            min_samples_leaf=15, min_samples_split=20,
+            max_features="sqrt", bootstrap=True, max_samples=0.80,
+            n_jobs=-1)
 
     def fit(self, X_full, y, X_comp, y_comp):
         print("  Cascade Stage 1: General RF...")
@@ -1067,35 +1152,48 @@ def main():
     svm.fit(X_train_normal)
     svm_sv = -svm.score_samples(X_val)
     svm_st = -svm.score_samples(X_test)
-    th_svm, _ = find_threshold(svm_sv, y_val, config.threshold_percentile)
+    th_svm = float(np.percentile(
+        svm_sv[y_val == 0], config.threshold_percentile))
     results_list.append(evaluate_model("One-Class SVM", svm_st, y_test,
                                        attack_types_test, threshold=th_svm))
 
     # ── 3. Autoencoder ──
     print("\n[3] Autoencoder...")
-    ae = Autoencoder(n_feat, config.ae_hidden_dims, config.ae_latent_dim)
-    ae_trainer = AETrainer(ae, config.ae_lr, config.ae_epochs,
-                           config.ae_batch, patience=15)
+    ae = Autoencoder(
+        n_feat, config.ae_hidden_dims, config.ae_latent_dim,
+        dropout=config.ae_dropout)
+    ae_trainer = AETrainer(
+        ae, config.ae_lr, config.ae_epochs, config.ae_batch,
+        patience=config.ae_patience,
+        weight_decay=config.ae_weight_decay,
+        min_delta=config.ae_min_delta)
     X_val_normal = X_val[y_val == 0]
     ae_trainer.fit(X_train_normal, X_val_normal)
     trainers_dict['Autoencoder'] = ae_trainer
     ae_sv = ae_trainer.reconstruction_error(X_val)
     ae_st = ae_trainer.reconstruction_error(X_test)
-    th_ae, _ = find_threshold(ae_sv, y_val, config.threshold_percentile)
+    th_ae = float(np.percentile(
+        ae_sv[y_val == 0], config.threshold_percentile))
     results_list.append(evaluate_model("Autoencoder", ae_st, y_test,
                                        attack_types_test, threshold=th_ae))
 
     # ── 4. VAE ──
     print("\n[4] VAE...")
-    vae = VAE(n_feat, config.vae_hidden_dims, config.vae_latent_dim)
-    vae_trainer = VAETrainer(vae, config.vae_lr, config.vae_epochs,
-                             config.vae_batch,
-                             kl_weight=config.vae_kl_weight, patience=15)
+    vae = VAE(
+        n_feat, config.vae_hidden_dims, config.vae_latent_dim,
+        dropout=config.vae_dropout)
+    vae_trainer = VAETrainer(
+        vae, config.vae_lr, config.vae_epochs, config.vae_batch,
+        kl_weight=config.vae_kl_weight,
+        patience=config.vae_patience,
+        weight_decay=config.vae_weight_decay,
+        min_delta=config.vae_min_delta)
     vae_trainer.fit(X_train_normal, X_val_normal)
     trainers_dict['VAE'] = vae_trainer
     vae_sv = vae_trainer.anomaly_score(X_val)
     vae_st = vae_trainer.anomaly_score(X_test)
-    th_vae, _ = find_threshold(vae_sv, y_val, config.threshold_percentile)
+    th_vae = float(np.percentile(
+        vae_sv[y_val == 0], config.threshold_percentile))
     results_list.append(evaluate_model("VAE", vae_st, y_test,
                                        attack_types_test, threshold=th_vae))
 
@@ -1108,9 +1206,13 @@ def main():
     if len(seq_train) > 100:
         lstm = LSTMAutoencoder(n_feat, config.lstm_hidden,
                                config.lstm_layers,
-                               config.lstm_seq_len, dropout=0.2)
-        lstm_trainer = AETrainer(lstm, config.lstm_lr, config.lstm_epochs,
-                                 config.lstm_batch, patience=15)
+                               config.lstm_seq_len,
+                               dropout=config.lstm_dropout)
+        lstm_trainer = AETrainer(
+            lstm, config.lstm_lr, config.lstm_epochs, config.lstm_batch,
+            patience=config.lstm_patience,
+            weight_decay=config.lstm_weight_decay,
+            min_delta=config.lstm_min_delta)
         seq_val, seq_y_val = pipeline.get_sequential_data(
             val_df, config.lstm_seq_len)
         seq_val_normal = seq_val[seq_y_val == 0]
@@ -1130,8 +1232,8 @@ def main():
 
         lstm_st = lstm_trainer.reconstruction_error(seq_test)
         lstm_sv = lstm_trainer.reconstruction_error(seq_val)
-        th_lstm, _ = find_threshold(lstm_sv, seq_y_val,
-                                    config.threshold_percentile)
+        th_lstm = float(np.percentile(
+            lstm_sv[seq_y_val == 0], config.threshold_percentile))
         results_list.append(evaluate_model(
             "LSTM-Autoencoder", lstm_st, seq_y_test,
             seq_at_test, threshold=th_lstm))
@@ -1142,25 +1244,36 @@ def main():
     # ── 6. Temporal-Attention-AE ──
     print("\n[6] Temporal-Attention-AE...")
     if lstm_done and len(seq_train) > 100:
-        tat = TemporalAttentionAE(n_feat, 64, 4, 2,
-                                  config.lstm_seq_len, 0.15)
-        tat_trainer = AETrainer(tat, 5e-4, 100, 256, patience=15)
+        tat = TemporalAttentionAE(
+            n_feat, config.tat_hidden, config.tat_heads, config.tat_layers,
+            config.lstm_seq_len, config.tat_dropout)
+        tat_trainer = AETrainer(
+            tat, config.tat_lr, config.tat_epochs, config.tat_batch,
+            patience=config.tat_patience,
+            weight_decay=config.tat_weight_decay,
+            min_delta=config.tat_min_delta)
         tat_trainer.fit(seq_train,
                         seq_val_normal if len(seq_val_normal) > 0 else None)
         trainers_dict['TA-AE'] = tat_trainer
         tat_st = tat_trainer.reconstruction_error(seq_test)
         tat_sv = tat_trainer.reconstruction_error(seq_val)
-        th_tat, _ = find_threshold(tat_sv, seq_y_val,
-                                   config.threshold_percentile)
+        th_tat = float(np.percentile(
+            tat_sv[seq_y_val == 0], config.threshold_percentile))
         results_list.append(evaluate_model(
             "Temporal-Attention-AE", tat_st, seq_y_test,
             seq_at_test, threshold=th_tat))
 
     # ── 7. Random Forest ──
     print("\n[7] Random Forest...")
-    rf = RandomForestClassifier(n_estimators=config.rf_trees,
-                                random_state=config.seed,
-                                class_weight="balanced", n_jobs=-1)
+    rf = RandomForestClassifier(
+        n_estimators=config.rf_trees,
+        random_state=config.seed,
+        class_weight="balanced_subsample", n_jobs=-1,
+        max_depth=config.rf_max_depth,
+        min_samples_leaf=config.rf_min_samples_leaf,
+        min_samples_split=config.rf_min_samples_split,
+        max_features=config.rf_max_features,
+        bootstrap=True, max_samples=config.rf_max_samples)
     rf.fit(X_train, y_train)
     rf_pt = rf.predict_proba(X_test)[:, 1]
     results_list.append(evaluate_model("Random Forest", rf_pt, y_test,
@@ -1180,9 +1293,13 @@ def main():
 
     # ── 8. Gradient Boosting ──
     print("\n[8] Gradient Boosting...")
-    gb = GradientBoostingClassifier(n_estimators=config.gb_estimators,
-                                    learning_rate=config.gb_lr,
-                                    max_depth=5, random_state=config.seed)
+    gb = GradientBoostingClassifier(
+        n_estimators=config.gb_estimators,
+        learning_rate=config.gb_lr,
+        max_depth=config.gb_max_depth,
+        min_samples_leaf=config.gb_min_samples_leaf,
+        subsample=config.gb_subsample,
+        random_state=config.seed)
     gb.fit(X_train, y_train)
     gb_pt = gb.predict_proba(X_test)[:, 1]
     results_list.append(evaluate_model("Gradient Boosting", gb_pt, y_test,
@@ -1206,7 +1323,8 @@ def main():
     ens_results = []
     for en in sorted(ens_st.keys()):
         sv, st = ens_sv[en], ens_st[en]
-        th, _ = find_threshold(sv, y_val, config.threshold_percentile)
+        th = float(np.percentile(
+            sv[y_val == 0], config.threshold_percentile))
         r = evaluate_model(f"Ens:{en}", st, y_test, attack_types_test,
                            threshold=th)
         results_list.append(r)
@@ -1215,30 +1333,36 @@ def main():
     # ── 11. Meta-Ensemble ──
     print("\n[11] Meta-Ensemble...")
 
-    def norm_score(s):
-        p1, p99 = np.percentile(s, 1), np.percentile(s, 99)
-        return np.clip((s - p1) / (p99 - p1 + 1e-9), 0, 1)
+    # Stacking guard: the meta learner must never see in-sample predictions
+    # from base learners. Fit it on validation predictions only, then freeze
+    # the normalization and apply that transform to the untouched test set.
+    meta_val_raw = np.column_stack([
+        iso_sv,
+        svm_sv,
+        ae_sv,
+        vae_sv,
+        cascade.predict_proba(X_val, X_val_comp),
+        rf.predict_proba(X_val)[:, 1],
+        gb.predict_proba(X_val)[:, 1],
+    ])
+    meta_test_raw = np.column_stack([
+        iso_st, svm_st, ae_st, vae_st, casc_pt, rf_pt, gb_pt,
+    ])
+    meta_p1 = np.percentile(meta_val_raw, 1, axis=0)
+    meta_p99 = np.percentile(meta_val_raw, 99, axis=0)
 
-    meta_train = np.column_stack([
-        norm_score(-iso.score_samples(X_train_iso)),
-        norm_score(-svm.score_samples(X_train)),
-        norm_score(ae_trainer.reconstruction_error(X_train)),
-        norm_score(vae_trainer.anomaly_score(X_train)),
-        norm_score(cascade.predict_proba(X_train, X_train_comp)),
-        norm_score(rf.predict_proba(X_train)[:, 1]),
-        norm_score(gb.predict_proba(X_train)[:, 1]),
-    ])
-    meta_test = np.column_stack([
-        norm_score(iso_st), norm_score(svm_st),
-        norm_score(ae_st), norm_score(vae_st),
-        norm_score(casc_pt),
-        norm_score(rf_pt), norm_score(gb_pt),
-    ])
+    def apply_meta_norm(a):
+        return np.clip(
+            (a - meta_p1) / (meta_p99 - meta_p1 + 1e-9), 0, 1)
+
+    meta_val = apply_meta_norm(meta_val_raw)
+    meta_test = apply_meta_norm(meta_test_raw)
 
     meta_gb = GradientBoostingClassifier(
-        n_estimators=200, learning_rate=0.05, max_depth=3,
+        n_estimators=120, learning_rate=0.03, max_depth=2,
+        min_samples_leaf=20, subsample=0.80,
         random_state=config.seed)
-    meta_gb.fit(meta_train, y_train)
+    meta_gb.fit(meta_val, y_val)
     meta_pt = meta_gb.predict_proba(meta_test)[:, 1]
     results_list.append(evaluate_model("Meta-Ensemble", meta_pt, y_test,
                                        attack_types_test, threshold=0.5))
@@ -1268,7 +1392,12 @@ def main():
     non_ms_idx = [pipeline.feature_cols.index(c) for c in non_ms]
     rf_no_ms = RandomForestClassifier(
         n_estimators=config.rf_trees, random_state=config.seed,
-        class_weight="balanced", n_jobs=-1)
+        class_weight="balanced_subsample", n_jobs=-1,
+        max_depth=config.rf_max_depth,
+        min_samples_leaf=config.rf_min_samples_leaf,
+        min_samples_split=config.rf_min_samples_split,
+        max_features=config.rf_max_features,
+        bootstrap=True, max_samples=config.rf_max_samples)
     rf_no_ms.fit(X_train[:, non_ms_idx], y_train)
     rf_no_ms_p = rf_no_ms.predict_proba(X_test[:, non_ms_idx])[:, 1]
     r_no_ms = evaluate_model("RF (no MS)", rf_no_ms_p, y_test,
@@ -1286,7 +1415,12 @@ def main():
     non_temp_idx = [pipeline.feature_cols.index(c) for c in non_temp]
     rf_no_temp = RandomForestClassifier(
         n_estimators=config.rf_trees, random_state=config.seed,
-        class_weight="balanced", n_jobs=-1)
+        class_weight="balanced_subsample", n_jobs=-1,
+        max_depth=config.rf_max_depth,
+        min_samples_leaf=config.rf_min_samples_leaf,
+        min_samples_split=config.rf_min_samples_split,
+        max_features=config.rf_max_features,
+        bootstrap=True, max_samples=config.rf_max_samples)
     rf_no_temp.fit(X_train[:, non_temp_idx], y_train)
     rf_no_temp_p = rf_no_temp.predict_proba(X_test[:, non_temp_idx])[:, 1]
     r_no_temp = evaluate_model("RF (no temporal)", rf_no_temp_p, y_test,
@@ -1317,6 +1451,82 @@ def main():
         'f1': casc_r['f1'],
         'compromise_rate': 100 * comp_casc / max(1, comp_total),
     })
+
+    # ══════════════════════════════════════════════════
+    #  Generalization / overfitting diagnostics
+    # ══════════════════════════════════════════════════
+    overfit_diag = {
+        "method": {
+            "neural_early_stopping": "best benign-validation loss, restored weights",
+            "unsupervised_thresholds": "95th percentile of benign validation only",
+            "meta_stacking": "fit on validation predictions; normalization fit on validation only",
+            "test_role": "untouched until final evaluation",
+        },
+        "neural": {},
+        "supervised": {},
+    }
+
+    for name, trainer in trainers_dict.items():
+        vals = np.asarray(trainer.val_losses, dtype=float)
+        trs = np.asarray(trainer.train_losses, dtype=float)
+        if len(vals) and len(trs):
+            best_idx = int(np.argmin(vals))
+            overfit_diag["neural"][name] = {
+                "epochs_run": int(len(trs)),
+                "best_epoch": best_idx + 1,
+                "train_loss_at_best": float(trs[best_idx]),
+                "best_val_loss": float(vals[best_idx]),
+                "absolute_gap_at_best": float(vals[best_idx] - trs[best_idx]),
+                "final_train_loss": float(trs[-1]),
+                "final_val_loss": float(vals[-1]),
+            }
+
+    def split_ap(model_name, p_train, p_val, p_test):
+        train_ap = float(average_precision_score(y_train, p_train))
+        val_ap = float(average_precision_score(y_val, p_val))
+        test_ap = float(average_precision_score(y_test, p_test))
+        overfit_diag["supervised"][model_name] = {
+            "train_auc_pr": train_ap,
+            "val_auc_pr": val_ap,
+            "test_auc_pr": test_ap,
+            "train_minus_val_auc_pr": train_ap - val_ap,
+            "val_minus_test_auc_pr": val_ap - test_ap,
+        }
+
+    split_ap(
+        "Random Forest",
+        rf.predict_proba(X_train)[:, 1],
+        rf.predict_proba(X_val)[:, 1],
+        rf_pt,
+    )
+    split_ap(
+        "Gradient Boosting",
+        gb.predict_proba(X_train)[:, 1],
+        gb.predict_proba(X_val)[:, 1],
+        gb_pt,
+    )
+    split_ap(
+        "Cascade",
+        cascade.predict_proba(X_train, X_train_comp),
+        cascade.predict_proba(X_val, X_val_comp),
+        casc_pt,
+    )
+    overfit_diag["supervised"]["Meta-Ensemble"] = {
+        "fit_auc_pr_on_validation": float(
+            average_precision_score(y_val, meta_gb.predict_proba(meta_val)[:, 1])
+        ),
+        "test_auc_pr": float(average_precision_score(y_test, meta_pt)),
+        "fit_minus_test_auc_pr": float(
+            average_precision_score(y_val, meta_gb.predict_proba(meta_val)[:, 1])
+            - average_precision_score(y_test, meta_pt)
+        ),
+    }
+
+    diag_path = os.path.join(config.results_dir, "overfitting_diagnostics.json")
+    with open(diag_path, "w", encoding="utf-8") as f:
+        json.dump(overfit_diag, f, indent=2, ensure_ascii=False)
+    print("\n  Overfitting diagnostics:")
+    print(json.dumps(overfit_diag, indent=2, ensure_ascii=False))
 
     # ══════════════════════════════════════════════════
     #  Save Results
