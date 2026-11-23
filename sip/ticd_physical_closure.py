@@ -45,13 +45,13 @@ def prepare_master_closure_features(df:pd.DataFrame):
     return out
 
 class PhysicalClosureTICD(MultiScaleInvariantTICD):
-    CANDIDATES=("physical","physical_zone","physical_zone_context")
+    PHYSICAL_MODES=("physical","physical_zone","physical_zone_context")
     EXTRA=("master_ack_shortfall_adjusted","dev_master_ack_shortfall_vs_zone")
 
     def __init__(self,base_model,mode="physical_zone",normal_quantile=99.0):
         # Invariant/temporal channel's same normal-only calibration.
         super().__init__(base_model=base_model,mode="temporal",normal_quantile=normal_quantile)
-        if mode not in self.CANDIDATES:raise ValueError(mode)
+        if mode not in self.PHYSICAL_MODES:raise ValueError(mode)
         self.physical_mode=mode
 
     def fit(self,train_df):
