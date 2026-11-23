@@ -103,14 +103,14 @@ jobs:
 
             sudo tcpdump -i lo -U -s 0 -w "${out}" 'tcp port 3868'               >"/tmp/tcpdump-${name}.log" 2>&1 &
             cap_pid=$!
-            sleep 0.35
+            sleep 1.25
 
             (
               cd external_diameter
               dart run bin/external_attack_driver.dart                 "${scenario}" "${count}" "${delay_ms}"
             )
 
-            sleep 0.25
+            sleep 0.75
             sudo pkill -INT -x tcpdump || true
             wait "${cap_pid}" || true
             sudo chown "$USER":"$USER" "${out}"
