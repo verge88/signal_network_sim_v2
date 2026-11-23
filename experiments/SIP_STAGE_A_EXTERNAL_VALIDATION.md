@@ -95,3 +95,57 @@ No raw external captures are uploaded as artifacts.
 
 All reports represent actual machine execution; missing labels and
 unobservable features are null, not invented.
+
+
+## Retry on 23 November 2026 — authenticated Drive and a true Internet attack corpus
+
+**Authenticated Google Drive** (connected user, using Google Drive `files.get`
+and folder `fetch`) returned:
+- Folder `VoIP Enterprise - Attack Dataset`, id
+  `1rGBsHSS3CUQa2ntQkaQfcn-tQggJcm_o`;
+- `files: []`; Google classified the folder as empty;
+- `shared: true` and permission `anyone/writer` (folder metadata).
+This establishes that listing the original public folder is not blocked
+by unauthenticated `gdown` alone. It still does not establish whether the
+dataset is available elsewhere. No Alvares attack samples have been evaluated.
+
+**Independent observed real public-Internet activity (not traffic synthesized
+by this simulator)**: *Multi-Regional Cloud Honeynet Dataset (MURHCAD)*,
+Enrique Feito-Casares, Ismael Gómez-Talal, José Luis Rojo-Álvarez,
+Zenodo DOI `10.5281/zenodo.15716735`,
+`https://zenodo.org/records/15716735`.
+The archive `CloudHoneyNetDataset.zip` is 64,567,749 bytes,
+MD5 `9902cf514bcc9cf6983a28bf55c7526c` (matches Zenodo),
+SHA256 `9703d532af9a9857a3d1c7a97c9607c8b9a84775ab92c50586826b1259f19b4d`.
+Zenodo distributes a cleaned event-level CSV (not SIP PCAP) plus three
+Elasticsearch JSON exports containing original SentryPeer fields.
+
+A GitHub Actions job independently downloaded and checked the archive:
+`https://github.com/verge88/signal_network_sim_v2/actions/runs/45230064728`.
+Another job aggregated all 132,425 event rows, identifying **61,377 SIP
+events** classified as SentryPeer, all targeting port 5060, across **56
+distinct source addresses** over June 9–11, 2025. There were 510 non-empty
+five-minute SIP windows and the maximum contained 1,240 events:
+`https://github.com/verge88/signal_network_sim_v2/actions/runs/45230358408`.
+
+These constitute real traffic directed to exposed honeypots, not a
+labeled benchmark against genuine SIP proxy compromises. SentryPeer is
+the sensor identity: `attackType=Sentrypeer` in the CSV is **not**
+an independently verified attack category. The data do not support
+estimating TICD's full end-to-end recall, FPR, F1, or ROC-AUC. Raw
+identifiers and message bodies are never uploaded as Actions artifacts.
+
+Pipelines added:
+- `experiments/sip_stage_a_murhcad_inventory.py` and
+  `.github/workflows/sip-stage-a-murhcad.yml`;
+- `experiments/sip_stage_a_murhcad_profile.py` and
+  `.github/workflows/sip-stage-a-murhcad-profile.yml`;
+- `experiments/sip_stage_a_murhcad_raw.py` and
+  `.github/workflows/sip-stage-a-murhcad-raw.yml` (independent raw JSON
+  protocol-field inventory).
+
+**Conclusion of retry:** Actual independent benign SIP traces and independent
+real-world SIP attack *events* have both been checked in reproducible CI.
+An external **full TICD** test still requires synchronized node reports,
+zonal telemetry, and independently verified compromise intervals; the real
+honeypot evidence does not contain those fields.
