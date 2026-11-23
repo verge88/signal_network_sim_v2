@@ -1,0 +1,108 @@
+name: TICD zonal-context early-warning heldout comparison
+on:
+  push:
+    branches: [improve/ticd-zonal-context-warnings]
+    paths:
+      - '.github/workflows/sip-ticd-zonal-warning.yml'
+      - 'sip/ticd_zonal_warnings.py'
+      - 'experiments/evaluate_ticd_zonal_warnings.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  zonal-warnings:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+      PYTHONHASHSEED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install and preflight compile SIP research sources
+        run: |
+          set -euo pipefail
+          python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+          python -m compileall -q sip/ticd_zonal_warnings.py experiments/evaluate_ticd_zonal_warnings.py
+          python -m pip freeze > zonal_warning_environment.txt
+      - name: Retrieve frozen two-tier SIP TICD from prior verified Actions
+        run: |
+          set -euo pipefail
+          mkdir -p prior
+          gh run download 45249660732 --repo "${{ github.repository }}" --name sip-ticd-two-tier-trained-thresholds-and-holdout --dir prior
+          saved="$(find prior -type f -name ticd_two_tier_model.pkl -print -quit)"
+          test -n "$saved"
+          echo "PRIOR_DIR=$(dirname "$saved")" >> "$GITHUB_ENV"
+      - name: Train benign zone reference, select variant on development only and evaluate untouched simulation seeds
+        run: |
+          python -m experiments.evaluate_ticd_zonal_warnings --prior "$PRIOR_DIR" --out results_ticd_zone_context
+      - name: Verify loaded model, threshold provenance, separated FPR and oracle-free scoring
+        run: |
+          python - <<'PY'
+          import json,pickle,sys
+          from pathlib import Path
+          sys.path.insert(0,'sip')
+          p=Path('results_ticd_zone_context')
+          d=json.loads((p/'zone_context_ticd_report.json').read_text())
+          with (p/'ticd_zone_context_model.pkl').open('rb') as f:
+              pack=pickle.load(f)
+          assert d['model_reload_verified']
+          assert d['no_batch_composition_leak'] and d['no_oracle_feature_leak']
+          assert d['all_thresholds_from_independent_benign_validation_only']
+          assert d['heldout_not_used_for_selection']
+          assert not d['full_real_attack_validation']
+          assert d['real_capture_sha256']=='e455d66eef30d9399ba3beefc36ad2a4a7e2fac0684aa1ae405a30a2371af9a7'
+          assert pack['selected_variant']==d['selected_variant']
+          assert pack['model'].fitted
+          for cohort,metric in d['heldout_results'].items():
+              for name in ('baseline','zonal_selected'):
+                  m=metric[name]
+                  assert m['confirmed_FP']+m['warning_only_FP']<=m['normal']
+                  assert m['confirmed_TP']+m['warning_only_TP']==m['covered_attack_rows']
+              assert metric['baseline']['confirmed_FP']==metric['zonal_selected']['confirmed_FP']
+              assert metric['baseline']['confirmed_TP']==metric['zonal_selected']['confirmed_TP']
+          print('ZONAL_TICD_MODEL_RELOAD_AND_ORACLE_FREE_VERIFIED',d['selected_variant'])
+          PY
+      - name: Publish reproducible test metrics and negative results
+        if: always()
+        run: |
+          if [ -f results_ticd_zone_context/zone_context_ticd_report.json ]; then
+            echo '## SIP TICD: zone-context early warnings vs previous two-tier detector' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Simulation-only evidence. Master ACK counts are simulated; zone reported SIP load may be adversarial.' >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d=json.load(open('results_ticd_zone_context/zone_context_ticd_report.json'))
+          print('Selected zone warning strategy:',d['selected_variant'])
+          print('Candidate selection utilities:',d['dev_selection_utility'])
+          print('Alert threshold:',d['alert_threshold'])
+          print('Warning threshold:',d['selected_manifest']['warning_threshold'])
+          for cohort,pair in d['heldout_results'].items():
+              print('TEST',cohort)
+              for name,metric in pair.items():
+                  s=metric['by_sophistication']['statistical']
+                  print(name,'alert FPR',metric['confirmed_alert_FPR'],
+                        'warning FWR',metric['false_warning_rate'],
+                        'combined FPR',metric['combined_normal_signal_rate'],
+                        'confirmed recall',metric['confirmed_recall'],
+                        'statistical confirmed',s['confirmed_recall'],
+                        'statistical warned',s['warning_only_incremental'])
+          PY
+            echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-ticd-zonal-warning-model-and-evaluation
+          path: |
+            results_ticd_zone_context/
+            zonal_warning_environment.txt
+          if-no-files-found: warn
+          retention-days: 30
