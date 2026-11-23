@@ -28,10 +28,10 @@ with zipfile.ZipFile(DATA) as archive:
         with archive.open(filename) as reader:
             prefix=reader.read(512).lstrip()[:1]
         if prefix==b'[': expr='item'
-        elif prefix==b'{': expr='hits.hits.item'
+        elif prefix==b'{': expr=''
         else:raise SystemExit(f"Unknown JSON root in {filename} prefix={prefix!r}")
         with archive.open(filename) as reader:
-            for record in ijson.items(reader,expr):
+            for record in ijson.items(reader,expr,multiple_values=True):
                 counts['all']+=1;total+=1
                 if not isinstance(record,dict):continue
                 node=record.get('_source',record)
