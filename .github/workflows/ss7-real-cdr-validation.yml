@@ -42,6 +42,7 @@ jobs:
 
       - name: Validate canonical SS7 model on independent real CDR data
         run: |
+          set -o pipefail
           mkdir -p results
           python -m ss7.validate_real_cdr \
             --date 2013-11-01 \
