@@ -202,15 +202,41 @@ def load_real_cdr_features(
     if len(out) < 100:
         raise RuntimeError(f"Only {len(out)} usable real CDR windows; need at least 100")
 
-    if len(out) > max_windows:
-        out = out.sample(n=max_windows, random_state=seed)
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce", utc=True)
+    out = out.dropna(subset=["datetime"]).copy()
 
+    # Preserve complete cell trajectories.  Random row sampling would leak the same
+    # timestamps into train/validation/test and make temporal calibration optimistic.
+    selection = "all_cells"
+    if len(out) > max_windows:
+        counts = out.groupby("cell_id").size()
+        cells = counts.index.to_numpy()
+        rng = np.random.default_rng(seed)
+        cells = cells[rng.permutation(len(cells))]
+        chosen = []
+        used = 0
+        for cell in cells:
+            n = int(counts.loc[cell])
+            if chosen and used + n > max_windows:
+                continue
+            chosen.append(int(cell))
+            used += n
+            if used >= int(max_windows * 0.98):
+                break
+        if not chosen:
+            raise RuntimeError("Cannot select complete cell trajectories under max_windows")
+        out = out[out["cell_id"].isin(chosen)].copy()
+        selection = "complete_cell_trajectories"
+
+    out = out.sort_values(["datetime", "cell_id"]).reset_index(drop=True)
     meta = {
         "raw_rows_in_prefix": int(len(raw)),
         "usable_windows": int(len(out)),
         "unique_cells": int(out["cell_id"].nunique()),
+        "unique_timestamps": int(out["datetime"].nunique()),
         "timestamp_min": str(out["datetime"].min()),
         "timestamp_max": str(out["datetime"].max()),
+        "sampling": selection,
     }
     return out, meta
 
@@ -244,6 +270,47 @@ def time_split(
     return tr, va, te
 
 
+def real_time_split(
+    df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    """Strict 60/20/20 split by unique real timestamps."""
+    times = np.array(sorted(df["datetime"].dropna().unique()))
+    if len(times) < 15:
+        raise RuntimeError(
+            f"Real-data temporal split requires >=15 timestamps, got {len(times)}"
+        )
+    i1 = max(1, int(len(times) * 0.60))
+    i2 = max(i1 + 1, int(len(times) * 0.80))
+    i2 = min(i2, len(times) - 1)
+    train_times = set(times[:i1])
+    val_times = set(times[i1:i2])
+    test_times = set(times[i2:])
+
+    tr = df[df["datetime"].isin(train_times)].copy()
+    va = df[df["datetime"].isin(val_times)].copy()
+    te = df[df["datetime"].isin(test_times)].copy()
+    if min(len(tr), len(va), len(te)) < 100:
+        raise RuntimeError(
+            f"Real temporal split too small: train={len(tr)}, val={len(va)}, test={len(te)}"
+        )
+
+    def desc(part: pd.DataFrame) -> dict:
+        return {
+            "rows": int(len(part)),
+            "cells": int(part["cell_id"].nunique()),
+            "timestamps": int(part["datetime"].nunique()),
+            "start": str(part["datetime"].min()),
+            "end": str(part["datetime"].max()),
+        }
+
+    return tr, va, te, {
+        "method": "strict_unique_timestamp_60_20_20",
+        "train": desc(tr),
+        "validation": desc(va),
+        "test": desc(te),
+    }
+
+
 def feature_shift(
     train: pd.DataFrame,
     real: pd.DataFrame,
@@ -254,12 +321,12 @@ def feature_shift(
     sx = scaler.transform(imp.transform(train[cols]))
     rx = scaler.transform(imp.transform(real[cols]))
     out: Dict[str, dict] = {}
-    for j, c in enumerate(cols):
+    for j, col in enumerate(cols):
         s = sx[:, j]
         r = rx[:, j]
         ks = ks_2samp(s, r, alternative="two-sided", mode="auto")
         lo, hi = np.quantile(s, [0.005, 0.995])
-        out[c] = {
+        out[col] = {
             "ks_stat": float(ks.statistic),
             "ks_pvalue": float(ks.pvalue),
             "median_shift_sigma": float(abs(np.median(r) - np.median(s))),
@@ -268,68 +335,176 @@ def feature_shift(
     return out
 
 
-def validate_profile(
-    tr: pd.DataFrame,
-    va: pd.DataFrame,
-    te: pd.DataFrame,
-    real: pd.DataFrame,
+def fit_detector(
+    train: pd.DataFrame, cols: List[str], seed: int
+) -> Tuple[SimpleImputer, StandardScaler, IsolationForest]:
+    imp = SimpleImputer(strategy="median").fit(train[cols])
+    scaler = StandardScaler().fit(imp.transform(train[cols]))
+    x = scaler.transform(imp.transform(train[cols]))
+    model = IsolationForest(
+        n_estimators=300,
+        contamination="auto",
+        random_state=seed,
+        n_jobs=-1,
+    ).fit(x)
+    return imp, scaler, model
+
+
+def detector_scores(
+    frame: pd.DataFrame,
+    cols: List[str],
+    imp: SimpleImputer,
+    scaler: StandardScaler,
+    model: IsolationForest,
+) -> np.ndarray:
+    x = scaler.transform(imp.transform(frame[cols]))
+    return -model.score_samples(x)
+
+
+def threshold_for_fpr(scores: np.ndarray, target_fpr: float) -> float:
+    return float(np.quantile(scores, 1.0 - target_fpr))
+
+
+def wilson_interval(k: int, n: int, z: float = 1.96) -> List[float]:
+    if n <= 0:
+        return [float("nan"), float("nan")]
+    p = k / n
+    den = 1.0 + z * z / n
+    centre = (p + z * z / (2.0 * n)) / den
+    half = z * np.sqrt((p * (1.0 - p) / n) + z * z / (4.0 * n * n)) / den
+    return [float(max(0.0, centre - half)), float(min(1.0, centre + half))]
+
+
+def rejection_summary(scores: np.ndarray, threshold: float) -> dict:
+    rejected = scores > threshold
+    k = int(rejected.sum())
+    n = int(len(rejected))
+    return {
+        "rows": n,
+        "rejections": k,
+        "fpr": float(k / n) if n else float("nan"),
+        "fpr_wilson_95": wilson_interval(k, n),
+    }
+
+
+def temporal_block_fpr(
+    frame: pd.DataFrame, scores: np.ndarray, threshold: float, n_blocks: int = 4
+) -> dict:
+    tmp = frame[["datetime"]].copy()
+    tmp["score"] = scores
+    unique_times = np.array(sorted(tmp["datetime"].unique()))
+    blocks = []
+    for idx, times in enumerate(np.array_split(unique_times, n_blocks), start=1):
+        if len(times) == 0:
+            continue
+        sub = tmp[tmp["datetime"].isin(set(times))]
+        summary = rejection_summary(sub["score"].to_numpy(float), threshold)
+        summary.update({
+            "block": idx,
+            "timestamps": int(len(times)),
+            "start": str(sub["datetime"].min()),
+            "end": str(sub["datetime"].max()),
+        })
+        blocks.append(summary)
+    rates = np.array([b["fpr"] for b in blocks], dtype=float)
+    return {
+        "blocks": blocks,
+        "mean_fpr": float(np.mean(rates)) if len(rates) else float("nan"),
+        "std_fpr": float(np.std(rates)) if len(rates) else float("nan"),
+        "min_fpr": float(np.min(rates)) if len(rates) else float("nan"),
+        "max_fpr": float(np.max(rates)) if len(rates) else float("nan"),
+    }
+
+
+def evaluate_profile(
+    syn_tr: pd.DataFrame,
+    syn_va: pd.DataFrame,
+    syn_te: pd.DataFrame,
+    real_tr: pd.DataFrame,
+    real_va: pd.DataFrame,
+    real_te: pd.DataFrame,
     cols: List[str],
     seed: int,
     target_fpr: float,
 ) -> dict:
-    imp = SimpleImputer(strategy="median").fit(tr[cols])
-    scaler = StandardScaler().fit(imp.transform(tr[cols]))
-
-    def tx(frame: pd.DataFrame) -> np.ndarray:
-        return scaler.transform(imp.transform(frame[cols]))
-
-    xtr, xva, xte, xreal = tx(tr), tx(va), tx(te), tx(real)
-    model = IsolationForest(
-        n_estimators=400,
-        contamination="auto",
-        random_state=seed,
-        n_jobs=-1,
-    ).fit(xtr)
-
-    score_val = -model.score_samples(xva)
-    score_test = -model.score_samples(xte)
-    score_real = -model.score_samples(xreal)
-    threshold = float(np.quantile(score_val, 1.0 - target_fpr))
-
-    synth_test_fpr = float(np.mean(score_test > threshold))
-    real_rejection = float(np.mean(score_real > threshold))
-    shift = feature_shift(tr, real, cols, imp, scaler)
-
+    # Domain-shift diagnostics are measured only against real TRAIN so the held-out
+    # real test block remains untouched until final evaluation.
+    simp = SimpleImputer(strategy="median").fit(syn_tr[cols])
+    ssc = StandardScaler().fit(simp.transform(syn_tr[cols]))
+    shift = feature_shift(syn_tr, real_tr, cols, simp, ssc)
     ks_values = np.array([v["ks_stat"] for v in shift.values()], dtype=float)
     coverage = np.array(
         [v["real_inside_synth_99pct"] for v in shift.values()], dtype=float
     )
-    med_shift = np.array(
-        [v["median_shift_sigma"] for v in shift.values()], dtype=float
-    )
 
-    transfer_warning = bool(
-        real_rejection > max(0.05, 5.0 * target_fpr)
-        or float(np.median(ks_values)) > 0.50
-        or float(np.median(coverage)) < 0.50
-    )
-    top_shift = sorted(
-        ({"feature": c, **vals} for c, vals in shift.items()),
-        key=lambda x: (x["ks_stat"], x["median_shift_sigma"]),
-        reverse=True,
-    )
+    # Mode 1: original synthetic-only calibration.
+    imp_s, sc_s, model_s = fit_detector(syn_tr, cols, seed)
+    score_syn_val = detector_scores(syn_va, cols, imp_s, sc_s, model_s)
+    score_syn_test = detector_scores(syn_te, cols, imp_s, sc_s, model_s)
+    score_real_val_s = detector_scores(real_va, cols, imp_s, sc_s, model_s)
+    score_real_test_s = detector_scores(real_te, cols, imp_s, sc_s, model_s)
+
+    thr_syn = threshold_for_fpr(score_syn_val, target_fpr)
+    mode_synthetic = {
+        "model_fit": "synthetic_train",
+        "threshold_fit": "synthetic_validation",
+        "threshold": thr_syn,
+        "synthetic_validation": rejection_summary(score_syn_val, thr_syn),
+        "synthetic_test": rejection_summary(score_syn_test, thr_syn),
+        "real_test": rejection_summary(score_real_test_s, thr_syn),
+        "real_test_temporal_stability": temporal_block_fpr(
+            real_te, score_real_test_s, thr_syn
+        ),
+    }
+
+    # Mode 2: keep the synthetic model unchanged, but calibrate its operational
+    # threshold on a disjoint real NORMAL validation block.
+    thr_real = threshold_for_fpr(score_real_val_s, target_fpr)
+    mode_threshold = {
+        "model_fit": "synthetic_train",
+        "threshold_fit": "real_validation",
+        "threshold": thr_real,
+        "real_validation": rejection_summary(score_real_val_s, thr_real),
+        "real_test": rejection_summary(score_real_test_s, thr_real),
+        "synthetic_test_at_real_threshold": rejection_summary(score_syn_test, thr_real),
+        "real_test_temporal_stability": temporal_block_fpr(
+            real_te, score_real_test_s, thr_real
+        ),
+    }
+
+    # Mode 3: learn the normal-domain preprocessing and Isolation Forest exclusively
+    # on real TRAIN, set the threshold on real VALIDATION, and touch real TEST once.
+    imp_r, sc_r, model_r = fit_detector(real_tr, cols, seed)
+    score_real_train_r = detector_scores(real_tr, cols, imp_r, sc_r, model_r)
+    score_real_val_r = detector_scores(real_va, cols, imp_r, sc_r, model_r)
+    score_real_test_r = detector_scores(real_te, cols, imp_r, sc_r, model_r)
+    thr_real_model = threshold_for_fpr(score_real_val_r, target_fpr)
+    mode_real_normal = {
+        "model_fit": "real_train_normal_only",
+        "threshold_fit": "real_validation",
+        "threshold": thr_real_model,
+        "real_train_at_validation_threshold": rejection_summary(
+            score_real_train_r, thr_real_model
+        ),
+        "real_validation": rejection_summary(score_real_val_r, thr_real_model),
+        "real_test": rejection_summary(score_real_test_r, thr_real_model),
+        "real_test_temporal_stability": temporal_block_fpr(
+            real_te, score_real_test_r, thr_real_model
+        ),
+    }
 
     return {
         "features": cols,
-        "target_synthetic_fpr": float(target_fpr),
-        "threshold": threshold,
-        "synthetic_test_fpr": synth_test_fpr,
-        "real_rejection_rate_unlabeled": real_rejection,
-        "median_ks_stat": float(np.median(ks_values)),
-        "median_real_inside_synth_99pct": float(np.median(coverage)),
-        "median_abs_shift_sigma": float(np.median(med_shift)),
-        "transfer_warning": transfer_warning,
-        "top_feature_shift": top_shift,
+        "domain_shift_train_only": {
+            "median_ks_stat": float(np.median(ks_values)),
+            "median_real_inside_synth_99pct": float(np.median(coverage)),
+            "per_feature": shift,
+        },
+        "modes": {
+            "synthetic_only": mode_synthetic,
+            "threshold_calibration": mode_threshold,
+            "real_normal_calibration": mode_real_normal,
+        },
     }
 
 
@@ -337,12 +512,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default="2013-11-01")
     ap.add_argument("--max-bytes", type=int, default=64 * 1024 * 1024)
-    ap.add_argument("--max-real-windows", type=int, default=60000)
+    ap.add_argument("--max-real-windows", type=int, default=120000)
     ap.add_argument("--synthetic-days", type=float, default=0.5)
     ap.add_argument("--target-fpr", type=float, default=0.01)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--cache-dir", default=".cache/real_cdr")
-    ap.add_argument("--output", default="results/ss7_real_cdr_validation.json")
+    ap.add_argument("--output", default="results/ss7_real_cdr_calibration.json")
+    ap.add_argument("--summary-csv", default="results/ss7_real_cdr_calibration.csv")
     args = ap.parse_args(list(argv) if argv is not None else None)
 
     url = mirror_url(args.date)
@@ -353,25 +529,57 @@ def main(argv: Iterable[str] | None = None) -> int:
     real, real_meta = load_real_cdr_features(
         raw_path, args.max_real_windows, args.seed
     )
+    real_tr, real_va, real_te, real_split = real_time_split(real)
+
     syn = synthetic_normal(args.seed, args.synthetic_days)
-    tr, va, te = time_split(syn)
+    syn_tr, syn_va, syn_te = time_split(syn)
 
     profiles = {
-        "full_proxy": validate_profile(
-            tr, va, te, real, FULL_PROXY_FEATURES, args.seed, args.target_fpr
+        "full_proxy": evaluate_profile(
+            syn_tr, syn_va, syn_te,
+            real_tr, real_va, real_te,
+            FULL_PROXY_FEATURES, args.seed, args.target_fpr,
         ),
-        "ratio_proxy": validate_profile(
-            tr, va, te, real, RATIO_PROXY_FEATURES, args.seed, args.target_fpr
+        "ratio_proxy": evaluate_profile(
+            syn_tr, syn_va, syn_te,
+            real_tr, real_va, real_te,
+            RATIO_PROXY_FEATURES, args.seed, args.target_fpr,
         ),
     }
+
+    rows = []
+    for profile_name, profile in profiles.items():
+        for mode_name, mode in profile["modes"].items():
+            test = mode["real_test"]
+            stability = mode["real_test_temporal_stability"]
+            rows.append({
+                "profile": profile_name,
+                "mode": mode_name,
+                "target_fpr": args.target_fpr,
+                "real_test_rows": test["rows"],
+                "real_test_rejections": test["rejections"],
+                "real_test_fpr": test["fpr"],
+                "real_test_fpr_ci_low": test["fpr_wilson_95"][0],
+                "real_test_fpr_ci_high": test["fpr_wilson_95"][1],
+                "temporal_block_fpr_std": stability["std_fpr"],
+                "temporal_block_fpr_min": stability["min_fpr"],
+                "temporal_block_fpr_max": stability["max_fpr"],
+            })
+
+    ratio_modes = profiles["ratio_proxy"]["modes"]
+    target = float(args.target_fpr)
+    real_normal_fpr = ratio_modes["real_normal_calibration"]["real_test"]["fpr"]
+    threshold_only_fpr = ratio_modes["threshold_calibration"]["real_test"]["fpr"]
+    synthetic_only_fpr = ratio_modes["synthetic_only"]["real_test"]["fpr"]
 
     report = {
         "status": "completed",
         "interpretation": (
-            "Independent non-synthetic normal-traffic external-validity check. "
-            "No real attack recall/precision/AUC is claimed because this public CDR "
-            "mirror contains no SS7 attack labels and no packet-level/cross-node "
-            "SS7 invariants."
+            "Three-way calibration experiment on independent non-synthetic normal "
+            "Telecom Italia CDR traffic. Real data are split strictly by timestamp "
+            "60/20/20 before calibration. No real attack recall/precision/AUC is "
+            "claimed because the public CDR mirror has no SS7 attack labels and no "
+            "packet-level/cross-node SS7 invariants."
         ),
         "source": {
             "original_dataset": "Telecom Italia Milan telecommunications activity",
@@ -385,28 +593,30 @@ def main(argv: Iterable[str] | None = None) -> int:
             "non_synthetic": True,
             "independent_of_repository_generator": True,
         },
+        "protocol": {
+            "target_fpr": target,
+            "real_split": real_split,
+            "modes": {
+                "synthetic_only": "fit synthetic train; threshold synthetic validation",
+                "threshold_calibration": (
+                    "fit synthetic train; threshold real validation; no model refit"
+                ),
+                "real_normal_calibration": (
+                    "fit real normal train; threshold real validation; evaluate once on real test"
+                ),
+            },
+        },
         "proxy_mapping": {
             "signalling_equivalent_units": (
                 "call activity -> five ISUP message-type units; "
                 "SMS-out -> one MAP unit; SMS-in -> two MAP units"
             ),
             "excluded_as_unobservable_in_mirror": [
-                "dest_entropy",
-                "n_unique_dest",
-                "dest_top1_ratio",
-                "dest_top2_ratio",
-                "transit_share",
-                "dlg_closure_ratio",
-                "recon_mean",
-                "recon_min",
-                "recon_absmax",
-                "recon_rms",
-                "od_mean",
-                "od_min",
-                "od_absmax",
-                "closure_resid",
-                "transit_resid",
-                "integrity_fail",
+                "dest_entropy", "n_unique_dest", "dest_top1_ratio",
+                "dest_top2_ratio", "transit_share", "dlg_closure_ratio",
+                "recon_mean", "recon_min", "recon_absmax", "recon_rms",
+                "od_mean", "od_min", "od_absmax", "closure_resid",
+                "transit_resid", "integrity_fail",
             ],
         },
         "real_data": real_meta,
@@ -414,14 +624,17 @@ def main(argv: Iterable[str] | None = None) -> int:
             "seed": args.seed,
             "days": args.synthetic_days,
             "rows": int(len(syn)),
-            "train_rows": int(len(tr)),
-            "validation_rows": int(len(va)),
-            "test_rows": int(len(te)),
+            "train_rows": int(len(syn_tr)),
+            "validation_rows": int(len(syn_va)),
+            "test_rows": int(len(syn_te)),
         },
         "profiles": profiles,
-        "overall_transfer_warning": bool(
-            any(p["transfer_warning"] for p in profiles.values())
-        ),
+        "primary_ratio_profile": {
+            "synthetic_only_real_test_fpr": synthetic_only_fpr,
+            "threshold_calibration_real_test_fpr": threshold_only_fpr,
+            "real_normal_calibration_real_test_fpr": real_normal_fpr,
+            "real_normal_within_2x_target": bool(real_normal_fpr <= 2.0 * target),
+        },
     }
 
     out = Path(args.output)
@@ -429,7 +642,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     out.write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    summary = Path(args.summary_csv)
+    summary.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(summary, index=False)
+
     print(json.dumps(report, ensure_ascii=False, indent=2))
+    print("\nSUMMARY")
+    print(pd.DataFrame(rows).to_string(index=False))
     return 0
 
 
