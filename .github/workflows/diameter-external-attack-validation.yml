@@ -43,8 +43,8 @@ jobs:
       - name: Install system dependencies
         run: |
           echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark tcpdump netcat-openbsd
+          sudo apt-get update -o Acquire::Retries=3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark tcpdump netcat-openbsd
 
       - name: Install Python dependencies
         run: |
