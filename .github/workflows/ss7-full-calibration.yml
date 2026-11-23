@@ -54,6 +54,7 @@ jobs:
             --max-real-windows-per-day 120000 \
             --overall-target-fpr 0.01 \
             --seed 42 \
+            --secondary-seed 1337 \
             --confirm-seed 2026 \
             --synthetic-days 1.0 \
             --output-dir results/full_calibration \
