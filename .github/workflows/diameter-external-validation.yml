@@ -36,11 +36,10 @@ jobs:
           cache: pip
 
       - name: Install system dependencies
-        env:
-          DEBIAN_FRONTEND: noninteractive
         run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
           sudo apt-get update
-          sudo apt-get install -y tshark
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
 
       - name: Install Python dependencies
         run: |
