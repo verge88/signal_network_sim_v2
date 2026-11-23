@@ -73,12 +73,12 @@ jobs:
           for pcap in external_pcaps/*.pcap; do
             echo "=== ${pcap} ==="
             capinfos -c -u -a -e "${pcap}" || true
-            tshark -r "${pcap}" -Y diameter -T fields               -e diameter.cmd.code -e diameter.applicationId | head -n 30
+            sudo tshark -r "${pcap}" -Y diameter -T fields               -e diameter.cmd.code -e diameter.applicationId | head -n 30
           done
 
       - name: Run independent validation
         run: |
-          python experiments/diameter_external_pcap_validation.py             external_pcaps/s6a.pcap             external_pcaps/gy.pcap             external_pcaps/rx.pcap             external_pcaps/gy_mscc.pcap             --out-dir results_external_diameter
+          PYTHONPATH=. python experiments/diameter_external_pcap_validation.py             external_pcaps/s6a.pcap             external_pcaps/gy.pcap             external_pcaps/rx.pcap             external_pcaps/gy_mscc.pcap             --out-dir results_external_diameter
 
       - name: Publish step summary
         if: always()
