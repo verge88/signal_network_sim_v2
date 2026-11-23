@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Dict, Iterable, List
@@ -26,6 +27,10 @@ import pandas as pd
 from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from diameter.diameter_sim_v1 import (
     AttackScenario,
@@ -173,7 +178,10 @@ def _run_tshark(path: Path) -> List[Dict[str, str]]:
         "-e", "frame.time_epoch", "-e", "diameter.cmd.code",
         "-e", "diameter.applicationId", "-e", "diameter.CC-Request-Type",
     ]
-    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 and "permission" in proc.stderr.lower():
+        proc = subprocess.run(["sudo", *cmd], capture_output=True, text=True)
+    proc.check_returncode()
     rows = []
     for line in proc.stdout.splitlines():
         parts = line.split("\t")
