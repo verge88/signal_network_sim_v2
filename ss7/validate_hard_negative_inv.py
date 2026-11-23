@@ -1,24 +1,12 @@
 """Hard-negative and feature-robust validation for the SS7 INV detector.
 
-Purpose
--------
-Previous calibrated validation showed:
-* OWN OR INV did not improve episode recall and increased false positives.
-* context recognition was too sparse to provide reliable per-window suppression.
-* INV Random Forest remained the useful attack-scoring channel, but temporal
-  test FPR drifted above the validation target on some topologies.
+Architecture selection is performed only on development seeds.  Evaluation seeds
+are disjoint and their test blocks are touched once after the architecture is frozen.
 
-This experiment therefore keeps a single INV attack channel and changes only
-training/calibration:
-1. normal operational events are explicit hard negatives and may receive extra
-   training weight;
-2. several invariant feature families are compared, because temporal z-features
-   can react strongly to benign load changes;
-3. a global validation quantile is compared with a block-robust threshold;
-4. architecture selection uses development seeds only;
-5. final metrics are reported once on disjoint evaluation seeds.
-
-No evaluation-seed test window participates in model/threshold selection.
+The experiment addresses two failures found by the earlier full validation:
+(1) temporal/zone derived INV features may overreact to benign operational changes;
+(2) benign events such as traffic spikes/campaigns must be treated as explicit hard
+negative controls rather than runtime context labels.
 """
 from __future__ import annotations
 
@@ -30,18 +18,8 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import average_precision_score, roc_auc_score
 
-from ss7.fix import (
-    INV,
-    MASK_FAMILIES,
-    NORMAL_EVENTS,
-    RngBook,
-    SimConfig,
-    blocked_split,
-    build_dataset,
-    episode_metrics,
-)
+from ss7.fix import INV, RngBook, SimConfig, blocked_split, build_dataset
 from ss7.validate_calibrated_detectors import (
     INV_CAL_RF,
     add_episode_parameters,
@@ -59,36 +37,35 @@ from ss7.validate_context_aware_detector import (
 )
 
 
-OPERATING_FPR = 0.01
 DEVELOPMENT_FPR_TOLERANCE = 0.015
 DEVELOPMENT_EVENT_FPR_TOLERANCE = 0.05
 MIN_BLOCK_NEGATIVES = 400
 
-HARD_NEGATIVE_WEIGHTS = (1.0, 2.0, 4.0, 8.0)
+HARD_NEGATIVE_WEIGHTS = (1.0, 4.0, 8.0)
 CALIBRATION_TARGETS = (0.005, 0.01)
 THRESHOLD_MODES = ("global", "block_robust")
+FEATURE_FAMILIES = (
+    "inv_raw",
+    "inv_raw_history",
+    "inv_raw_history_zone",
+    "inv_all_derived",
+)
 
 
 def invariant_feature_families(frame: pd.DataFrame) -> Dict[str, List[str]]:
     raw = [c for c in INV if c in frame.columns]
-    mean_std = []
-    z = []
-    zone = []
+    mean_std, zone = [], []
     for c in raw:
-        for suffix, target in [
-            ("__mean", mean_std),
-            ("__std", mean_std),
-            ("__z", z),
-            ("__dev_zone", zone),
-        ]:
+        for suffix in ("__mean", "__std"):
             name = c + suffix
             if name in frame.columns:
-                target.append(name)
-
+                mean_std.append(name)
+        zone_name = c + "__dev_zone"
+        if zone_name in frame.columns:
+            zone.append(zone_name)
     return {
         "inv_raw": raw,
         "inv_raw_history": raw + mean_std,
-        "inv_raw_zone": raw + zone,
         "inv_raw_history_zone": raw + mean_std + zone,
         "inv_all_derived": all_derived(frame, INV),
     }
@@ -113,63 +90,54 @@ def calibrate_threshold(
     global_thr = fpr_threshold(scores[neg], target_fpr)
     if mode == "global":
         return float(global_thr), {
-            "mode": "global",
+            "mode": mode,
             "global_threshold": float(global_thr),
             "selected_threshold": float(global_thr),
             "threshold_lift": 0.0,
             "eligible_blocks": 0,
         }
 
-    if mode != "block_robust":
-        raise ValueError(mode)
-
     candidates = [float(global_thr)]
-    block_rows = []
+    blocks = []
     for idx, times in enumerate(contiguous_time_blocks(validation), start=1):
         mask = neg & validation["t"].isin(times).to_numpy()
         n = int(mask.sum())
         if n < MIN_BLOCK_NEGATIVES:
-            block_rows.append({
-                "block": idx,
-                "negative_rows": n,
-                "eligible": False,
-                "q": None,
+            blocks.append({
+                "block": idx, "negative_rows": n,
+                "eligible": False, "quantile_threshold": None,
             })
             continue
         q = fpr_threshold(scores[mask], target_fpr)
         candidates.append(float(q))
-        block_rows.append({
-            "block": idx,
-            "negative_rows": n,
-            "eligible": True,
-            "q": float(q),
+        blocks.append({
+            "block": idx, "negative_rows": n,
+            "eligible": True, "quantile_threshold": float(q),
         })
-
     selected = float(max(candidates))
     return selected, {
-        "mode": "block_robust",
+        "mode": mode,
         "global_threshold": float(global_thr),
         "selected_threshold": selected,
         "threshold_lift": float(selected - global_thr),
-        "eligible_blocks": int(sum(x["eligible"] for x in block_rows)),
-        "blocks": block_rows,
+        "eligible_blocks": int(sum(x["eligible"] for x in blocks)),
+        "blocks": blocks,
     }
 
 
-def training_sample_weights(frame: pd.DataFrame, hard_negative_weight: float) -> np.ndarray:
+def training_sample_weights(frame: pd.DataFrame, hard_weight: float) -> np.ndarray:
     y = frame["label"].to_numpy(int)
     context = frame["benign_event_kind_truth"].astype(str).to_numpy()
     w = np.ones(len(frame), dtype=float)
-    hard = (y == 0) & (context != "background")
-    w[hard] = float(hard_negative_weight)
+    w[(y == 0) & (context != "background")] = float(hard_weight)
     return w
 
 
-def fit_inv_model(
+def fit_model(
     train: pd.DataFrame,
     cols: Sequence[str],
     seed: int,
-    hard_negative_weight: float,
+    hard_weight: float,
 ):
     imp, sc, xtr = prep(train, cols)
     model = RandomForestClassifier(
@@ -181,47 +149,12 @@ def fit_inv_model(
     model.fit(
         xtr,
         train["label"].to_numpy(int),
-        sample_weight=training_sample_weights(train, hard_negative_weight),
+        sample_weight=training_sample_weights(train, hard_weight),
     )
     return imp, sc, model
 
 
-def attack_metrics(frame: pd.DataFrame, scores: np.ndarray, threshold: float) -> dict:
-    return detector_metrics(frame, scores, threshold)
-
-
-def event_fpr_rows(
-    frame: pd.DataFrame,
-    scores: np.ndarray,
-    threshold: float,
-) -> List[dict]:
-    y = frame["label"].to_numpy(int)
-    event = frame["benign_event_kind_truth"].astype(str).to_numpy()
-    fire = np.asarray(scores) > float(threshold)
-    rows = []
-    for kind in sorted(set(event[y == 0])):
-        mask = (y == 0) & (event == kind)
-        rows.append({
-            "normal_event": str(kind),
-            "rows": int(mask.sum()),
-            "alerts": int(np.sum(fire[mask])),
-            "window_fpr": float(np.mean(fire[mask])) if mask.any() else float("nan"),
-        })
-    return rows
-
-
-def max_reliable_event_fpr(rows: Sequence[dict], min_rows: int = 20) -> float:
-    vals = [
-        float(r["window_fpr"])
-        for r in rows
-        if int(r["rows"]) >= min_rows
-        and r["normal_event"] != "background"
-        and np.isfinite(float(r["window_fpr"]))
-    ]
-    return float(max(vals)) if vals else 0.0
-
-
-def build_world(seed: int, days: float, n_compromise: int, n_normal: int):
+def build_prepared_world(seed: int, days: float, n_compromise: int, n_normal: int) -> dict:
     cfg = SimConfig(seed=int(seed), days=float(days))
     frame, sim, episodes = build_dataset(
         cfg,
@@ -236,192 +169,170 @@ def build_world(seed: int, days: float, n_compromise: int, n_normal: int):
     frame = add_episode_parameters(frame, episodes)
     tr, va, te = blocked_split(frame, cfg, RngBook(seed)["split"])
     tr, va, te, split_audit = purge_cross_split_benign_events(tr, va, te)
-    return frame, cfg, episodes, tr, va, te, {
-        "reroute": reroute,
-        "benign_split": split_audit,
-    }
-
-
-def evaluate_candidate_on_seed(
-    seed: int,
-    days: float,
-    candidate: dict,
-    *,
-    n_compromise: int,
-    n_normal: int,
-) -> dict:
-    frame, cfg, episodes, tr, va, te, audit = build_world(
-        seed, days, n_compromise, n_normal
-    )
-    families = invariant_feature_families(frame)
-    cols = families[candidate["feature_family"]]
-
-    imp, sc, model = fit_inv_model(
-        tr,
-        cols,
-        seed,
-        candidate["hard_negative_weight"],
-    )
-    va_scores = model.predict_proba(tx(va, cols, imp, sc))[:, 1]
-    te_scores = model.predict_proba(tx(te, cols, imp, sc))[:, 1]
-    threshold, threshold_diag = calibrate_threshold(
-        va,
-        va_scores,
-        candidate["target_fpr"],
-        candidate["threshold_mode"],
-    )
-
-    metrics = attack_metrics(te, te_scores, threshold)
-    event_rows = event_fpr_rows(te, te_scores, threshold)
-    rate_rows = episode_recall_by_group(
-        te,
-        te_scores - threshold,
-        0.0,
-        "episode_hidden_rate",
-    )
-    family_rows = episode_recall_by_group(
-        te,
-        te_scores - threshold,
-        0.0,
-        "episode_family_truth",
-    )
     return {
         "seed": int(seed),
-        "feature_family": candidate["feature_family"],
-        "n_features": int(len(cols)),
-        "hard_negative_weight": float(candidate["hard_negative_weight"]),
-        "target_fpr": float(candidate["target_fpr"]),
-        "threshold_mode": candidate["threshold_mode"],
-        "threshold": float(threshold),
-        "threshold_diagnostics": threshold_diag,
-        "metrics": metrics,
-        "event_fpr": event_rows,
-        "max_reliable_event_fpr": max_reliable_event_fpr(event_rows),
-        "rate_rows": rate_rows,
-        "family_rows": family_rows,
-        "test_rows": int(len(te)),
-        "test_episodes": int(te.loc[te["label"] == 1, "episode_id"].nunique()),
-        "audit": audit,
+        "frame": frame,
+        "train": tr,
+        "validation": va,
+        "test": te,
+        "feature_families": invariant_feature_families(frame),
+        "audit": {
+            "reroute": reroute,
+            "benign_split": split_audit,
+        },
     }
 
 
-def candidate_key(candidate: dict) -> str:
+def event_fpr_rows(frame: pd.DataFrame, scores: np.ndarray, threshold: float) -> List[dict]:
+    y = frame["label"].to_numpy(int)
+    event = frame["benign_event_kind_truth"].astype(str).to_numpy()
+    fire = np.asarray(scores, dtype=float) > float(threshold)
+    out = []
+    for kind in sorted(set(event[y == 0])):
+        mask = (y == 0) & (event == kind)
+        out.append({
+            "normal_event": str(kind),
+            "rows": int(mask.sum()),
+            "alerts": int(np.sum(fire[mask])),
+            "window_fpr": float(np.mean(fire[mask])) if mask.any() else float("nan"),
+        })
+    return out
+
+
+def max_event_fpr(rows: Sequence[dict], min_rows: int = 20) -> float:
+    vals = [
+        float(r["window_fpr"])
+        for r in rows
+        if int(r["rows"]) >= min_rows
+        and r["normal_event"] != "background"
+        and np.isfinite(float(r["window_fpr"]))
+    ]
+    return float(max(vals)) if vals else 0.0
+
+
+def model_config_key(feature_family: str, hard_weight: float) -> str:
+    return f"{feature_family}/w{hard_weight:g}"
+
+
+def candidate_key(
+    feature_family: str,
+    hard_weight: float,
+    target_fpr: float,
+    threshold_mode: str,
+) -> str:
     return (
-        f'{candidate["feature_family"]}'
-        f'/w{candidate["hard_negative_weight"]:g}'
-        f'/fpr{candidate["target_fpr"]:g}'
-        f'/{candidate["threshold_mode"]}'
+        f"{model_config_key(feature_family, hard_weight)}"
+        f"/fpr{target_fpr:g}/{threshold_mode}"
     )
 
 
-def candidate_grid() -> List[dict]:
-    rows = []
-    for feature_family in [
-        "inv_raw",
-        "inv_raw_history",
-        "inv_raw_zone",
-        "inv_raw_history_zone",
-        "inv_all_derived",
-    ]:
-        for weight in HARD_NEGATIVE_WEIGHTS:
-            for target in CALIBRATION_TARGETS:
-                for mode in THRESHOLD_MODES:
-                    rows.append({
-                        "feature_family": feature_family,
-                        "hard_negative_weight": float(weight),
-                        "target_fpr": float(target),
-                        "threshold_mode": mode,
-                    })
-    return rows
+def score_model_config(world: dict, feature_family: str, hard_weight: float) -> dict:
+    cols = world["feature_families"][feature_family]
+    tr, va, te = world["train"], world["validation"], world["test"]
+    imp, sc, model = fit_model(tr, cols, world["seed"], hard_weight)
+    return {
+        "cols": cols,
+        "validation_scores": model.predict_proba(tx(va, cols, imp, sc))[:, 1],
+        "test_scores": model.predict_proba(tx(te, cols, imp, sc))[:, 1],
+    }
 
 
-def summarize_development(candidate: dict, results: Sequence[dict]) -> dict:
-    recall = np.asarray(
-        [r["metrics"]["episode_recall"] for r in results], dtype=float
+def evaluate_threshold_variant(
+    world: dict,
+    scored: dict,
+    target_fpr: float,
+    threshold_mode: str,
+) -> dict:
+    va, te = world["validation"], world["test"]
+    threshold, diag = calibrate_threshold(
+        va, scored["validation_scores"], target_fpr, threshold_mode
     )
-    fpr = np.asarray(
-        [r["metrics"]["window_fpr_direct"] for r in results], dtype=float
-    )
-    ap = np.asarray([r["metrics"]["ap"] for r in results], dtype=float)
-    event_fpr = np.asarray(
-        [r["max_reliable_event_fpr"] for r in results], dtype=float
-    )
+    te_scores = scored["test_scores"]
+    metrics = detector_metrics(te, te_scores, threshold)
+    events = event_fpr_rows(te, te_scores, threshold)
+    return {
+        "seed": int(world["seed"]),
+        "threshold": float(threshold),
+        "threshold_diagnostics": diag,
+        "metrics": metrics,
+        "event_fpr": events,
+        "max_reliable_event_fpr": max_event_fpr(events),
+        "test_rows": int(len(te)),
+        "test_episodes": int(te.loc[te["label"] == 1, "episode_id"].nunique()),
+        "rate_rows": episode_recall_by_group(
+            te, te_scores - threshold, 0.0, "episode_hidden_rate"
+        ),
+        "family_rows": episode_recall_by_group(
+            te, te_scores - threshold, 0.0, "episode_family_truth"
+        ),
+    }
+
+
+def summarize_candidate(candidate: dict, seed_results: Sequence[dict], n_features: int) -> dict:
+    recall = np.asarray([x["metrics"]["episode_recall"] for x in seed_results], float)
+    fpr = np.asarray([x["metrics"]["window_fpr_direct"] for x in seed_results], float)
+    ap = np.asarray([x["metrics"]["ap"] for x in seed_results], float)
+    event = np.asarray([x["max_reliable_event_fpr"] for x in seed_results], float)
 
     max_fpr = float(np.nanmax(fpr))
-    mean_fpr = float(np.nanmean(fpr))
-    worst_event = float(np.nanmax(event_fpr))
-    min_recall = float(np.nanmin(recall))
-    mean_recall = float(np.nanmean(recall))
-    mean_ap = float(np.nanmean(ap))
-
-    fpr_violation = max(
-        0.0,
-        max_fpr - DEVELOPMENT_FPR_TOLERANCE,
-    )
-    event_violation = max(
-        0.0,
-        worst_event - DEVELOPMENT_EVENT_FPR_TOLERANCE,
-    )
+    max_event = float(np.nanmax(event))
+    fpr_violation = max(0.0, max_fpr - DEVELOPMENT_FPR_TOLERANCE)
+    event_violation = max(0.0, max_event - DEVELOPMENT_EVENT_FPR_TOLERANCE)
     feasible = bool(fpr_violation == 0.0 and event_violation == 0.0)
 
-    # Lexicographic selection: first satisfy robust false-positive constraints;
-    # then maximize worst-seed and mean episode recall, then AP and compactness.
+    mean_recall = float(np.nanmean(recall))
+    min_recall = float(np.nanmin(recall))
+    mean_ap = float(np.nanmean(ap))
     selection_key = (
         0 if feasible else 1,
         float(fpr_violation + event_violation),
         -min_recall,
         -mean_recall,
         -mean_ap,
-        int(results[0]["n_features"]),
+        int(n_features),
     )
-
     return {
-        "candidate": candidate_key(candidate),
+        "candidate": candidate_key(
+            candidate["feature_family"],
+            candidate["hard_negative_weight"],
+            candidate["target_fpr"],
+            candidate["threshold_mode"],
+        ),
         **candidate,
-        "n_features": int(results[0]["n_features"]),
-        "development_seeds": [int(r["seed"]) for r in results],
+        "n_features": int(n_features),
         "mean_episode_recall": mean_recall,
         "min_episode_recall": min_recall,
-        "mean_test_fpr": mean_fpr,
+        "mean_test_fpr": float(np.nanmean(fpr)),
         "max_test_fpr": max_fpr,
-        "worst_reliable_event_fpr": worst_event,
+        "worst_reliable_event_fpr": max_event,
         "mean_ap": mean_ap,
-        "fpr_constraint": DEVELOPMENT_FPR_TOLERANCE,
-        "event_fpr_constraint": DEVELOPMENT_EVENT_FPR_TOLERANCE,
         "feasible": feasible,
         "selection_key": list(selection_key),
     }
 
 
-def aggregate_metrics(rows: pd.DataFrame) -> dict:
+def aggregate_metrics(df: pd.DataFrame) -> dict:
     out = {}
-    for col in [
-        "episode_recall",
-        "window_fpr_direct",
-        "auc",
-        "ap",
-        "median_ttd_seconds",
-        "window_tpr",
-        "alerts_per_day_network",
-    ]:
-        x = rows[col].to_numpy(float)
+    for col in (
+        "episode_recall", "window_fpr_direct", "auc", "ap",
+        "median_ttd_seconds", "window_tpr", "alerts_per_day_network",
+    ):
+        x = df[col].to_numpy(float)
         x = x[np.isfinite(x)]
         out[col + "_mean"] = float(np.mean(x)) if len(x) else float("nan")
-        out[col + "_std"] = (
-            float(np.std(x, ddof=1)) if len(x) > 1 else 0.0
-        )
+        out[col + "_std"] = float(np.std(x, ddof=1)) if len(x) > 1 else 0.0
         out[col + "_min"] = float(np.min(x)) if len(x) else float("nan")
         out[col + "_max"] = float(np.max(x)) if len(x) else float("nan")
     return out
 
 
-def aggregate_event_rows(rows: pd.DataFrame) -> List[dict]:
+def aggregate_events(df: pd.DataFrame) -> List[dict]:
     out = []
-    for event, g in rows.groupby("normal_event"):
+    for event, g in df.groupby("normal_event"):
         n = int(g["rows"].sum())
         alerts = int(g["alerts"].sum())
         out.append({
-            "normal_event": event,
+            "normal_event": str(event),
             "rows": n,
             "alerts": alerts,
             "pooled_window_fpr": float(alerts / n) if n else float("nan"),
@@ -433,104 +344,105 @@ def aggregate_event_rows(rows: pd.DataFrame) -> List[dict]:
 
 def main(argv: Iterable[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--development-seeds",
-        nargs="+",
-        type=int,
-        default=[42, 1337, 5151],
-    )
-    ap.add_argument(
-        "--evaluation-seeds",
-        nargs="+",
-        type=int,
-        default=[7001, 7002, 7003, 7004, 7005],
-    )
-    ap.add_argument("--development-days", type=float, default=1.0)
+    ap.add_argument("--development-seeds", nargs="+", type=int, default=[42, 1337, 5151])
+    ap.add_argument("--evaluation-seeds", nargs="+", type=int, default=[7001, 7002, 7003, 7004, 7005])
+    ap.add_argument("--development-days", type=float, default=0.9)
     ap.add_argument("--evaluation-days", type=float, default=1.25)
-    ap.add_argument(
-        "--output-dir",
-        default="results/ss7_hard_negative_inv",
-    )
+    ap.add_argument("--output-dir", default="results/ss7_hard_negative_inv")
     args = ap.parse_args(list(argv) if argv is not None else None)
 
     outdir = Path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    development_rows = []
-    development_detail = {}
-    for candidate in candidate_grid():
-        key = candidate_key(candidate)
-        per_seed = []
-        for seed in args.development_seeds:
-            result = evaluate_candidate_on_seed(
-                int(seed),
-                float(args.development_days),
-                candidate,
-                n_compromise=24,
-                n_normal=72,
-            )
-            per_seed.append(result)
-        summary = summarize_development(candidate, per_seed)
-        development_rows.append(summary)
-        development_detail[key] = per_seed
+    development_worlds = [
+        build_prepared_world(int(seed), float(args.development_days), 20, 60)
+        for seed in args.development_seeds
+    ]
 
-    development_rows.sort(key=lambda x: tuple(x["selection_key"]))
-    selected = development_rows[0]
-    selected_candidate = {
+    candidate_summaries = []
+    candidate_detail = {}
+    for feature_family in FEATURE_FAMILIES:
+        for hard_weight in HARD_NEGATIVE_WEIGHTS:
+            config_scores = {
+                w["seed"]: score_model_config(w, feature_family, hard_weight)
+                for w in development_worlds
+            }
+            n_features = len(next(iter(config_scores.values()))["cols"])
+            for target_fpr in CALIBRATION_TARGETS:
+                for threshold_mode in THRESHOLD_MODES:
+                    candidate = {
+                        "feature_family": feature_family,
+                        "hard_negative_weight": float(hard_weight),
+                        "target_fpr": float(target_fpr),
+                        "threshold_mode": str(threshold_mode),
+                    }
+                    per_seed = [
+                        evaluate_threshold_variant(
+                            w,
+                            config_scores[w["seed"]],
+                            float(target_fpr),
+                            str(threshold_mode),
+                        )
+                        for w in development_worlds
+                    ]
+                    summary = summarize_candidate(candidate, per_seed, n_features)
+                    candidate_summaries.append(summary)
+                    candidate_detail[summary["candidate"]] = per_seed
+
+    candidate_summaries.sort(key=lambda x: tuple(x["selection_key"]))
+    selected = candidate_summaries[0]
+    selected_model = {
         "feature_family": selected["feature_family"],
-        "hard_negative_weight": selected["hard_negative_weight"],
-        "target_fpr": selected["target_fpr"],
+        "hard_negative_weight": float(selected["hard_negative_weight"]),
+    }
+    selected_threshold = {
+        "target_fpr": float(selected["target_fpr"]),
         "threshold_mode": selected["threshold_mode"],
     }
 
-    pd.DataFrame(development_rows).to_csv(
-        outdir / "development_candidate_summary.csv",
-        index=False,
+    pd.DataFrame(candidate_summaries).to_csv(
+        outdir / "development_candidate_summary.csv", index=False
     )
 
-    eval_metric_rows = []
-    eval_event_rows = []
-    eval_rate_rows = []
-    eval_family_rows = []
-    eval_seed_reports = []
+    metric_rows, event_rows, rate_rows, family_rows, seed_reports = [], [], [], [], []
     for seed in args.evaluation_seeds:
-        result = evaluate_candidate_on_seed(
-            int(seed),
-            float(args.evaluation_days),
-            selected_candidate,
-            n_compromise=18,
-            n_normal=42,
+        world = build_prepared_world(int(seed), float(args.evaluation_days), 18, 42)
+        scored = score_model_config(
+            world,
+            selected_model["feature_family"],
+            selected_model["hard_negative_weight"],
         )
-        m = {
+        result = evaluate_threshold_variant(
+            world,
+            scored,
+            selected_threshold["target_fpr"],
+            selected_threshold["threshold_mode"],
+        )
+        metric_rows.append({
             "seed": int(seed),
             **result["metrics"],
             "threshold": result["threshold"],
             "test_rows": result["test_rows"],
             "test_episodes": result["test_episodes"],
-        }
-        eval_metric_rows.append(m)
-        for row in result["event_fpr"]:
-            eval_event_rows.append({"seed": int(seed), **row})
-        for row in result["rate_rows"]:
-            eval_rate_rows.append({"seed": int(seed), **row})
-        for row in result["family_rows"]:
-            eval_family_rows.append({"seed": int(seed), **row})
-        eval_seed_reports.append({
+        })
+        event_rows.extend({"seed": int(seed), **x} for x in result["event_fpr"])
+        rate_rows.extend({"seed": int(seed), **x} for x in result["rate_rows"])
+        family_rows.extend({"seed": int(seed), **x} for x in result["family_rows"])
+        seed_reports.append({
             "seed": int(seed),
+            "n_features": int(len(scored["cols"])),
             "threshold": result["threshold"],
             "threshold_diagnostics": result["threshold_diagnostics"],
-            "n_features": result["n_features"],
             "max_reliable_event_fpr": result["max_reliable_event_fpr"],
             "test_rows": result["test_rows"],
             "test_episodes": result["test_episodes"],
-            "audit": result["audit"],
+            "audit": world["audit"],
         })
 
-    metrics_df = pd.DataFrame(eval_metric_rows)
-    events_df = pd.DataFrame(eval_event_rows)
-    rates_df = pd.DataFrame(eval_rate_rows)
-    families_df = pd.DataFrame(eval_family_rows)
-
+    metrics_df = pd.DataFrame(metric_rows)
+    events_df = pd.DataFrame(event_rows)
+    rates_df = pd.DataFrame(rate_rows)
+    families_df = pd.DataFrame(family_rows)
     metrics_df.to_csv(outdir / "evaluation_multiseed.csv", index=False)
     events_df.to_csv(outdir / "evaluation_normal_event_fpr.csv", index=False)
     rates_df.to_csv(outdir / "evaluation_recall_by_hidden_rate.csv", index=False)
@@ -540,44 +452,38 @@ def main(argv: Iterable[str] | None = None) -> int:
         "status": "completed",
         "architecture": {
             "attack_channel": "INV Random Forest only",
-            "own_channel": "not used in attack decision; retained for drift monitoring",
-            "hard_negative_training": (
-                "benign operational-event windows receive extra sample weight"
-            ),
-            "feature_family_selection": (
-                "raw/temporal/zone invariant families selected on development seeds"
-            ),
-            "threshold_selection": (
-                "global or max-over-validation-block quantile, development-selected"
-            ),
-            "test_used_for_architecture_selection": False,
+            "own_channel": "drift monitoring only; excluded from attack decision",
+            "hard_negative_training": "normal operational-event windows are upweighted",
+            "feature_family": selected["feature_family"],
+            "hard_negative_weight": selected["hard_negative_weight"],
+            "threshold_mode": selected["threshold_mode"],
+            "threshold_target_fpr": selected["target_fpr"],
+            "architecture_selected_on_evaluation_seeds": False,
         },
         "development": {
             "seeds": [int(x) for x in args.development_seeds],
             "days": float(args.development_days),
-            "candidate_count": int(len(development_rows)),
+            "candidate_count": int(len(candidate_summaries)),
             "selected": selected,
-            "top_candidates": development_rows[:10],
+            "top_candidates": candidate_summaries[:10],
         },
         "evaluation": {
             "seeds": [int(x) for x in args.evaluation_seeds],
             "days": float(args.evaluation_days),
             "aggregate_metrics": aggregate_metrics(metrics_df),
-            "normal_event_fpr": aggregate_event_rows(events_df),
-            "seed_reports": eval_seed_reports,
+            "normal_event_fpr": aggregate_events(events_df),
+            "seed_reports": seed_reports,
         },
         "limitations": [
-            "Attack labels and benign-event labels are simulation-generated.",
-            "Development seeds are used for architecture selection; evaluation seeds are disjoint.",
-            "Thresholds remain locally calibrated per topology/realization and are not universal constants.",
+            "Attack and benign-event labels are simulation-generated.",
+            "Architecture selection uses development seeds only; evaluation seeds are disjoint.",
+            "Thresholds are locally calibrated per realization and are not universal constants.",
             "Real SS7 attack recall remains unmeasured.",
         ],
     }
     (outdir / "ss7_hard_negative_inv_validation.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-
     print(json.dumps({
         "status": "completed",
         "selected": selected,
