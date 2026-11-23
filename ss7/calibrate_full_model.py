@@ -27,7 +27,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.preprocessing import StandardScaler
@@ -65,6 +65,12 @@ IF_GRID = (
     {"n_estimators": 500, "max_samples": 1024, "max_features": 0.75},
 )
 
+RF_GRID = (
+    {"n_estimators": 400, "min_samples_leaf": 4, "max_features": "sqrt"},
+    {"n_estimators": 600, "min_samples_leaf": 8, "max_features": 0.5},
+    {"n_estimators": 600, "min_samples_leaf": 16, "max_features": 1.0},
+)
+
 
 def fit_if(
     train: pd.DataFrame,
@@ -82,6 +88,50 @@ def fit_if(
         **params,
     ).fit(x)
     return imp, scaler, model
+
+
+def fit_rf(
+    train: pd.DataFrame,
+    cols: Sequence[str],
+    seed: int,
+    params: dict,
+) -> Tuple[SimpleImputer, StandardScaler, RandomForestClassifier]:
+    imp = SimpleImputer(strategy="median").fit(train[list(cols)])
+    scaler = StandardScaler().fit(imp.transform(train[list(cols)]))
+    x = scaler.transform(imp.transform(train[list(cols)]))
+    y = train["label"].to_numpy(int)
+    model = RandomForestClassifier(
+        class_weight="balanced_subsample",
+        random_state=seed,
+        n_jobs=-1,
+        **params,
+    ).fit(x, y)
+    return imp, scaler, model
+
+
+def classifier_scores(
+    frame: pd.DataFrame,
+    cols: Sequence[str],
+    imp: SimpleImputer,
+    scaler: StandardScaler,
+    model: RandomForestClassifier,
+) -> np.ndarray:
+    x = scaler.transform(imp.transform(frame[list(cols)]))
+    return model.predict_proba(x)[:, 1]
+
+
+def invariant_rule_scores(frame: pd.DataFrame) -> np.ndarray:
+    def z(name: str) -> np.ndarray:
+        if name not in frame:
+            return np.zeros(len(frame), dtype=float)
+        return frame[name].fillna(0.0).to_numpy(float)
+
+    return np.maximum.reduce([
+        -z("recon_min"),
+        np.abs(z("od_min")),
+        -z("closure_resid"),
+        np.abs(z("transit_resid")),
+    ])
 
 
 def scores(
@@ -279,15 +329,48 @@ def attack_summary(frame: pd.DataFrame, s: np.ndarray, threshold: float) -> dict
     return m
 
 
-def invariant_rank_key(row: dict, target: float) -> Tuple[float, float, float, float, int]:
+def invariant_rank_key(row: dict, target: float) -> Tuple[float, ...]:
     m = row["validation_attack_metrics"]
     recall = finite_metric(m["episode_recall"], -1.0)
+    worst_seed_recall = finite_metric(row.get("worst_seed_episode_recall", recall), -1.0)
     ap = finite_metric(m["ap"], -1.0)
     auc = finite_metric(m["auc"], -1.0)
     fpr_dev = abs(finite_metric(m["negative_window_fpr_direct"], 1.0) - target)
-    # Select exclusively on validation: maximize incident recall, then AP/AUC,
-    # then operational FPR fidelity, finally prefer the smaller representation.
-    return (-recall, -ap, -auc, fpr_dev, int(row["n_features"]))
+    worst_seed_fpr_dev = finite_metric(row.get("worst_seed_fpr_deviation", 1.0), 1.0)
+    # No test information is used.  Robustness across both calibration seeds is
+    # primary; pooled incident recall and ranking quality are secondary.
+    return (
+        -worst_seed_recall,
+        -recall,
+        -ap,
+        -auc,
+        worst_seed_fpr_dev,
+        fpr_dev,
+        int(row["n_features"]),
+    )
+
+
+def prepare_seed_split(
+    seed: int,
+    days: float,
+    index: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    cfg = SimConfig(seed=seed, days=days)
+    df, meta = make_synthetic_dataset(seed, days)
+    tr, va, te = blocked_split(df, cfg, RngBook(seed)["split"])
+
+    def namespace(part: pd.DataFrame) -> pd.DataFrame:
+        out = part.copy()
+        out["source_seed"] = int(seed)
+        out["nid"] = out["nid"].astype(int) + index * 10000
+        pos = out["episode_id"] >= 0
+        out.loc[pos, "episode_id"] = (
+            out.loc[pos, "episode_id"].astype(int) + index * 1000
+        )
+        return out
+
+    return namespace(tr), namespace(va), namespace(te), meta
+
 
 
 def make_synthetic_dataset(seed: int, days: float) -> Tuple[pd.DataFrame, dict]:
@@ -317,103 +400,225 @@ def make_synthetic_dataset(seed: int, days: float) -> Tuple[pd.DataFrame, dict]:
 
 def calibrate_invariant(
     seed: int,
+    secondary_seed: int,
     confirm_seed: int,
     days: float,
     channel_fpr: float,
 ) -> Tuple[dict, dict, pd.DataFrame]:
-    cfg = SimConfig(seed=seed, days=days)
-    df, primary_meta = make_synthetic_dataset(seed, days)
-    tr, va, te = blocked_split(df, cfg, RngBook(seed)["split"])
-    families = invariant_feature_families(df)
+    calibration_seeds = [int(seed), int(secondary_seed)]
+    split_rows = []
+    metas = []
+    for idx, s in enumerate(calibration_seeds):
+        tr_i, va_i, te_i, meta_i = prepare_seed_split(s, days, idx)
+        split_rows.append((tr_i, va_i, te_i))
+        metas.append(meta_i)
+
+    tr = pd.concat([x[0] for x in split_rows], ignore_index=True, sort=False)
+    va = pd.concat([x[1] for x in split_rows], ignore_index=True, sort=False)
+    te = pd.concat([x[2] for x in split_rows], ignore_index=True, sort=False)
+    families = invariant_feature_families(tr)
 
     candidates = []
     fitted = {}
     yva = va["label"].to_numpy(int)
 
+    def seed_diagnostics(frame: pd.DataFrame, s: np.ndarray, threshold: float) -> dict:
+        tmp = frame.copy()
+        tmp["_score"] = s
+        by_seed = {}
+        recalls = []
+        fpr_devs = []
+        for source_seed, part in tmp.groupby("source_seed"):
+            ss = part["_score"].to_numpy(float)
+            metrics = attack_summary(part.drop(columns=["_score"]), ss, threshold)
+            by_seed[str(int(source_seed))] = metrics
+            recalls.append(finite_metric(metrics["episode_recall"], -1.0))
+            fpr_devs.append(
+                abs(finite_metric(metrics["negative_window_fpr_direct"], 1.0) - channel_fpr)
+            )
+        return {
+            "by_seed": by_seed,
+            "worst_seed_episode_recall": float(min(recalls)) if recalls else -1.0,
+            "worst_seed_fpr_deviation": float(max(fpr_devs)) if fpr_devs else 1.0,
+        }
+
     for family_name, cols in families.items():
         if not cols:
             continue
+
+        # Unsupervised candidates.
         for grid_idx, params in enumerate(IF_GRID):
-            imp, scaler, model = fit_if(tr[tr["label"] == 0], cols, seed, params)
+            imp, scaler, model = fit_if(
+                tr[tr["label"] == 0], cols, seed, params
+            )
             val_scores = scores(va, cols, imp, scaler, model)
-            neg_scores = val_scores[yva == 0]
-            threshold = threshold_for_fpr(neg_scores, channel_fpr)
+            threshold = threshold_for_fpr(val_scores[yva == 0], channel_fpr)
             metrics = attack_summary(va, val_scores, threshold)
+            diag = seed_diagnostics(va, val_scores, threshold)
             key = f"{family_name}/if{grid_idx}"
             row = {
                 "candidate": key,
+                "model_kind": "isolation_forest",
                 "feature_family": family_name,
                 "features": list(cols),
                 "n_features": int(len(cols)),
                 "params": params,
                 "threshold": float(threshold),
                 "validation_attack_metrics": metrics,
-                "validation_negative_score_resolution": score_resolution(neg_scores),
+                "validation_by_seed": diag["by_seed"],
+                "worst_seed_episode_recall": diag["worst_seed_episode_recall"],
+                "worst_seed_fpr_deviation": diag["worst_seed_fpr_deviation"],
+                "validation_negative_score_resolution": score_resolution(
+                    val_scores[yva == 0]
+                ),
             }
             row["selection_key"] = list(invariant_rank_key(row, channel_fpr))
             candidates.append(row)
-            fitted[key] = (imp, scaler, model, list(cols), params, threshold)
+            fitted[key] = (
+                "isolation_forest", imp, scaler, model, list(cols), params, threshold
+            )
+
+        # Supervised canonical candidate family.  Labels are synthetic; this is
+        # explicit in the report and cross-seed confirmation is mandatory.
+        for grid_idx, params in enumerate(RF_GRID):
+            imp, scaler, model = fit_rf(tr, cols, seed, params)
+            val_scores = classifier_scores(va, cols, imp, scaler, model)
+            threshold = threshold_for_fpr(val_scores[yva == 0], channel_fpr)
+            metrics = attack_summary(va, val_scores, threshold)
+            diag = seed_diagnostics(va, val_scores, threshold)
+            key = f"{family_name}/rf{grid_idx}"
+            row = {
+                "candidate": key,
+                "model_kind": "random_forest",
+                "feature_family": family_name,
+                "features": list(cols),
+                "n_features": int(len(cols)),
+                "params": params,
+                "threshold": float(threshold),
+                "validation_attack_metrics": metrics,
+                "validation_by_seed": diag["by_seed"],
+                "worst_seed_episode_recall": diag["worst_seed_episode_recall"],
+                "worst_seed_fpr_deviation": diag["worst_seed_fpr_deviation"],
+                "validation_negative_score_resolution": score_resolution(
+                    val_scores[yva == 0]
+                ),
+            }
+            row["selection_key"] = list(invariant_rank_key(row, channel_fpr))
+            candidates.append(row)
+            fitted[key] = (
+                "random_forest", imp, scaler, model, list(cols), params, threshold
+            )
+
+    # Mechanistic rule baseline is a genuine candidate, not merely a comparator.
+    rule_val = invariant_rule_scores(va)
+    rule_thr = threshold_for_fpr(rule_val[yva == 0], channel_fpr)
+    rule_metrics = attack_summary(va, rule_val, rule_thr)
+    rule_diag = seed_diagnostics(va, rule_val, rule_thr)
+    rule_row = {
+        "candidate": "inv_mechanistic_rule",
+        "model_kind": "rule_baseline",
+        "feature_family": "inv_rule_raw",
+        "features": ["recon_min", "od_min", "closure_resid", "transit_resid"],
+        "n_features": 4,
+        "params": {},
+        "threshold": float(rule_thr),
+        "validation_attack_metrics": rule_metrics,
+        "validation_by_seed": rule_diag["by_seed"],
+        "worst_seed_episode_recall": rule_diag["worst_seed_episode_recall"],
+        "worst_seed_fpr_deviation": rule_diag["worst_seed_fpr_deviation"],
+        "validation_negative_score_resolution": score_resolution(rule_val[yva == 0]),
+    }
+    rule_row["selection_key"] = list(invariant_rank_key(rule_row, channel_fpr))
+    candidates.append(rule_row)
 
     if not candidates:
         raise RuntimeError("No invariant calibration candidate could be constructed")
     selected = min(candidates, key=lambda x: tuple(x["selection_key"]))
-    imp, scaler, model, cols, params, threshold = fitted[selected["candidate"]]
 
-    same_seed_scores = scores(te, cols, imp, scaler, model)
+    model_kind = selected["model_kind"]
+    if model_kind == "rule_baseline":
+        cols = selected["features"]
+        params = {}
+        threshold = selected["threshold"]
+        imp = scaler = model = None
+        same_seed_scores = invariant_rule_scores(te)
+    else:
+        model_kind, imp, scaler, model, cols, params, threshold = fitted[
+            selected["candidate"]
+        ]
+        if model_kind == "random_forest":
+            same_seed_scores = classifier_scores(te, cols, imp, scaler, model)
+        else:
+            same_seed_scores = scores(te, cols, imp, scaler, model)
     same_seed_metrics = attack_summary(te, same_seed_scores, threshold)
 
     confirm_df, confirm_meta = make_synthetic_dataset(confirm_seed, days)
-    confirm_scores = scores(confirm_df, cols, imp, scaler, model)
+    confirm_df = confirm_df.copy()
+    confirm_df["source_seed"] = int(confirm_seed)
+    if model_kind == "rule_baseline":
+        confirm_scores = invariant_rule_scores(confirm_df)
+    elif model_kind == "random_forest":
+        confirm_scores = classifier_scores(confirm_df, cols, imp, scaler, model)
+    else:
+        confirm_scores = scores(confirm_df, cols, imp, scaler, model)
     confirm_metrics = attack_summary(confirm_df, confirm_scores, threshold)
 
     result = {
         "selected_candidate": selected["candidate"],
+        "model_kind": model_kind,
         "selected_feature_family": selected["feature_family"],
         "features": cols,
         "params": params,
         "threshold": float(threshold),
         "channel_target_fpr": float(channel_fpr),
         "validation_attack_metrics": selected["validation_attack_metrics"],
-        "same_seed_heldout_test": same_seed_metrics,
+        "validation_by_seed": selected["validation_by_seed"],
+        "validation_worst_seed_episode_recall": selected["worst_seed_episode_recall"],
+        "same_calibration_seeds_heldout_test": same_seed_metrics,
         "cross_seed_frozen_threshold_test": confirm_metrics,
-        "primary_synthetic_meta": primary_meta,
+        "calibration_synthetic_meta": metas,
+        "calibration_seeds": calibration_seeds,
         "primary_split_rows": {
             "train": int(len(tr)),
             "validation": int(len(va)),
             "test": int(len(te)),
         },
         "cross_seed_meta": confirm_meta,
-        "selection_used_primary_test": False,
+        "selection_used_heldout_test": False,
         "selection_used_cross_seed_test": False,
     }
     artifact = {
-        "kind": "ss7_invariant_isolation_forest",
+        "kind": f"ss7_invariant_{model_kind}",
+        "model_kind": model_kind,
         "features": cols,
         "imputer": imp,
         "scaler": scaler,
         "model": model,
         "threshold": float(threshold),
         "channel_target_fpr": float(channel_fpr),
-        "synthetic_calibration_seed": int(seed),
+        "synthetic_calibration_seeds": calibration_seeds,
     }
 
     flat = []
-    for c in candidates:
-        m = c["validation_attack_metrics"]
+    for cand in candidates:
+        m = cand["validation_attack_metrics"]
         flat.append({
             "channel": "invariant",
-            "candidate": c["candidate"],
-            "feature_family": c["feature_family"],
-            "n_features": c["n_features"],
-            "n_estimators": c["params"]["n_estimators"],
-            "max_samples": c["params"]["max_samples"],
-            "max_features": c["params"]["max_features"],
-            "threshold": c["threshold"],
+            "candidate": cand["candidate"],
+            "model_kind": cand["model_kind"],
+            "feature_family": cand["feature_family"],
+            "n_features": cand["n_features"],
+            "n_estimators": cand["params"].get("n_estimators"),
+            "max_samples": cand["params"].get("max_samples"),
+            "max_features": cand["params"].get("max_features"),
+            "min_samples_leaf": cand["params"].get("min_samples_leaf"),
+            "threshold": cand["threshold"],
             "validation_fpr": m["negative_window_fpr_direct"],
             "validation_episode_recall": m["episode_recall"],
+            "validation_worst_seed_episode_recall": cand["worst_seed_episode_recall"],
             "validation_auc": m["auc"],
             "validation_ap": m["ap"],
-            "selected": c["candidate"] == selected["candidate"],
+            "selected": cand["candidate"] == selected["candidate"],
         })
     return result, artifact, pd.DataFrame(flat)
 
@@ -439,6 +644,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     ap.add_argument("--max-real-windows-per-day", type=int, default=120000)
     ap.add_argument("--overall-target-fpr", type=float, default=0.01)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--secondary-seed", type=int, default=1337)
     ap.add_argument("--confirm-seed", type=int, default=2026)
     ap.add_argument("--synthetic-days", type=float, default=1.0)
     ap.add_argument("--cache-dir", default=".cache/full_calibration")
@@ -478,7 +684,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         real_train, real_validation, real_test, args.seed, channel_fpr
     )
     inv, inv_artifact, inv_candidates = calibrate_invariant(
-        args.seed, args.confirm_seed, args.synthetic_days, channel_fpr
+        args.seed, args.secondary_seed, args.confirm_seed,
+        args.synthetic_days, channel_fpr
     )
 
     joblib.dump(own_artifact, outdir / "ss7_own_calibrator.joblib")
@@ -510,11 +717,14 @@ def main(argv: Iterable[str] | None = None) -> int:
             "training_source": args.real_train_date,
         },
         "invariant_channel": {
+            "model_kind": inv["model_kind"],
             "feature_family": inv["selected_feature_family"],
             "features": inv["features"],
-            "isolation_forest": jsonable_params(inv["params"]),
+            "model_params": jsonable_params(inv["params"]),
             "threshold": inv["threshold"],
-            "training_source": f"canonical synthetic seed {args.seed}",
+            "training_source": (
+                f"canonical synthetic seeds {args.seed} and {args.secondary_seed}"
+            ),
             "external_synthetic_confirmation_seed": int(args.confirm_seed),
         },
         "integrity_channel": {
@@ -583,7 +793,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "own_real_test_ci95": own["test"]["fpr_wilson_95"],
         "inv_selected": inv["selected_candidate"],
         "inv_validation_episode_recall": inv["validation_attack_metrics"]["episode_recall"],
-        "inv_same_seed_test_episode_recall": inv["same_seed_heldout_test"]["episode_recall"],
+        "inv_same_seed_test_episode_recall": inv["same_calibration_seeds_heldout_test"]["episode_recall"],
         "inv_cross_seed_episode_recall": inv["cross_seed_frozen_threshold_test"]["episode_recall"],
         "inv_cross_seed_normal_fpr": inv["cross_seed_frozen_threshold_test"]["negative_window_fpr_direct"],
         "overall_target_fpr": float(args.overall_target_fpr),
