@@ -1,0 +1,96 @@
+name: Train physical ACK closure TICD and cross-scenario verify
+on:
+  push:
+    branches: [improve/ticd-temporal-invariant-consensus]
+    paths:
+      - '.github/workflows/sip-ticd-physical-closure-comparison.yml'
+      - 'sip/ticd_physical_closure.py'
+      - 'experiments/compare_sip_ticd_physical.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  physical-closure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+      PYTHONHASHSEED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install scientific runtime
+        run: |
+          python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+          python -m pip freeze > physical_closure_environment.txt
+      - name: Import previously checksum-verified Di Mauro LTE-A calibration
+        run: |
+          set -euo pipefail
+          mkdir -p calibration_artifacts
+          gh run download 45234641925 --repo "${{ github.repository }}" --name sip-ticd-calibrated-retrained-model-and-evidence --dir calibration_artifacts
+          reference_file="$(find calibration_artifacts -type f -name sip_real_method_calibration.json -print -quit)"
+          test -n "$reference_file"
+          cp "$reference_file" real_sip_calibration.json
+          python - <<'PY'
+          import json
+          c=json.load(open("real_sip_calibration.json"))
+          assert c["source_archive_sha256"]=="e455d66eef30d9399ba3beefc36ad2a4a7e2fac0684aa1ae405a30a2371af9a7"
+          print("REAL_CALIBRATION_SHA_VERIFIED")
+          PY
+      - name: Train baseline, temporal, and physical TICD; select only on development and evaluate fresh heldouts
+        run: python -m experiments.compare_sip_ticd_physical --calibration real_sip_calibration.json --out-dir results_ticd_physical
+      - name: Verify model artifact and disjoint partitions
+        run: |
+          python - <<'PY'
+          import sys,json,pickle
+          sys.path.insert(0,'sip')
+          a=json.load(open('results_ticd_physical/physical_closure_comparison.json'))
+          with open('results_ticd_physical/ticd_physical_closure_model.pkl','rb') as f:
+              p=pickle.load(f)
+          assert p['model'].fitted
+          assert p['model_name']==a['selected']
+          groups=[set(a['training_seeds']),set(a['normal_validation_seeds']),
+                  {x for l in a['development_seeds'].values() for x in l},
+                  {x for l in a['heldout_seeds'].values() for x in l}]
+          for i,one in enumerate(groups):
+              for two in groups[i+1:]:assert one.isdisjoint(two)
+          assert a['no_real_compromise_validation']
+          print('PHYSICAL_MODEL_ARTIFACT_RELOAD_OK',p['model_name'])
+          PY
+      - name: Show results
+        if: always()
+        run: |
+          if [ -f results_ticd_physical/physical_closure_comparison.json ]; then
+            echo '## SIP TICD — independent observed ACK closure + temporal I1, stress holdout' >> "$GITHUB_STEP_SUMMARY"
+            echo 'SIMULATION EVALUATION ONLY; not externally labelled real-world TICD results' >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d=json.load(open("results_ticd_physical/physical_closure_comparison.json"))
+          print('Selected mode:',d["selected"])
+          print('Reference normal FPR:',d["validation_fpr"])
+          print('Development utilities:',d["development_utilities"])
+          for cohort,models in d["heldout_comparison"].items():
+              print(cohort)
+              for model_name,metrics in models.items():
+                  print(model_name, 'Recall',metrics["recall"],'FPR',metrics["fpr"],'F1',metrics["f1"],'SOPH',metrics["by_sophistication"])
+          PY
+            echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-ticd-master-physical-closure-retrained
+          path: |
+            results_ticd_physical/
+            real_sip_calibration.json
+            physical_closure_environment.txt
+          if-no-files-found: warn
+          retention-days: 30
