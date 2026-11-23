@@ -42,6 +42,29 @@ def main():
     assert "cu_ack_closure_mismatch" in model.inv_cols
     features=model.inv_cols+model.ctx_cols+list(model.CONSENSUS_FEATURES)
     assert not any(x.startswith("gt_") for x in features)
+    # Prespecified operating points are calibrated solely on benign validation.
+    # This is sensitivity analysis, not picking a favorable threshold on test.
+    y=test.is_anomaly.to_numpy(dtype=int)
+    val_s=model.score(val)
+    controls=[]
+    for budget in (0.01,0.025,0.05,0.10):
+        t=float(np.quantile(val_s,1-budget,method="higher"))
+        pred=score_all>t
+        tp=int(((pred==1)&(y==1)).sum())
+        fp=int(((pred==1)&(y==0)).sum())
+        tn=int(((pred==0)&(y==0)).sum())
+        fn=int(((pred==0)&(y==1)).sum())
+        comp={}
+        for sophistication in ("naive","statistical","adaptive"):
+            mask=(test.attack_type.eq("proxy_compromise")&
+                  test.attacker_sophistication.eq(sophistication)).to_numpy()
+            comp[sophistication]={"n":int(mask.sum()),
+                "recall":float(pred[mask].mean()) if mask.sum() else None}
+        controls.append({"validation_fpr_budget":budget,"threshold":t,
+                         "actual_validation_fpr":float((val_s>t).mean()),
+                         "test_tpr":float(tp/(tp+fn)),
+                         "test_fpr":float(fp/(fp+tn)),
+                         "per_compromise_sophistication":comp})
     attack=d["overall_pooled_synthetic_test"]["by_attack"]
     soph=d["overall_pooled_synthetic_test"]["by_compromise_sophistication"]
     events=d["overall_pooled_synthetic_test"]["by_benign_event"]
@@ -55,6 +78,7 @@ def main():
       "calibration_original_L1":original,
       "calibration_after_L1":now,
       "method_weights":c["method_weights"],
+      "threshold_sensitivity_from_validation_only":controls,
       "pooled_synthetic_test_confusion":{
           k:d["overall_pooled_synthetic_test"][k] for k in ("tp","tn","fp","fn")},
       "by_attack":attack,
