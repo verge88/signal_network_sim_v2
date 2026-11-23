@@ -51,6 +51,15 @@ CONTEXT_CONFIDENCE = 0.70
 MIN_CONTEXT_VALIDATION = 40
 CONTEXT_SHRINKAGE_PRIOR = 100.0
 
+CONTEXT_GROUP = {
+    "traffic_spike": "load_surge",
+    "campaign": "load_surge",
+    "traffic_dip": "load_reduction",
+    "scale_in": "load_reduction",
+    "link_failure": "link_failure",
+    "reroute": "reroute",
+}
+
 CONTEXT_RF = {
     "n_estimators": 500,
     "min_samples_leaf": 8,
@@ -66,6 +75,7 @@ def annotate_context(frame: pd.DataFrame, episodes: Sequence) -> pd.DataFrame:
     """
     out = frame.copy()
     labels = np.full(len(out), "background", dtype=object)
+    event_kinds = np.full(len(out), "background", dtype=object)
     event_ids = np.full(len(out), -1, dtype=int)
     hits = np.zeros(len(out), dtype=int)
     nid = out["nid"].to_numpy(int)
@@ -76,14 +86,17 @@ def annotate_context(frame: pd.DataFrame, episodes: Sequence) -> pd.DataFrame:
             continue
         mask = (nid == int(e.nid)) & (t >= int(e.t0)) & (t <= int(e.t1))
         first = mask & (hits == 0)
-        labels[first] = str(e.kind)
+        labels[first] = CONTEXT_GROUP.get(str(e.kind), str(e.kind))
+        event_kinds[first] = str(e.kind)
         event_ids[first] = int(event_id)
         overlap = mask & (hits > 0)
         labels[overlap] = "multi_event"
+        event_kinds[overlap] = "multi_event"
         event_ids[overlap] = -2
         hits[mask] += 1
 
     out["benign_context_truth"] = labels
+    out["benign_event_kind_truth"] = event_kinds
     out["benign_event_id"] = event_ids
     out["benign_context_overlap_count"] = hits
     return out
@@ -317,16 +330,21 @@ def benign_context_fpr(
 ) -> List[dict]:
     rows = []
     neg = frame["label"].to_numpy(int) == 0
-    truth = frame["benign_context_truth"].astype(str).to_numpy()
-    for context in sorted(set(truth[neg])):
-        mask = neg & (truth == context)
+    truth_kind = frame["benign_event_kind_truth"].astype(str).to_numpy()
+    for event_kind in sorted(set(truth_kind[neg])):
+        mask = neg & (truth_kind == event_kind)
+        expected_context = (
+            "background" if event_kind == "background"
+            else CONTEXT_GROUP.get(event_kind, event_kind)
+        )
         rows.append({
-            "true_context": context,
+            "true_context": event_kind,
+            "expected_context_group": expected_context,
             "rows": int(mask.sum()),
             "alerts": int(np.sum(fire[mask])),
             "window_fpr": float(np.mean(fire[mask])) if mask.any() else float("nan"),
             "predicted_as_same_fraction": float(
-                np.mean(predicted_context[mask] == context)
+                np.mean(predicted_context[mask] == expected_context)
             ) if mask.any() else float("nan"),
             "mean_prediction_confidence": float(
                 np.mean(confidence[mask])
@@ -574,9 +592,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         "architecture": {
             "attack_channel": "INV Random Forest only",
             "context_channel": (
-                "OWN Random Forest predicts benign context; it never raises "
-                "attack score"
+                "OWN Random Forest predicts observable benign context groups; "
+                "it never raises attack score"
             ),
+            "context_grouping": CONTEXT_GROUP,
             "global_target_fpr": TARGET_FPR,
             "context_confidence": CONTEXT_CONFIDENCE,
             "min_context_validation_rows": MIN_CONTEXT_VALIDATION,
