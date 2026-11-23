@@ -167,10 +167,20 @@ identified **61,963 SIP message entries**:
 
 All 61,963 SIP request entries included original SIP message text, `Call-ID`
 and `CSeq`; no response messages were present in those entries.
-There were **61,377 unique hashed Call-IDs**. The 586 surplus raw
-occurrences are under separate reproducible duplicate-record analysis; it
-would be scientifically incorrect to present raw occurrences as 61,963
-unique SIP calls. The cleaned CSV has 61,377 SIP events.
+There were **61,377 unique hashed Call-IDs**. Crucially, the
+source events also had **61,963 distinct Elasticsearch (index, event-ID) pairs**:
+there are **zero duplicate source event identifiers**. The difference of
+586 is the number of additional SIP request entries sharing previously
+observed Call-IDs; it must **not** be called duplicated exported records
+or 61,963 unique calls. The cleaned CSV reports 61,377 SIP events,
+matching the unique Call-ID count, not the raw-event count.
+
+Deduplication by Call-ID (for a strictly *per-Call-ID* inventory) yields
+44,081 INVITE, 17,148 REGISTER, and 148 OPTIONS entries. This is not
+a packet-level deduplication: different SIP requests within one dialog
+can validly share Call-ID. The event-ID counts above should be used
+for original message records, while per-Call-ID counts describe grouped
+call identifiers.
 
 These real SIP request samples do not supply any matching trusted
 `cu_*` reports or zonal telemetry and cannot produce a defensible TICD
