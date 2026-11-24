@@ -220,9 +220,10 @@ jobs:
           summary = {
               "architecture": {
                   "full_mode": "56-feature CU/zone/temporal detector",
-                  "portable_mode": "32-feature PCAP-native supervised ensemble",
-                  "portable_monitoring": "robust IF OR PCAP-native supervised",
-                  "portable_final_alert": "robust IF AND PCAP-native supervised confirmation",
+                  "portable_mode": "PCAP-native supervised ensemble with wire-observable temporal/volume features",
+                  "portable_primary": "PCAP-native supervised ensemble",
+                  "portable_secondary_monitor": "robust IF",
+                  "portable_high_specificity_optional": "robust IF AND PCAP-native supervised",
               },
               "legacy_16_feature_rf_external_attack_tpr": float(
                   robust_summary["rf_external_attack_tpr"]),
@@ -258,18 +259,31 @@ jobs:
           print(json.dumps(summary, indent=2, ensure_ascii=False))
           print(merged.to_string(index=False))
 
-          # Development-domain acceptance applies to the primary portable
-          # anomaly detector only.  The supervised native score and hybrid
-          # combinations are reported for analysis but are not tuned/gated
-          # against the inspected Kelly development traces.
+          # Regression-only gate for the primary portable detector.
+          # Kelly has already been inspected, so it is NOT used to tune model
+          # weights or thresholds.  The loose gate only catches implementation
+          # regressions.  Final transfer claims come from post-freeze Bromelia
+          # and jDiameter confirmations, not from this development-domain gate.
+          static_benign_fpr = float(
+              native_benign_summary["external_benign_fpr"])
+          if native_tpr < 0.75:
+              raise SystemExit(
+                  f"PCAP-native development-regression TPR below 75%: "
+                  f"{native_tpr:.3f}")
+          if native_fpr > 0.25:
+              raise SystemExit(
+                  f"PCAP-native attack-holdout benign FPR above 25%: "
+                  f"{native_fpr:.3f}")
+          if static_benign_fpr > 0.25:
+              raise SystemExit(
+                  f"PCAP-native static benign FPR above 25%: "
+                  f"{static_benign_fpr:.3f}")
+
           robust_tpr = float(robust_summary["iso_robust_external_attack_tpr"])
           robust_fpr = float(robust_summary["iso_robust_external_benign_fpr"])
-          if robust_tpr < 0.875:
-              raise SystemExit(
-                  f"Primary robust IF development TPR below 87.5%: {robust_tpr:.3f}")
-          if robust_fpr > 0.05:
-              raise SystemExit(
-                  f"Primary robust IF development benign FPR above 5%: {robust_fpr:.3f}")
+          print(
+              "Robust IF diagnostic only: "
+              f"TPR={robust_tpr:.3f}, FPR={robust_fpr:.3f}")
           PY
 
       - name: Publish summary
