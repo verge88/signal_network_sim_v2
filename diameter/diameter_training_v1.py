@@ -1002,26 +1002,33 @@ class CascadeCompromiseDetector:
         # Dedicated compromise expert. Histogram boosting ranks the subtle
         # node-compromise class better than the generic stage-2 ensemble
         # while retaining explicit regularisation.
-        self.stage2_hgb = HistGradientBoostingClassifier(
-            max_iter=180,
-            learning_rate=0.06,
-            max_leaf_nodes=31,
-            max_depth=8,
-            min_samples_leaf=20,
-            l2_regularization=1.0,
-            class_weight="balanced",
-            random_state=seed + 17,
-        )
+        self.stage2_hgbs = [
+            HistGradientBoostingClassifier(
+                max_iter=180,
+                learning_rate=0.06,
+                max_leaf_nodes=31,
+                max_depth=8,
+                min_samples_leaf=20,
+                l2_regularization=1.0,
+                class_weight="balanced",
+                random_state=seed + offset,
+            )
+            for offset in (15, 16, 17, 18, 19)
+        ]
 
     def fit(self, X_full, y, X_comp, y_comp):
         print("  Cascade Stage 1: General RF...")
         self.stage1_rf.fit(X_full, y)
-        print("  Cascade Stage 2: full-feature compromise HistGB...")
-        self.stage2_hgb.fit(X_full, y_comp)
+        print("  Cascade Stage 2: five-seed full-feature compromise HistGB...")
+        for model in self.stage2_hgbs:
+            model.fit(X_full, y_comp)
 
     def predict_components(self, X_full, X_comp):
         p1 = self.stage1_rf.predict_proba(X_full)[:, 1]
-        p2 = self.stage2_hgb.predict_proba(X_full)[:, 1]
+        p2 = np.mean([
+            model.predict_proba(X_full)[:, 1]
+            for model in self.stage2_hgbs
+        ], axis=0)
         return p1, p2
 
     def predict_proba(self, X_full, X_comp):
@@ -1032,7 +1039,10 @@ class CascadeCompromiseDetector:
         return self.stage1_rf.predict_proba(X)[:, 1]
 
     def predict_proba_stage2(self, X_comp, X_full):
-        return self.stage2_hgb.predict_proba(X_full)[:, 1]
+        return np.mean([
+            model.predict_proba(X_full)[:, 1]
+            for model in self.stage2_hgbs
+        ], axis=0)
 
 
 # ══════════════════════════════════════════════════════════
