@@ -18,6 +18,8 @@ import time
 from message import Message
 
 APP_S6A = 16777251
+CMD_CER = 257
+CMD_DPR = 282
 CMD_AIR = 318
 CMD_ULR = 316
 REQUEST_FLAG = 0x80
@@ -94,8 +96,8 @@ def scenario_ops(name: str, count: int):
     raise ValueError(f"unknown scenario {name!r}")
 
 
-def request_for(cmd: int) -> Message:
-    return Message(cmdflags=REQUEST_FLAG, cmdcode=cmd, appId=APP_S6A)
+def request_for(cmd: int, app_id: int = APP_S6A) -> Message:
+    return Message(cmdflags=REQUEST_FLAG, cmdcode=cmd, appId=app_id)
 
 
 def run_client(host: str, port: int, scenario: str, count: int, delay_ms: int) -> None:
@@ -105,6 +107,14 @@ def run_client(host: str, port: int, scenario: str, count: int, delay_ms: int) -
     delay_s = max(0, delay_ms) / 1000.0
 
     try:
+        # Frozen RFC 6733 session overhead: one CER/CEA before S6a traffic and
+        # one DPR/DPA after it.  This uses the independent codec and is not
+        # derived from any Kelly/go-diameter capture.
+        sock.sendall(request_for(CMD_CER, app_id=0).encode())
+        cea = recv_message(sock)
+        if cea.header.cmdcode != CMD_CER or cea.header.appId != 0:
+            raise RuntimeError("unexpected CEA")
+
         if paced:
             for cmd in ops:
                 sock.sendall(request_for(cmd).encode())
@@ -120,6 +130,11 @@ def run_client(host: str, port: int, scenario: str, count: int, delay_ms: int) -
                 ans = recv_message(sock)
                 if ans.header.cmdcode != cmd or ans.header.appId != APP_S6A:
                     raise RuntimeError("unexpected Diameter answer")
+
+        sock.sendall(request_for(CMD_DPR, app_id=0).encode())
+        dpa = recv_message(sock)
+        if dpa.header.cmdcode != CMD_DPR or dpa.header.appId != 0:
+            raise RuntimeError("unexpected DPA")
         time.sleep(0.15)
     finally:
         sock.close()
