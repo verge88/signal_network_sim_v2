@@ -26,7 +26,7 @@ jobs:
   train-matrix:
     name: Train all models seed ${{ matrix.seed }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -50,12 +50,16 @@ jobs:
       - name: Train full model zoo
         env:
           SNS_EXPORT_DIR: results/full_all_models/seed_${{ matrix.seed }}/export
+          SNS_SCORE_EXPORT_DIR: results/full_all_models/seed_${{ matrix.seed }}/scores
         run: |
           set -o pipefail
           mkdir -p results/full_all_models/seed_${{ matrix.seed }}
           python -m ss7.ss7_training_v7 \
             --seed ${{ matrix.seed }} \
-            --days 2.0 \
+            --days 4.0 \
+            --n-compromise 36 \
+            --n-normal 72 \
+            --n-ext 12 \
             --feature-set OWN+INV \
             --soph adaptive \
             --alerts-per-day 20 \
@@ -75,7 +79,7 @@ jobs:
   diagnostics:
     name: Full zoo and diagnostics seed 42
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 240
 
     steps:
       - name: Checkout
@@ -95,12 +99,16 @@ jobs:
       - name: Train all models and run all diagnostics
         env:
           SNS_EXPORT_DIR: results/full_all_models/seed_42/export
+          SNS_SCORE_EXPORT_DIR: results/full_all_models/seed_42/scores
         run: |
           set -o pipefail
           mkdir -p results/full_all_models/seed_42
           python -m ss7.ss7_training_v7 \
             --seed 42 \
-            --days 2.0 \
+            --days 4.0 \
+            --n-compromise 36 \
+            --n-normal 72 \
+            --n-ext 12 \
             --feature-set OWN+INV \
             --soph adaptive \
             --alerts-per-day 20 \
@@ -141,7 +149,7 @@ jobs:
       - name: Install plotting dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install numpy pandas matplotlib
+          python -m pip install numpy pandas matplotlib scikit-learn
 
       - name: Download all seed artifacts
         uses: actions/download-artifact@v4
