@@ -1311,6 +1311,13 @@ def main(config=None):
 
     X_train_normal, _ = pipeline.get_normal_data(train_df, fit=False)
 
+    # Compress heavy-tailed standardized telemetry for squared-error models.
+    # The signed monotone transform uses the training-fitted scaler and has
+    # no parameters to re-estimate on validation, stacking, or test.
+    X_train_neural, X_val_neural, X_stack_neural, X_test_neural = (
+        np.arcsinh(X) for X in (X_train_normal, X_val, X_stack, X_test)
+    )
+
     attack_types_test = test_df["attack_type"].values
     n_feat = X_train.shape[1]
 
@@ -1382,10 +1389,10 @@ def main(config=None):
         weight_decay=config.ae_weight_decay,
         min_delta=config.ae_min_delta)
     X_val_normal = X_val[y_val == 0]
-    ae_trainer.fit(X_train_normal, X_val_normal)
+    ae_trainer.fit(X_train_neural, X_val_neural[y_val == 0])
     trainers_dict['Autoencoder'] = ae_trainer
-    ae_sv = ae_trainer.reconstruction_error(X_val)
-    ae_st = ae_trainer.reconstruction_error(X_test)
+    ae_sv = ae_trainer.reconstruction_error(X_val_neural)
+    ae_st = ae_trainer.reconstruction_error(X_test_neural)
     th_ae = float(np.percentile(
         ae_sv[y_val == 0], config.threshold_percentile))
     results_list.append(evaluate_model("Autoencoder", ae_st, y_test,
@@ -1402,10 +1409,10 @@ def main(config=None):
         patience=config.vae_patience,
         weight_decay=config.vae_weight_decay,
         min_delta=config.vae_min_delta)
-    vae_trainer.fit(X_train_normal, X_val_normal)
+    vae_trainer.fit(X_train_neural, X_val_neural[y_val == 0])
     trainers_dict['VAE'] = vae_trainer
-    vae_sv = vae_trainer.anomaly_score(X_val)
-    vae_st = vae_trainer.anomaly_score(X_test)
+    vae_sv = vae_trainer.anomaly_score(X_val_neural)
+    vae_st = vae_trainer.anomaly_score(X_test_neural)
     th_vae = float(np.percentile(
         vae_sv[y_val == 0], config.threshold_percentile))
     results_list.append(evaluate_model("VAE", vae_st, y_test,
@@ -1415,12 +1422,14 @@ def main(config=None):
     print("\n[5] LSTM-Autoencoder...")
     seq_train, _, _, benign_train = pipeline.get_sequential_data(
         train_df, config.lstm_seq_len)
-    seq_train = seq_train[benign_train]
+    seq_train = np.arcsinh(seq_train[benign_train])
     seq_val, _, _, benign_val_windows = pipeline.get_sequential_data(
         val_df, config.lstm_seq_len)
+    seq_val = np.arcsinh(seq_val)
     seq_val_normal = seq_val[benign_val_windows]
     seq_test, seq_y_test, seq_at_test, _ = pipeline.get_sequential_data(
         test_df, config.lstm_seq_len)
+    seq_test = np.arcsinh(seq_test)
     lstm_done = False
     if len(seq_train) > 100 and len(seq_val_normal) and len(seq_test):
         lstm = LSTMAutoencoder(n_feat, config.lstm_hidden,
@@ -1573,7 +1582,7 @@ def main(config=None):
     meta_stack = np.column_stack([
         -iso.score_samples(apply_iso_robust_bounds(X_stack, iso_low, iso_high)),
         -svm.score_samples(X_stack),
-        ae_trainer.reconstruction_error(X_stack), vae_trainer.anomaly_score(X_stack),
+        ae_trainer.reconstruction_error(X_stack_neural), vae_trainer.anomaly_score(X_stack_neural),
         stack_general, stack_compromise,
         rf.predict_proba(X_stack)[:, 1], gb.predict_proba(X_stack)[:, 1],
     ])
@@ -1713,6 +1722,7 @@ def main(config=None):
             "unsupervised_thresholds": "95th percentile of benign validation only",
             "split_protocol": pipeline.split_protocol,
             "sequences": "consecutive intervals; wholly benign fit and validation windows",
+            "neural_scaling": "signed asinh of training-standardized features",
             "specialized_scaling": "frozen quantiles from benign training scores",
             "meta_stacking": "fit on separate stacking predictions; threshold on validation",
             "supervised_thresholds": (
