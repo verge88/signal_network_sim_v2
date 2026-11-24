@@ -230,6 +230,44 @@ def plot_attack_heatmap(results_list: Sequence[dict], out_dir: Path) -> List[str
     return save_figure(fig, out_dir, "04_attack_detection_heatmap")
 
 
+def plot_node_compromise_recall(results_list: Sequence[dict],
+                                out_dir: Path,
+                                target: float = 85.0) -> List[str]:
+    rows = []
+    for r in results_list:
+        name = str(r.get("name", ""))
+        if name not in MAIN_MODELS:
+            continue
+        rec = r.get("per_attack", {}).get("node_compromise")
+        if rec is None:
+            continue
+        rows.append((name, float(rec[2])))
+    if not rows:
+        return []
+
+    rows.sort(key=lambda x: x[1])
+    names = [x[0] for x in rows]
+    values = [x[1] for x in rows]
+    y = np.arange(len(rows))
+    fig, ax = plt.subplots(figsize=(9, 6))
+    bars = ax.barh(
+        y, values, facecolor="0.70", edgecolor="black", hatch="//")
+    ax.axvline(
+        target, color="black", linestyle="--", linewidth=1.2,
+        label=f"Целевой уровень {target:.0f}%")
+    ax.set_yticks(y)
+    ax.set_yticklabels(names)
+    ax.set_xlim(0, 105)
+    ax.set_xlabel("Полнота обнаружения компрометации узла, %")
+    ax.set_title("Обнаружение атаки «компрометация узла»")
+    for b, v in zip(bars, values):
+        ax.text(v + 1.0, b.get_y() + b.get_height()/2,
+                f"{v:.1f}%", va="center", fontsize=8)
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    return save_figure(fig, out_dir, "13_node_compromise_recall")
+
+
 def plot_feature_importance(artifacts: dict, out_dir: Path,
                             top_n: int = 20) -> List[str]:
     importances = np.asarray(artifacts.get("importances", []), dtype=float)
@@ -579,6 +617,7 @@ def main() -> None:
     generated += plot_roc(results_list, y_test, out_dir)
     generated += plot_pr(results_list, y_test, out_dir)
     generated += plot_attack_heatmap(results_list, out_dir)
+    generated += plot_node_compromise_recall(results_list, out_dir)
     generated += plot_feature_importance(artifacts, out_dir)
     generated += plot_ablation(artifacts, out_dir)
     generated += plot_training_curves(artifacts, diagnostics, out_dir)

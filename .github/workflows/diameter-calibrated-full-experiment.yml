@@ -6,6 +6,7 @@ on:
       - main
       - calibrate/diameter-independent-data
       - regularize/diameter-overfit-guard
+      - improve/diameter-node-compromise-recall
     paths:
       - "diameter/**"
       - "experiments/diameter_calibrate_from_independent_pcaps.py"
@@ -99,6 +100,41 @@ jobs:
         run: |
           rm -rf results_diameter_v1
           python diameter/diameter_training_v1.py
+
+      - name: Check node-compromise recall target
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path("results_diameter_v1/compromise_recall_diagnostics.json")
+          if not p.exists():
+              raise SystemExit("Missing compromise_recall_diagnostics.json")
+          d = json.loads(p.read_text(encoding="utf-8"))
+          t = d["test"]
+          candidates = {
+              "Cascade": (
+                  float(t["cascade_compromise_recall"]),
+                  float(t["cascade_benign_fpr"]),
+              ),
+              "Meta-Ensemble": (
+                  float(t["meta_compromise_recall"]),
+                  float(t["meta_benign_fpr"]),
+              ),
+          }
+          print(json.dumps(d, indent=2, ensure_ascii=False))
+          # Acceptance gate is deliberately slightly looser than the 0.85
+          # validation target to avoid tuning to the untouched test split.
+          passing = {
+              name: (recall, fpr)
+              for name, (recall, fpr) in candidates.items()
+              if recall >= 0.80 and fpr <= 0.025
+          }
+          if not passing:
+              raise SystemExit(
+                  "No compromise-aware detector simultaneously satisfies "
+                  f"recall>=0.80 and FPR<=0.025: {candidates}")
+          print(f"Passing compromise-aware detectors: {passing}")
+          PY
 
       - name: Check full model inventory
         run: |
