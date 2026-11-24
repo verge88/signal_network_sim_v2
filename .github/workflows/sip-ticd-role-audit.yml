@@ -1,0 +1,54 @@
+name: Audit TICD role-scoped warnings per independent seed
+on:
+  push:
+    branches: [improve/ticd-role-scoped-warnings]
+    paths:
+      - '.github/workflows/sip-ticd-role-audit.yml'
+      - 'experiments/audit_ticd_role_warning_seeds.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  paired-seed-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch source JSON from successful role-scoped holdout, no retraining
+        run: |
+          set -euo pipefail
+          mkdir -p source
+          gh run download 45345567415 --repo "${{ github.repository }}" --name sip-ticd-role-scoped-warning-frozen-model-and-holdout --dir source
+          report="$(find source -type f -name role_warning_report.json -print -quit)"
+          test -n "$report"
+          echo "SOURCE_REPORT=$report" >> "$GITHUB_ENV"
+      - name: Validate paired FWR gains and unchanged strong alarms on every seed
+        run: |
+          python3 -m experiments.audit_ticd_role_warning_seeds --source "$SOURCE_REPORT" --out results_role_warning_paired_audit
+      - name: Publish seed-level summary and scientific limits
+        run: |
+          echo '## SIP TICD role-scoped warning per-seed audit' >> "$GITHUB_STEP_SUMMARY"
+          echo 'These are paired IMITATION runs, not operational validated FPR. Warning-only suppression narrows the threat coverage.' >> "$GITHUB_STEP_SUMMARY"
+          echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d=json.load(open('results_role_warning_paired_audit/role_warning_seed_audit.json'))
+          print('PAIRED_SEEDS improved,tied,worsened',
+                d['fwr_improved_seeds'],d['fwr_tied_seeds'],d['fwr_regressed_seeds'])
+          for key,v in d['by_cohort'].items():
+              print(key,
+                    'FWR old',v['old_pooled_warning_FWR'],
+                    'FWR selected',v['new_pooled_warning_FWR'],
+                    'episodes old',v['old_false_warning_episodes'],
+                    'episodes selected',v['new_false_warning_episodes'],
+                    'high confidence unchanged',v['confirmed_FPR_unchanged'])
+          PY
+          echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sip-ticd-role-scoped-independent-seed-audit
+          path: results_role_warning_paired_audit/role_warning_seed_audit.json
+          retention-days: 30
