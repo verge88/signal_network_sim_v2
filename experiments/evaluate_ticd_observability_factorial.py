@@ -26,11 +26,12 @@ def group(seeds,cal,kind,causal):
     return d,masters,[p[2] for p in parts]
 def rate(a,b):return float(a/b) if b else None
 def evaluation(model,df,hybrid=False):
-    y=model.predict_levels(df)
     valid=df.primary_observer_valid.to_numpy(dtype=bool)
-    # Neither method gets credit for unavailable primary SIP data. Hybrid
-    # can still see the separate policy audit; non-hybrid cannot.
-    if not hybrid:y=np.where(valid,y,0)
+    # No method sees inaccessible primary data at decision time.
+    if hybrid:y=model.predict_levels(df)
+    else:
+        y=np.zeros(len(df),dtype=np.int8)
+        if valid.any():y[valid]=model.predict_levels(df.loc[valid])
     cache=CachedDecision(df,y);out=metrics(cache,df)
     a=y==2;w=y==1;attack=df.is_anomaly.to_numpy(dtype=bool)
     audit=df.audit_observed_count.to_numpy()>0
@@ -38,7 +39,9 @@ def evaluation(model,df,hybrid=False):
     observed=(valid|audit) if hybrid else valid
     out.update({"complete_rows":int(complete.sum()),"partial_rows":int((observed&~complete).sum()),
          "unobservable_rows":int((~observed).sum()),"unobservable_attack_rows":int((~observed&attack).sum()),
-         "observed_attack_recall":rate(int((a&attack&observed).sum()),int((attack&observed).sum()))})
+         "observed_attack_recall":rate(int((a&attack&observed).sum()),int((attack&observed).sum())),
+         "observed_normal_FPR":rate(int((a&~attack&observed).sum()),int((~attack&observed).sum())),
+         "unobservable_no_signal_rows":int((~observed&~a&~w).sum())})
     if "eval_active_deficit" in df:
         active=df.eval_active_deficit.fillna(False).to_numpy(dtype=bool)&attack
         out["active_deficit_recall"]=rate(int((a&active).sum()),int(active.sum()))
