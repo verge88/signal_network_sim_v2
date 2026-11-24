@@ -1,0 +1,73 @@
+name: SS7 report-only invariant study
+on:
+  push:
+    branches: [ss7-report-only-invariant-study]
+    paths: [.github/workflows/ss7-report-only-invariant-study.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ss7-report-only-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/report_only_invariant_study.py
+      - run: python -u -m ss7.report_only_invariant_study train --output results/train
+      - uses: actions/upload-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/train
+  test:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        seed: [8401,8402,8403,8404,8405,8406,8407,8408]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/train
+      - run: python -u -m ss7.report_only_invariant_study test --seed ${{ matrix.seed }} --models results/train/models.joblib --output results/seed_${{ matrix.seed }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: report-only-seed-${{ matrix.seed }}
+          path: results/seed_${{ matrix.seed }}
+  aggregate:
+    needs: [train,test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: report-only-seed-*
+          path: results/collected
+      - run: python -m ss7.report_only_invariant_study aggregate --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: report-only-summary
+          path: results/summary
