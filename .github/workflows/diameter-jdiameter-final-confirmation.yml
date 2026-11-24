@@ -30,11 +30,10 @@ jobs:
           python-version: "3.11"
 
       - name: Set up Java 8
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "8"
-          cache: maven
 
       - name: Install capture and Python dependencies
         run: |
