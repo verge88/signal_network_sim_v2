@@ -395,13 +395,32 @@ def plot_fpr_vs_f1(df: pd.DataFrame, out_dir: Path) -> List[str]:
     d = df[df["name"].isin(MAIN_MODELS)].copy()
     if d.empty:
         return []
-    fig, ax = plt.subplots(figsize=(7, 5.5))
+
+    # Fixed offsets keep labels deterministic and readable without requiring
+    # an additional layout dependency such as adjustText.
+    offsets = {
+        "Meta-Ensemble": (7, 8),
+        "Gradient Boosting": (7, 5),
+        "Random Forest": (7, 5),
+        "Cascade": (7, -9),
+        "One-Class SVM": (7, 7),
+        "Autoencoder": (7, -8),
+        "Isolation Forest": (7, -1),
+        "VAE": (7, 7),
+        "Temporal-Attention-AE": (7, 5),
+        "LSTM-Autoencoder": (7, 5),
+    }
+
+    fig, ax = plt.subplots(figsize=(7.5, 5.8))
     for _, row in d.iterrows():
-        ax.scatter(float(row["fpr"])*100, float(row["f1"]),
-                   facecolors="white", edgecolors="black", s=55)
-        ax.annotate(str(row["name"]),
-                    (float(row["fpr"])*100, float(row["f1"])),
-                    xytext=(5, 4), textcoords="offset points", fontsize=7)
+        name = str(row["name"])
+        x = float(row["fpr"]) * 100
+        y = float(row["f1"])
+        ax.scatter(x, y, facecolors="white", edgecolors="black", s=55)
+        dx, dy = offsets.get(name, (6, 4))
+        ax.annotate(
+            name, (x, y), xytext=(dx, dy),
+            textcoords="offset points", fontsize=7)
     ax.set_xlabel("FPR, %")
     ax.set_ylabel("F1")
     ax.set_title("Компромисс между ложными срабатываниями и F1")
@@ -525,17 +544,27 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     csv_path = results_dir / "full_comparison_diameter.csv"
+    json_artifacts_path = results_dir / "plot_artifacts.json"
     pkl_path = results_dir / "plot_artifacts.pkl"
     diag_path = results_dir / "overfitting_diagnostics.json"
 
-    required = [csv_path, pkl_path, diag_path]
+    required = [csv_path, diag_path]
     missing = [str(p) for p in required if not p.exists()]
+    if not json_artifacts_path.exists() and not pkl_path.exists():
+        missing.append(
+            f"{json_artifacts_path} (preferred) or {pkl_path} (legacy)")
     if missing:
         raise SystemExit(f"Missing required plotting inputs: {missing}")
 
     metrics = pd.read_csv(csv_path)
-    with pkl_path.open("rb") as f:
-        artifacts = pickle.load(f)
+    if json_artifacts_path.exists():
+        artifacts = json.loads(
+            json_artifacts_path.read_text(encoding="utf-8"))
+        artifacts_source = json_artifacts_path
+    else:
+        with pkl_path.open("rb") as f:
+            artifacts = pickle.load(f)
+        artifacts_source = pkl_path
     diagnostics = load_json(diag_path)
     external_attacks = load_json(args.external_attacks)
     calibration = load_json(args.calibration_verification)
@@ -559,7 +588,7 @@ def main() -> None:
 
     source_files = [
         csv_path,
-        pkl_path,
+        artifacts_source,
         diag_path,
         args.external_benign,
         args.external_attacks,
