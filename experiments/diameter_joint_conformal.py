@@ -79,20 +79,27 @@ def audit_captures(calibration, evaluation, calibration_root, evaluation_root, d
 
 
 def split_development(manifest):
-    # Historical development-only repartition: fixed by names, not scores.
-    # Prospective deployment should collect separate exchangeable units.
+    # The whole archived calibration set is already development data.
+    # Prefer former references for the new fit, then fill by capture name.
     if set(manifest.expected_label) != {"benign"}:
         raise ValueError("Only benign calibration captures allowed")
-    if set(manifest.role) != {"reference", "calibration"}:
+    if not set(manifest.role) <= {"reference", "calibration"}:
         raise ValueError("Expected explicit reference/calibration roles")
-    inner = [manifest[manifest.role == "reference"]]
-    outer = []
-    for _, group in manifest[manifest.role == "calibration"].groupby("scenario"):
-        group = group.sort_values("capture")
-        # Six captures per procedure enable the existing local profile.
-        inner.append(group.iloc[:6])
-        outer.append(group.iloc[6:])
+
     import pandas as pd
+
+    inner, outer = [], []
+    for scenario, group in manifest.groupby("scenario", dropna=False):
+        if pd.isna(scenario) or len(group) < 10:
+            raise ValueError(f"Each archived procedure needs 10 usable fit captures: {scenario}")
+        ordered = group.assign(
+            archive_role=group.role, reference_first=group.role.ne("reference"),
+        ).sort_values(["reference_first", "capture"]).drop(columns="reference_first")
+        inner.extend([
+            ordered.iloc[:4].assign(role="reference"),
+            ordered.iloc[4:10].assign(role="calibration"),
+        ])
+        outer.append(ordered.iloc[10:].assign(role="joint_calibration"))
     return pd.concat(inner, ignore_index=True), pd.concat(outer, ignore_index=True)
 
 
@@ -176,6 +183,9 @@ def main():
         raise ValueError("Both evaluation classes need a decodable capture")
     inner, outer = split_development(cal)
     require_resolution(len(outer), args.alpha)
+    print(json.dumps({"reference_count": int((inner.role == "reference").sum()),
+                      "inner_calibration_count": int((inner.role == "calibration").sum()),
+                      "joint_count": len(outer)}), flush=True)
     with args.model.open("rb") as f:
         bundle = pickle.load(f)
     base = fit_local_benign_calibration(bundle, inner, args.calibration_dir,

@@ -77,13 +77,19 @@ class JointConformalTests(unittest.TestCase):
         records = [
             {"capture": f"{scenario}_{role}_{i:02}.pcap",
              "expected_label": "benign", "scenario": scenario, "role": role}
-            for scenario, count in [("attach", 14), ("reauth", 13), ("update", 13)]
-            for role, size in [("reference", 8), ("calibration", count)]
+            for scenario, n_ref, n_cal in [("attach", 8, 14), ("reauth", 3, 13), ("update", 0, 13)]
+            for role, size in [("reference", n_ref), ("calibration", n_cal)]
             for i in range(size)
         ]
         inner, outer = split_development(pd.DataFrame(records[::-1]))
-        self.assertEqual(len(inner), 42)
-        self.assertEqual(len(outer), 22)
+        self.assertEqual(len(inner), 30)
+        self.assertEqual(len(outer), 21)
+        for _, group in inner.groupby("scenario"):
+            self.assertEqual(group.role.value_counts().to_dict(), {
+                "calibration": 6, "reference": 4,
+            })
+        self.assertEqual(set(outer.role), {"joint_calibration"})
+        self.assertEqual(set(outer.archive_role), {"calibration"})
         self.assertTrue(set(inner.capture).isdisjoint(outer.capture))
         require_resolution(len(outer), .05)
 

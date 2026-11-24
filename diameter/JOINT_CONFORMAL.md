@@ -13,9 +13,12 @@ invalidate that assumption. Capture hashes detect exact duplicates only.
 The archived replay publishes a per-capture audit. It excludes undecodable
 captures, counts byte-identical copies once within consistent dataset/role/
 scenario/label metadata, and aborts on cross-dataset or metadata conflicts.
-The inner split retains six calibration captures per procedure where
-available, so the fitter can retain its procedure-specific profiles. The
-outer set must still contain at least 19 usable captures at alpha=.05.
+For the historical replay, each procedure contributes four reference and six
+inner calibration captures, preserving the fitter's procedure-specific
+profiles. The split prefers original reference captures and then orders by
+filename, independently of anomaly scores and evaluation labels. Excess
+captures form the outer set, which needs at least 19 usable captures at
+alpha=.05. The manifests include both original and assigned roles.
 The archived jDiameter replay is development, not a new independent
 confirmation; the original frozen detector and its results remain unchanged.
 A prospective confirmation must freeze this candidate and collect disjoint
