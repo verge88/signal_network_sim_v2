@@ -74,7 +74,11 @@ jobs:
       - name: Build jDiameter guide stack with frozen S6a driver
         run: |
           cd external_jdiameter
-          mvn -B -DskipTests -pl examples/guide1 -am package
+          # The upstream root reactor contains core only; examples/guide1 is
+          # intentionally outside that reactor. Install the pinned core first,
+          # then build the example against those exact local artifacts.
+          mvn -B -DskipTests install
+          mvn -B -DskipTests -f examples/guide1/pom.xml package
           jar=$(find examples/guide1/target -name '*jar-with-dependencies.jar' | head -1)
           test -n "${jar}"
           echo "${jar}" > /tmp/jdiameter_jar
