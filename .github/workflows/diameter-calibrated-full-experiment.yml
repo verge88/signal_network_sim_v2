@@ -111,23 +111,29 @@ jobs:
               raise SystemExit("Missing compromise_recall_diagnostics.json")
           d = json.loads(p.read_text(encoding="utf-8"))
           t = d["test"]
-          recall = max(
-              float(t["cascade_compromise_recall"]),
-              float(t["meta_compromise_recall"]),
-          )
-          fpr = min(
-              float(t["cascade_benign_fpr"]),
-              float(t["meta_benign_fpr"]),
-          )
+          candidates = {
+              "Cascade": (
+                  float(t["cascade_compromise_recall"]),
+                  float(t["cascade_benign_fpr"]),
+              ),
+              "Meta-Ensemble": (
+                  float(t["meta_compromise_recall"]),
+                  float(t["meta_benign_fpr"]),
+              ),
+          }
           print(json.dumps(d, indent=2, ensure_ascii=False))
           # Acceptance gate is deliberately slightly looser than the 0.85
           # validation target to avoid tuning to the untouched test split.
-          if recall < 0.80:
+          passing = {
+              name: (recall, fpr)
+              for name, (recall, fpr) in candidates.items()
+              if recall >= 0.80 and fpr <= 0.025
+          }
+          if not passing:
               raise SystemExit(
-                  f"Node-compromise recall regression: best test recall={recall:.3f}")
-          if fpr > 0.025:
-              raise SystemExit(
-                  f"Node-compromise branch FPR too high: best test FPR={fpr:.4f}")
+                  "No compromise-aware detector simultaneously satisfies "
+                  f"recall>=0.80 and FPR<=0.025: {candidates}")
+          print(f"Passing compromise-aware detectors: {passing}")
           PY
 
       - name: Check full model inventory
