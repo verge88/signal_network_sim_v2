@@ -91,21 +91,31 @@ jobs:
             out="$GITHUB_WORKSPACE/bromelia_expanded_benign/${name}"
             sudo tcpdump -i lo -U -s 0 -B 4096 -w "${out}" 'tcp port 3868' >"/tmp/${name}.log" 2>&1 &
             cap_pid=$!
-            for i in {1..40}; do
-              grep -q "listening on lo" "/tmp/${name}.log" && break
+            for i in {1..60}; do
+              if grep -q "listening on lo" "/tmp/${name}.log"; then
+                break
+              fi
               sleep 0.05
             done
-            sleep 0.15
+            grep -q "listening on lo" "/tmp/${name}.log"
+            # The fast Bromelia sessions can otherwise complete while libpcap
+            # is still attaching.  This delay changes capture readiness only.
+            sleep 0.75
             (
               cd external_bromelia
               python frozen_validation_driver.py --mode client --host 127.0.0.1 --port 3868 \
                 --scenario "${scenario}" --count "${count}" --delay-ms "${delay}"
             )
-            sleep 0.20
+            sleep 0.50
             sudo kill -INT "${cap_pid}" || true
             wait "${cap_pid}" || true
             sudo chown "$USER":"$USER" "${out}"
-            test "$(stat -c%s "${out}")" -gt 24
+            bytes=$(stat -c%s "${out}")
+            if [ "${bytes}" -le 24 ]; then
+              echo "Empty benign calibration PCAP: ${name} size=${bytes}"
+              cat "/tmp/${name}.log" || true
+              exit 1
+            fi
             echo "${name},benign,${scenario},${role}" >> "${manifest}"
           }
 
