@@ -1,0 +1,117 @@
+name: Diameter frozen aiodiameter artifact rescore
+
+on:
+  push:
+    branches:
+      - improve/diameter-pcap-native-transfer
+    paths:
+      - ".github/workflows/diameter-aiodiameter-frozen-rescore.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  frozen-rescore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout parser fix
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install decode and model dependencies
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update -o Acquire::Retries=3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn
+
+      - name: Download exact frozen artifact from first scoring attempt
+        uses: actions/download-artifact@v4
+        with:
+          name: diameter-aiodiameter-final-confirmation
+          path: frozen
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 45430474239
+
+      - name: Verify frozen inputs
+        run: |
+          test -s frozen/results_aiodiameter_native_model/pcap_native_bundle.pkl
+          test -s frozen/aiodiameter_final_pcaps/manifest.csv
+          test -s frozen/aiodiameter_final_pcaps/SHA256SUMS
+          echo "Frozen capture manifest:"
+          cat frozen/aiodiameter_final_pcaps/manifest.csv
+          echo "Frozen hashes:"
+          cat frozen/aiodiameter_final_pcaps/SHA256SUMS
+
+      - name: Score exact frozen PCAPs with parser-only fix
+        run: |
+          python experiments/diameter_pcap_native_detector.py score             --model frozen/results_aiodiameter_native_model/pcap_native_bundle.pkl             --manifest frozen/aiodiameter_final_pcaps/manifest.csv             --pcap-dir frozen/aiodiameter_final_pcaps             --out-dir results_aiodiameter_frozen_rescore
+
+      - name: Apply original predeclared acceptance gate
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          summary = json.loads(Path(
+              "results_aiodiameter_frozen_rescore/summary.json"
+          ).read_text(encoding="utf-8"))
+          summary["source"] = "alikhalilli/aiodiameter"
+          summary["source_commit"] = "947d7d8852e1ab107b3ae2796a678641286bf4ae"
+          summary["frozen_capture_run"] = 45430474239
+          summary["frozen_capture_artifact"] = 14939128502
+          summary["role"] = (
+              "same frozen external PCAPs and model as first scoring attempt; "
+              "only RFC6733 TCP parser fallback changed"
+          )
+          Path("results_aiodiameter_frozen_rescore/final_confirmation_summary.json").write_text(
+              json.dumps(summary, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+          if float(summary["external_attack_tpr"]) < 0.80:
+              raise SystemExit(
+                  f"Final PCAP-native TPR below 80%: {summary['external_attack_tpr']}")
+          if float(summary["external_benign_fpr"]) > 0.0:
+              raise SystemExit(
+                  f"Final PCAP-native benign FPR not zero: {summary['external_benign_fpr']}")
+          if float(summary["external_balanced_accuracy"]) < 0.90:
+              raise SystemExit(
+                  "Final PCAP-native balanced accuracy below 90%: "
+                  f"{summary['external_balanced_accuracy']}")
+          PY
+
+      - name: Publish frozen final result
+        if: always()
+        run: |
+          {
+            echo "## Frozen aiodiameter final artifact rescore"
+            for f in               results_aiodiameter_frozen_rescore/summary.json               results_aiodiameter_frozen_rescore/final_confirmation_summary.json; do
+              if [ -f "$f" ]; then
+                echo
+                echo "### $f"
+                echo '~~~json'
+                cat "$f"
+                echo '~~~'
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload frozen rescore results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diameter-aiodiameter-frozen-rescore
+          path: results_aiodiameter_frozen_rescore/
+          if-no-files-found: warn
