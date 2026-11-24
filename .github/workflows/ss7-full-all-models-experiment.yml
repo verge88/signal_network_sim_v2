@@ -1,0 +1,176 @@
+name: SS7 full all-model retraining and plots
+
+on:
+  push:
+    branches:
+      - validate-ss7-real-cdr
+    paths:
+      - "ss7/ss7_training_v7.py"
+      - "ss7/fix.py"
+      - "ss7/plot_full_model_experiment.py"
+      - ".github/workflows/ss7-full-all-models-experiment.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "ss7/ss7_training_v7.py"
+      - "ss7/fix.py"
+      - "ss7/plot_full_model_experiment.py"
+      - ".github/workflows/ss7-full-all-models-experiment.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  train-matrix:
+    name: Train all models seed ${{ matrix.seed }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [1337, 2026, 7, 31415]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Train full model zoo
+        env:
+          SNS_EXPORT_DIR: results/full_all_models/seed_${{ matrix.seed }}/export
+        run: |
+          set -o pipefail
+          mkdir -p results/full_all_models/seed_${{ matrix.seed }}
+          python -m ss7.ss7_training_v7 \
+            --seed ${{ matrix.seed }} \
+            --days 2.0 \
+            --feature-set OWN+INV \
+            --soph adaptive \
+            --alerts-per-day 20 \
+            --op-prevalence 0.0001 \
+            --out-dir results/full_all_models/seed_${{ matrix.seed }} \
+            2>&1 | tee results/full_all_models/seed_${{ matrix.seed }}/training.log
+
+      - name: Upload seed results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss7-all-models-seed-${{ matrix.seed }}
+          path: results/full_all_models/
+          if-no-files-found: warn
+          retention-days: 30
+
+  diagnostics:
+    name: Full zoo and diagnostics seed 42
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Train all models and run all diagnostics
+        env:
+          SNS_EXPORT_DIR: results/full_all_models/seed_42/export
+        run: |
+          set -o pipefail
+          mkdir -p results/full_all_models/seed_42
+          python -m ss7.ss7_training_v7 \
+            --seed 42 \
+            --days 2.0 \
+            --feature-set OWN+INV \
+            --soph adaptive \
+            --alerts-per-day 20 \
+            --op-prevalence 0.0001 \
+            --ablations \
+            --lomfo \
+            --curve \
+            --soph-sweep \
+            --out-dir results/full_all_models/seed_42 \
+            2>&1 | tee results/full_all_models/seed_42/training_and_diagnostics.log
+
+      - name: Upload diagnostics results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss7-all-models-seed-42
+          path: results/full_all_models/
+          if-no-files-found: warn
+          retention-days: 30
+
+  aggregate-and-plot:
+    name: Aggregate all seeds and render all figures
+    needs: [train-matrix, diagnostics]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install plotting dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas matplotlib
+
+      - name: Download all seed artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ss7-all-models-seed-*
+          path: results/all_models_collected
+          merge-multiple: true
+
+      - name: Build aggregate tables and every figure
+        run: |
+          set -o pipefail
+          mkdir -p results/all_models_figures
+          python -m ss7.plot_full_model_experiment \
+            --input-root results/all_models_collected \
+            --output-dir results/all_models_figures \
+            --formats png pdf \
+            2>&1 | tee results/all_models_figures/plotting.log
+
+      - name: List generated figures
+        run: |
+          find results/all_models_figures -maxdepth 1 -type f | sort
+
+      - name: Upload complete experiment and plots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss7-full-all-models-experiment
+          path: |
+            results/all_models_collected/
+            results/all_models_figures/
+          if-no-files-found: warn
+          retention-days: 30
