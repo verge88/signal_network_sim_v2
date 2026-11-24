@@ -298,11 +298,13 @@ def plot_training_curves(artifacts: dict, diagnostics: dict,
     neural_diag = diagnostics.get("neural", {})
 
     for ax, (name, hist) in zip(axes, histories.items()):
-        train = np.asarray(hist.get("train_losses", []), dtype=float)
+        train = np.asarray(
+            hist.get("train_eval_losses", hist.get("train_losses", [])),
+            dtype=float)
         val = np.asarray(hist.get("val_losses", []), dtype=float)
         if len(train):
             ax.plot(np.arange(1, len(train)+1), train, color="black",
-                    linestyle="-", label="Обучение")
+                    linestyle="-", label="Обучение (eval)")
         if len(val):
             ax.plot(np.arange(1, len(val)+1), val, color="0.45",
                     linestyle="--", label="Валидация")
