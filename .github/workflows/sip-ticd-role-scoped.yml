@@ -1,0 +1,107 @@
+name: SIP TICD role-scoped weak-proxy warnings independent holdout
+on:
+  push:
+    branches: [improve/ticd-role-scoped-warnings]
+    paths:
+      - '.github/workflows/sip-ticd-role-scoped.yml'
+      - 'sip/ticd_role_scoped_warning.py'
+      - 'experiments/evaluate_ticd_role_scoped_warning.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  compare-role-scopes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+      PYTHONHASHSEED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install scientific Python and compile new detector
+        run: |
+          set -euo pipefail
+          python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+          python -m compileall -q sip/ticd_role_scoped_warning.py experiments/evaluate_ticd_role_scoped_warning.py
+          python -m pip freeze > role_scoped_environment.txt
+      - name: Fetch frozen external-calibrated TICD from successful zonal evaluation
+        run: |
+          set -euo pipefail
+          mkdir -p prior
+          gh run download 45252940147 --repo "${{ github.repository }}" --name sip-ticd-zonal-warning-model-and-evaluation --dir prior
+          file="$(find prior -type f -name ticd_zone_context_model.pkl -print -quit)"
+          test -n "$file"
+          echo "PRIOR_DIR=$(dirname "$file")" >> "$GITHUB_ENV"
+      - name: Calibrate normal-only role thresholds; choose by synthetic development and evaluate completely untouched seeds
+        run: |
+          python -m experiments.evaluate_ticd_role_scoped_warning --prior "$PRIOR_DIR" --out results_ticd_role_warning
+      - name: Verify model reload, split integrity and mutually exclusive warning accounting
+        run: |
+          python - <<'PY'
+          import json,pickle,sys
+          sys.path.insert(0,'sip')
+          d=json.load(open('results_ticd_role_warning/role_warning_report.json'))
+          with open('results_ticd_role_warning/role_scoped_ticd_model.pkl','rb') as f:
+              model=pickle.load(f)
+          assert d['model_reload'] and d['label_oracle_invariance'] and d['test_batch_invariance']
+          assert d['source_frozen_prior_SIP_models_not_refitted']
+          assert d['strong_alarm_unchanged_all_node_types']
+          assert not d['real_field_SIP_compromise_validation']
+          assert model['selected_name']==d['selected_name']
+          assert model['selected_model'].fitted
+          seeds=[s for key in ('normal_validation_seeds','development_seeds','untouched_test_seeds')
+                 for xs in d[key].values() for s in xs]
+          assert len(seeds)==len(set(seeds))
+          for cohort,models in d['heldout'].items():
+              a,b=models['old_all_raw'],models['role_scoped_selected']
+              assert a['confirmed_FP']==b['confirmed_FP'] and a['confirmed_TP']==b['confirmed_TP']
+              for m in models.values():
+                  assert m['confirmed_TP']+m['warning_only_TP']==m['covered_attack_rows']
+                  assert m['confirmed_FP']+m['warning_only_FP']<=m['normal']
+          print('ROLE_SCOPED_TICD_RELOAD_AND_HELDOUT_METRICS_VERIFIED')
+          PY
+      - name: Show actual results including negative robustness findings
+        if: always()
+        run: |
+          if [ -f results_ticd_role_warning/role_warning_report.json ]; then
+            echo '## SIP TICD: role-scoped warning-only proxy compromise vs unrestricted warnings' >> "$GITHUB_STEP_SUMMARY"
+            echo 'All metrics are for simulator-generated traffic; real LTE-A SIP PCAP only partially calibrated benign SIP method frequency.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Role scoping can miss early compromise of excluded network-function types. Warning is NOT confirmed alert.' >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d=json.load(open('results_ticd_role_warning/role_warning_report.json'))
+          print('Selected:',d['selected_name'])
+          print('Development utilities:',d['development_utility'])
+          print('Confirmed threshold:',d['alert_threshold'])
+          print('Warning threshold:',d['selected_manifest']['warning_threshold'])
+          for name,models in d['heldout'].items():
+              print('SCENARIO',name)
+              for model_name,entry in models.items():
+                  stat=entry['by_sophistication']['statistical']
+                  print(model_name,'alert FPR',entry['confirmed_alert_FPR'],
+                       'warning FWR',entry['false_warning_rate'],
+                       'union FPR',entry['combined_normal_signal_rate'],
+                       'alert recall',entry['confirmed_recall'],
+                       'stat confirmed',stat['confirmed_recall'],
+                       'stat warning-only',stat['warning_only_incremental'])
+          PY
+            echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-ticd-role-scoped-warning-frozen-model-and-holdout
+          path: |
+            results_ticd_role_warning/
+            role_scoped_environment.txt
+          if-no-files-found: warn
+          retention-days: 30
