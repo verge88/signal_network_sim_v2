@@ -10,6 +10,12 @@ This gives marginal, not per-scenario or time-uniform, benign FPR control
 if the outer calibration and future benign scores are exchangeable given
 the fitted score. Correlated captures, drift and stratified sampling can
 invalidate that assumption. Capture hashes detect exact duplicates only.
+The archived replay publishes a per-capture audit. It excludes undecodable
+captures, counts byte-identical copies once within consistent dataset/role/
+scenario/label metadata, and aborts on cross-dataset or metadata conflicts.
+The inner split retains six calibration captures per procedure where
+available, so the fitter can retain its procedure-specific profiles. The
+outer set must still contain at least 19 usable captures at alpha=.05.
 The archived jDiameter replay is development, not a new independent
 confirmation; the original frozen detector and its results remain unchanged.
 A prospective confirmation must freeze this candidate and collect disjoint

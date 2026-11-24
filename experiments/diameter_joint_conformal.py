@@ -35,11 +35,47 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def hashes(manifest, root):
-    result = [digest(root / str(x)) for x in manifest["capture"]]
-    if len(set(result)) != len(result):
-        raise ValueError("Duplicate PCAP content")
-    return set(result)
+def audit_captures(calibration, evaluation, calibration_root, evaluation_root, decode):
+    import pandas as pd
+
+    rows = []
+    for dataset, manifest, root in (
+        ("calibration", calibration, calibration_root),
+        ("evaluation", evaluation, evaluation_root),
+    ):
+        for record in manifest.to_dict("records"):
+            capture = str(record["capture"])
+            path = root / capture
+            row = {**record, "dataset": dataset, "sha256": None,
+                   "decoded_pdus": 0, "status": "missing", "retained_capture": None}
+            if path.is_file():
+                row.update(sha256=digest(path), status="pending")
+            rows.append(row)
+
+    audit = pd.DataFrame(rows).sort_values(["dataset", "capture"], kind="stable")
+    candidates = audit[audit.status == "pending"]
+    for _, group in candidates.groupby("sha256", sort=False):
+        first = group.iloc[0]
+        root = calibration_root if first.dataset == "calibration" else evaluation_root
+        try:
+            decoded = int(decode(root / first.capture)["_decoded_pdus"])
+        except RuntimeError as error:
+            if not str(error).startswith("No Diameter PDUs decoded from "):
+                raise
+            decoded = 0
+        audit.loc[group.index, "decoded_pdus"] = decoded
+        if decoded <= 0:
+            audit.loc[group.index, "status"] = "undecodable"
+        elif group.dataset.nunique() > 1:
+            audit.loc[group.index, "status"] = "cross_dataset_overlap"
+        elif any(group[key].nunique(dropna=False) > 1
+                 for key in ("expected_label", "role", "scenario")):
+            audit.loc[group.index, "status"] = "conflicting_metadata"
+        else:
+            audit.loc[group.index, ["status", "retained_capture"]] = (
+                "duplicate", first.capture)
+            audit.loc[group.index[0], "status"] = "retained"
+    return audit
 
 
 def split_development(manifest):
@@ -53,9 +89,9 @@ def split_development(manifest):
     outer = []
     for _, group in manifest[manifest.role == "calibration"].groupby("scenario"):
         group = group.sort_values("capture")
-        cut = len(group) // 2
-        inner.append(group.iloc[:cut])
-        outer.append(group.iloc[cut:])
+        # Six captures per procedure enable the existing local profile.
+        inner.append(group.iloc[:6])
+        outer.append(group.iloc[6:])
     import pandas as pd
     return pd.concat(inner, ignore_index=True), pd.concat(outer, ignore_index=True)
 
@@ -97,9 +133,21 @@ def metrics(frame, column):
     return out
 
 
+def paired_changes(frame, candidate, baseline):
+    return {
+        label: {
+            "added_alarms": int(((group[candidate] == 1) & (group[baseline] == 0)).sum()),
+            "removed_alarms": int(((group[candidate] == 0) & (group[baseline] == 1)).sum()),
+        }
+        for label, group in frame.groupby("expected_label")
+    }
+
+
 def main():
     import pandas as pd
-    from diameter_pcap_native_detector import fit_local_benign_calibration
+    from diameter_pcap_native_detector import (
+        fit_local_benign_calibration, pcap_to_native_features,
+    )
     p = argparse.ArgumentParser()
     p.add_argument("--model", type=Path, required=True)
     p.add_argument("--calibration-dir", type=Path, required=True)
@@ -113,8 +161,19 @@ def main():
     ev = pd.read_csv(args.evaluation_dir / "manifest.csv")
     if set(ev.expected_label) != {"benign", "attack"}:
         raise ValueError("Both evaluation classes required")
-    if hashes(cal, args.calibration_dir) & hashes(ev, args.evaluation_dir):
-        raise ValueError("Calibration/evaluation PCAP overlap")
+    audit = audit_captures(cal, ev, args.calibration_dir, args.evaluation_dir,
+                           pcap_to_native_features)
+    audit.to_csv(args.out / "capture_audit.csv", index=False)
+    counts = (audit.groupby(["dataset", "expected_label", "status"]).size()
+              .rename("count").reset_index().to_dict("records"))
+    print(json.dumps({"capture_audit": counts}, indent=2), flush=True)
+    if audit.status.isin(["missing", "cross_dataset_overlap", "conflicting_metadata"]).any():
+        raise ValueError("Missing, overlapping or inconsistently labelled PCAPs; see capture_audit.csv")
+    retained = audit[audit.status == "retained"]
+    cal = retained.loc[retained.dataset == "calibration", cal.columns]
+    ev = retained.loc[retained.dataset == "evaluation", ev.columns]
+    if set(ev.expected_label) != {"benign", "attack"}:
+        raise ValueError("Both evaluation classes need a decodable capture")
     inner, outer = split_development(cal)
     require_resolution(len(outer), args.alpha)
     with args.model.open("rb") as f:
@@ -126,8 +185,10 @@ def main():
     # Freeze all model/threshold data before evaluating historical captures.
     frozen = {"alpha": args.alpha, "model_sha256": digest(args.model),
               "base": base, "joint_scores": scores,
-              "inner_capture_sha256": sorted(hashes(inner, args.calibration_dir)),
-              "joint_capture_sha256": sorted(hashes(outer, args.calibration_dir))}
+              "inner_capture_sha256": sorted(retained.loc[
+                  (retained.dataset == "calibration") & retained.capture.isin(inner.capture), "sha256"]),
+              "joint_capture_sha256": sorted(retained.loc[
+                  (retained.dataset == "calibration") & retained.capture.isin(outer.capture), "sha256"])}
     (args.out / "joint_calibration.json").write_text(json.dumps(frozen, indent=2, allow_nan=False))
     inner.to_csv(args.out / "inner_manifest.csv", index=False)
     joint.to_csv(args.out / "joint_manifest.csv", index=False)
@@ -139,7 +200,7 @@ def main():
     cols = ["capture", "expected_label", "pcap_native_pred_anomaly"]
     pred = pred.merge(old[cols], on=["capture", "expected_label"], how="left",
                       validate="one_to_one")
-    if pred.pcap_native_pred_anomaly.isna().any():
+    if not pred.pcap_native_pred_anomaly.isin([0, 1]).all():
         raise ValueError("Historical baseline and evaluation mismatch")
     pred.to_csv(args.out / "predictions.csv", index=False)
     comparisons = ["joint_pred", "same_base_uncalibrated_pred",
@@ -147,6 +208,11 @@ def main():
     result = {
         "role": "historical development replay, NOT independent confirmation",
         "alpha": args.alpha, "inner_count": len(inner),
+        "capture_audit": counts,
+        "paired_changes": {
+            baseline: paired_changes(pred, "joint_pred", baseline)
+            for baseline in comparisons[1:]
+        },
         "joint_count": len(outer), "min_p_value": 1/(len(outer)+1),
         "guarantee": "marginal benign FPR under exchangeability; not established by stratified historical replay",
         "metrics": {c: metrics(pred, c) for c in comparisons},
