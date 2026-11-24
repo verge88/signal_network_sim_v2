@@ -1047,6 +1047,209 @@ def summarise_external(
     return summary
 
 
+
+LOCAL_ADAPT_FEATURES = list(dict.fromkeys(
+    PORTABLE_FEATURES + [
+        "pcap_log_total_pdus",
+        "pcap_log_duration_s",
+        "pcap_log_rate_hz",
+        "pcap_s6a_fraction",
+        "pcap_gx_fraction",
+        "pcap_rx_fraction",
+        "pcap_s13_fraction",
+        "pcap_other_fraction",
+        "pcap_iat_cv",
+        "pcap_bin_count_cv",
+        "pcap_bin_count_peak_ratio",
+        "pcap_bin_count_autocorr",
+        "pcap_bin_entropy_std",
+        "pcap_bin_s6a_fraction_std",
+        "pcap_air_ratio_std",
+        "pcap_ulr_ratio_std",
+        "pcap_active_command_fraction",
+        "pcap_log_burst_mass",
+        "pcap_log_pdus_per_active_command",
+    ]
+))
+
+
+def _robust_scale_matrix(X: np.ndarray) -> np.ndarray:
+    q25 = np.quantile(X, 0.25, axis=0)
+    q75 = np.quantile(X, 0.75, axis=0)
+    iqr_scale = (q75 - q25) / 1.349
+    std = np.std(X, axis=0)
+    # A finite floor prevents a feature that is constant in a small benign
+    # calibration set from dominating the local distance by numerical noise.
+    scale = np.maximum.reduce([
+        iqr_scale,
+        0.25 * std,
+        np.full(X.shape[1], 0.05, dtype=float),
+    ])
+    return scale
+
+
+def _topk_rms(delta: np.ndarray, k: int = 8) -> float:
+    d = np.clip(np.abs(np.asarray(delta, dtype=float)), 0.0, 12.0)
+    if d.size == 0:
+        return 0.0
+    kk = min(k, d.size)
+    top = np.partition(d, d.size - kk)[-kk:]
+    return float(np.sqrt(np.mean(top ** 2)))
+
+
+def _nn_distance(x: np.ndarray, ref: np.ndarray, scale: np.ndarray) -> float:
+    if len(ref) == 0:
+        return float("inf")
+    z = (ref - x.reshape(1, -1)) / scale.reshape(1, -1)
+    distances = np.array([_topk_rms(row) for row in z], dtype=float)
+    return float(np.min(distances))
+
+
+def _envelope_distance(
+    x: np.ndarray,
+    ref: np.ndarray,
+    scale: np.ndarray,
+) -> float:
+    if len(ref) == 0:
+        return float("inf")
+    lo = np.min(ref, axis=0)
+    hi = np.max(ref, axis=0)
+    below = np.maximum((lo - x) / scale, 0.0)
+    above = np.maximum((x - hi) / scale, 0.0)
+    return _topk_rms(np.maximum(below, above), k=4)
+
+
+def _conformal_upper(values: np.ndarray, alpha: float) -> float:
+    vals = np.sort(np.asarray(values, dtype=float))
+    if len(vals) == 0:
+        raise RuntimeError("Cannot calibrate local detector on an empty set")
+    k = int(np.ceil((len(vals) + 1) * (1.0 - alpha)))
+    idx = min(max(k - 1, 0), len(vals) - 1)
+    return float(np.nextafter(vals[idx], np.inf))
+
+
+def _local_reference_score(
+    x: np.ndarray,
+    ref: np.ndarray,
+    scale: np.ndarray,
+    nn_threshold: float,
+    envelope_threshold: float,
+) -> Dict[str, float]:
+    nn = _nn_distance(x, ref, scale)
+    env = _envelope_distance(x, ref, scale)
+    nn_norm = nn / max(float(nn_threshold), 1e-9)
+    env_norm = env / max(float(envelope_threshold), 1e-9)
+    return {
+        "nn_distance": float(nn),
+        "envelope_distance": float(env),
+        "local_score": float(max(nn_norm, env_norm)),
+    }
+
+
+def fit_local_benign_calibration(
+    bundle: dict,
+    manifest: pd.DataFrame,
+    pcap_dir: Path,
+    target_fpr: float,
+) -> Dict[str, object]:
+    labels = manifest["expected_label"].astype(str).str.lower().str.strip()
+    if set(labels) != {"benign"}:
+        raise SystemExit(
+            "Local one-class calibration accepts benign captures only")
+    if len(manifest) < 12:
+        raise SystemExit(
+            "At least 12 benign PCAPs are required for local one-class calibration")
+    if not (0.0 < target_fpr < 1.0):
+        raise SystemExit("target_fpr must be strictly between 0 and 1")
+
+    rows = []
+    meta_rows = []
+    for rec in manifest.to_dict("records"):
+        path = pcap_dir / str(rec["capture"])
+        feat = pcap_to_native_features(path)
+        rows.append([float(feat[c]) for c in LOCAL_ADAPT_FEATURES])
+
+        X = pd.DataFrame([{k: feat[k] for k in PCAP_NATIVE_FEATURES}])
+        branch_scores = _branch_scores(bundle, X)[0]
+        meta_rows.append({
+            "capture": str(rec["capture"]),
+            "decoded_pdus": int(feat["_decoded_pdus"]),
+            "duration_s": float(feat["_duration_s"]),
+            "frozen_supervised_score": float(_meta_score(bundle, X)[0]),
+            **{
+                f"branch_{name}": float(value)
+                for name, value in zip(
+                    bundle["branch_features"].keys(), branch_scores)
+            },
+        })
+
+    Xcal = np.asarray(rows, dtype=float)
+    scale = _robust_scale_matrix(Xcal)
+
+    loo_nn = []
+    loo_env = []
+    for i in range(len(Xcal)):
+        ref = np.delete(Xcal, i, axis=0)
+        loo_nn.append(_nn_distance(Xcal[i], ref, scale))
+        loo_env.append(_envelope_distance(Xcal[i], ref, scale))
+    loo_nn = np.asarray(loo_nn, dtype=float)
+    loo_env = np.asarray(loo_env, dtype=float)
+
+    nn_threshold = _conformal_upper(loo_nn, target_fpr)
+    envelope_threshold = _conformal_upper(loo_env, target_fpr)
+
+    return {
+        "version": 1,
+        "method": "deployment_benign_local_manifold_conformal",
+        "scope": (
+            "deployment-local one-class detector; frozen global model; "
+            "benign PCAPs only; no attack labels"
+        ),
+        "model_sha256": None,
+        "feature_names": LOCAL_ADAPT_FEATURES,
+        "reference_vectors": Xcal.tolist(),
+        "scale": scale.tolist(),
+        "target_fpr": float(target_fpr),
+        "calibration_capture_count": int(len(Xcal)),
+        "nn_threshold": float(nn_threshold),
+        "envelope_threshold": float(envelope_threshold),
+        "loo_nn_scores": loo_nn.tolist(),
+        "loo_envelope_scores": loo_env.tolist(),
+        "captures": meta_rows,
+    }
+
+
+def score_with_local_calibration(
+    bundle: dict,
+    calibration: Dict[str, object],
+    feat: Dict[str, float],
+) -> Dict[str, float]:
+    names = list(calibration["feature_names"])
+    x = np.asarray([float(feat[c]) for c in names], dtype=float)
+    ref = np.asarray(calibration["reference_vectors"], dtype=float)
+    scale = np.asarray(calibration["scale"], dtype=float)
+    return _local_reference_score(
+        x, ref, scale,
+        float(calibration["nn_threshold"]),
+        float(calibration["envelope_threshold"]),
+    )
+
+
+def calibrate_local_cli(args) -> None:
+    with args.model.open("rb") as f:
+        bundle = pickle.load(f)
+    manifest = _load_benign_calibration_manifest(args.manifest)
+    calibration = fit_local_benign_calibration(
+        bundle, manifest, args.pcap_dir, float(args.target_fpr))
+    calibration["model_sha256"] = _sha256_file(args.model)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(
+        json.dumps(calibration, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(json.dumps(calibration, ensure_ascii=False, indent=2))
+
+
 def train_cli(args) -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     bundle, metrics = train_detector(args.calibration_pcaps)
@@ -1191,8 +1394,49 @@ def score_cli(args) -> None:
 
     pred = score_pcaps(
         bundle, manifest, args.pcap_dir, threshold=threshold)
+
+    local_meta = None
+    if args.local_calibration is not None:
+        local_meta = json.loads(
+            args.local_calibration.read_text(encoding="utf-8"))
+        expected_sha = str(local_meta.get("model_sha256", ""))
+        actual_sha = _sha256_file(args.model)
+        if expected_sha != actual_sha:
+            raise SystemExit(
+                "Local one-class calibration was produced for a different model")
+        if local_meta.get("method") != (
+                "deployment_benign_local_manifold_conformal"):
+            raise SystemExit("Unsupported local calibration method")
+
+        local_scores = []
+        local_preds = []
+        for rec in manifest.to_dict("records"):
+            feat = pcap_to_native_features(
+                args.pcap_dir / str(rec["capture"]))
+            scored = score_with_local_calibration(bundle, local_meta, feat)
+            local_scores.append(float(scored["local_score"]))
+            local_preds.append(int(scored["local_score"] > 1.0))
+        pred["frozen_supervised_pred_anomaly"] = (
+            pred["pcap_native_pred_anomaly"].astype(int))
+        pred["local_oneclass_score"] = local_scores
+        pred["local_oneclass_pred_anomaly"] = local_preds
+        # Detection decision in deployment-local mode is one-class.  The
+        # frozen supervised score remains available as explanatory evidence
+        # and possible attack-type classification, not as a hard gate.
+        pred["pcap_native_pred_anomaly"] = local_preds
+        threshold_source = "deployment_benign_local_oneclass"
+
     summary = summarise_external(
         pred, threshold, threshold_source=threshold_source)
+    if local_meta is not None:
+        summary["local_oneclass_calibration"] = {
+            "method": local_meta["method"],
+            "target_fpr": local_meta["target_fpr"],
+            "calibration_capture_count": local_meta[
+                "calibration_capture_count"],
+            "nn_threshold": local_meta["nn_threshold"],
+            "envelope_threshold": local_meta["envelope_threshold"],
+        }
     if calibration_meta is not None:
         summary["deployment_calibration"] = {
             "method": calibration_meta["method"],
@@ -1231,13 +1475,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("deployment_benign_calibration.json"))
     cal.set_defaults(func=calibrate_cli)
 
+    local = sub.add_parser("calibrate-local")
+    local.add_argument("--model", type=Path, required=True)
+    local.add_argument("--manifest", type=Path, required=True)
+    local.add_argument("--pcap-dir", type=Path, required=True)
+    local.add_argument("--target-fpr", type=float, default=0.05)
+    local.add_argument(
+        "--out", type=Path,
+        default=Path("deployment_local_oneclass_calibration.json"))
+    local.set_defaults(func=calibrate_local_cli)
+
     sc = sub.add_parser("score")
     sc.add_argument("--model", type=Path, required=True)
     sc.add_argument("--manifest", type=Path, required=True)
     sc.add_argument("--pcap-dir", type=Path, required=True)
     sc.add_argument(
         "--calibration", type=Path, default=None,
-        help="Optional benign-only deployment calibration JSON")
+        help="Optional benign-only supervised threshold calibration JSON")
+    sc.add_argument(
+        "--local-calibration", type=Path, default=None,
+        help="Optional benign-only deployment local one-class calibration JSON")
     sc.add_argument(
         "--out-dir", type=Path, default=Path("results_pcap_native_external"))
     sc.set_defaults(func=score_cli)
