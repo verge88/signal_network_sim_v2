@@ -1,0 +1,62 @@
+name: SS7 threshold transfer study
+on:
+  push:
+    branches: [ss7-threshold-transfer-study]
+    paths: [.github/workflows/ss7-threshold-transfer-study.yml, ss7/threshold_transfer_study.py]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-threshold-transfer-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        seed: [8601,8602,8603,8604,8605,8606,8607,8608]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/train
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - run: |
+          python -m py_compile ss7/threshold_transfer_study.py
+          python -u -m ss7.threshold_transfer_study test --seed ${{ matrix.seed }} --models results/train/models.joblib --output results/seed_${{ matrix.seed }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: threshold-seed-${{ matrix.seed }}
+          path: results/seed_${{ matrix.seed }}
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: threshold-seed-*
+          path: results/collected
+      - run: python -m ss7.threshold_transfer_study aggregate --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-threshold-summary
+          path: results/summary
