@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 import os
 import json
+import random
 import warnings
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
@@ -89,60 +90,60 @@ class TrainingConfig:
     ocsvm_nu: float = 0.05
     ocsvm_kernel: str = "rbf"
 
-    # Autoencoder — deliberately compact + explicit regularization.
-    ae_hidden_dims: List[int] = field(default_factory=lambda: [48, 24])
+    # Neural models — compact capacity and aggressive validation guards.
+    ae_hidden_dims: List[int] = field(default_factory=lambda: [40, 20])
     ae_latent_dim: int = 8
-    ae_epochs: int = 80
+    ae_epochs: int = 60
     ae_batch: int = 256
-    ae_lr: float = 7e-4
-    ae_dropout: float = 0.20
-    ae_weight_decay: float = 1e-4
-    ae_patience: int = 8
-    ae_min_delta: float = 1e-4
+    ae_lr: float = 4e-4
+    ae_dropout: float = 0.10
+    ae_weight_decay: float = 2e-4
+    ae_patience: int = 4
+    ae_min_delta: float = 5e-4
 
-    # VAE — lower capacity and deterministic validation scoring.
-    vae_hidden_dims: List[int] = field(default_factory=lambda: [48, 24])
+    # VAE — stronger latent regularisation and short overfit tail.
+    vae_hidden_dims: List[int] = field(default_factory=lambda: [40, 20])
     vae_latent_dim: int = 8
-    vae_epochs: int = 100
+    vae_epochs: int = 80
     vae_batch: int = 256
-    vae_lr: float = 7e-4
-    vae_kl_weight: float = 0.5
-    vae_dropout: float = 0.15
-    vae_weight_decay: float = 1e-4
-    vae_patience: int = 10
-    vae_min_delta: float = 1e-4
+    vae_lr: float = 4e-4
+    vae_kl_weight: float = 0.60
+    vae_dropout: float = 0.10
+    vae_weight_decay: float = 2e-4
+    vae_patience: int = 4
+    vae_min_delta: float = 5e-4
 
-    # LSTM-AE — reduced hidden width, stronger recurrent dropout.
-    lstm_hidden: int = 32
+    # LSTM-AE — smaller recurrent state and earlier plateau stop.
+    lstm_hidden: int = 28
     lstm_layers: int = 2
     lstm_seq_len: int = 10
-    lstm_epochs: int = 60
+    lstm_epochs: int = 55
     lstm_batch: int = 256
-    lstm_lr: float = 7e-4
-    lstm_dropout: float = 0.30
-    lstm_weight_decay: float = 1e-4
-    lstm_patience: int = 8
-    lstm_min_delta: float = 1e-4
+    lstm_lr: float = 5e-4
+    lstm_dropout: float = 0.35
+    lstm_weight_decay: float = 2e-4
+    lstm_patience: int = 5
+    lstm_min_delta: float = 5e-4
 
-    # Temporal-attention AE — smaller transformer with stronger dropout.
-    tat_hidden: int = 48
+    # Temporal-attention AE — reduced width + stronger dropout.
+    tat_hidden: int = 40
     tat_heads: int = 4
     tat_layers: int = 1
-    tat_dropout: float = 0.25
-    tat_epochs: int = 80
+    tat_dropout: float = 0.30
+    tat_epochs: int = 65
     tat_batch: int = 256
-    tat_lr: float = 3e-4
-    tat_weight_decay: float = 1e-4
-    tat_patience: int = 8
-    tat_min_delta: float = 1e-4
+    tat_lr: float = 2e-4
+    tat_weight_decay: float = 2e-4
+    tat_patience: int = 5
+    tat_min_delta: float = 5e-4
 
     # Supervised models — constrain tree capacity to reduce memorisation.
     rf_trees: int = 450
-    rf_max_depth: int = 18
-    rf_min_samples_leaf: int = 2
-    rf_min_samples_split: int = 4
+    rf_max_depth: int = 16
+    rf_min_samples_leaf: int = 3
+    rf_min_samples_split: int = 6
     rf_max_features: str = "sqrt"
-    rf_max_samples: float = 0.90
+    rf_max_samples: float = 0.85
 
     gb_estimators: int = 260
     gb_lr: float = 0.035
@@ -415,7 +416,7 @@ class Autoencoder(nn.Module):
         prev = input_dim
         for h in hidden_dims:
             enc.extend([
-                nn.Linear(prev, h), nn.ReLU(), nn.BatchNorm1d(h),
+                nn.Linear(prev, h), nn.ReLU(), nn.LayerNorm(h),
                 nn.Dropout(dropout),
             ])
             prev = h
@@ -425,7 +426,7 @@ class Autoencoder(nn.Module):
         prev = latent_dim
         for h in reversed(hidden_dims):
             dec.extend([
-                nn.Linear(prev, h), nn.ReLU(), nn.BatchNorm1d(h),
+                nn.Linear(prev, h), nn.ReLU(), nn.LayerNorm(h),
                 nn.Dropout(dropout),
             ])
             prev = h
@@ -443,7 +444,7 @@ class VAE(nn.Module):
         prev = input_dim
         for h in hidden_dims:
             enc.extend([
-                nn.Linear(prev, h), nn.ReLU(), nn.BatchNorm1d(h),
+                nn.Linear(prev, h), nn.ReLU(), nn.LayerNorm(h),
                 nn.Dropout(dropout),
             ])
             prev = h
@@ -454,7 +455,7 @@ class VAE(nn.Module):
         prev = latent_dim
         for h in reversed(hidden_dims):
             dec.extend([
-                nn.Linear(prev, h), nn.ReLU(), nn.BatchNorm1d(h),
+                nn.Linear(prev, h), nn.ReLU(), nn.LayerNorm(h),
                 nn.Dropout(dropout),
             ])
             prev = h
@@ -527,17 +528,19 @@ class AETrainer:
         self.device = device or ("cuda" if torch.cuda.is_available()
                                  else "cpu")
         self.model.to(self.device)
-        self.train_losses, self.val_losses = [], []
+        self.train_losses, self.train_eval_losses, self.val_losses = [], [], []
 
     def fit(self, X_train, X_val=None):
         opt = torch.optim.AdamW(self.model.parameters(), lr=self.lr,
                                 weight_decay=self.weight_decay)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, self.epochs)
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode="min", factor=0.5, patience=2,
+            threshold=self.min_delta, min_lr=max(self.lr * 0.05, 1e-6))
         crit = nn.MSELoss()
         dl = DataLoader(TensorDataset(torch.FloatTensor(X_train)),
                         batch_size=self.batch_size, shuffle=True)
         best_val, pat_cnt, best_state = float("inf"), 0, None
-        self.train_losses, self.val_losses = [], []
+        self.train_losses, self.train_eval_losses, self.val_losses = [], [], []
 
         for epoch in range(self.epochs):
             self.model.train()
@@ -553,12 +556,17 @@ class AETrainer:
                 opt.step()
                 tl += loss.item() * len(batch)
             tl /= len(X_train)
-            sched.step()
             self.train_losses.append(tl)
 
+            # Compare train and validation in identical eval mode.  The old
+            # curve mixed dropout-active training loss with dropout-disabled
+            # validation loss, which overstated/obscured generalization gaps.
+            train_eval = self._eval(X_train, crit)
+            self.train_eval_losses.append(train_eval)
             if X_val is not None:
                 vl = self._eval(X_val, crit)
                 self.val_losses.append(vl)
+                sched.step(vl)
                 if vl < best_val - self.min_delta:
                     best_val, pat_cnt = vl, 0
                     best_state = {k: v.cpu().clone()
@@ -567,7 +575,7 @@ class AETrainer:
                     pat_cnt += 1
                 if (epoch + 1) % 20 == 0:
                     print(f"  Epoch {epoch+1}/{self.epochs}: "
-                          f"train={tl:.6f}, val={vl:.6f}")
+                          f"train_eval={train_eval:.6f}, val={vl:.6f}")
                 if pat_cnt >= self.patience:
                     print(f"  Early stopping at epoch {epoch+1}")
                     break
@@ -578,9 +586,17 @@ class AETrainer:
 
     def _eval(self, X, crit):
         self.model.eval()
+        total, count = 0.0, 0
+        dl = DataLoader(
+            TensorDataset(torch.FloatTensor(X)),
+            batch_size=max(self.batch_size, 1024), shuffle=False)
         with torch.no_grad():
-            t = torch.FloatTensor(X).to(self.device)
-            return crit(self.model(t), t).item()
+            for (batch,) in dl:
+                batch = batch.to(self.device)
+                loss = crit(self.model(batch), batch)
+                total += loss.item() * len(batch)
+                count += len(batch)
+        return total / max(count, 1)
 
     def reconstruction_error(self, X):
         self.model.eval()
@@ -605,7 +621,7 @@ class VAETrainer:
         self.device = device or ("cuda" if torch.cuda.is_available()
                                  else "cpu")
         self.model.to(self.device)
-        self.train_losses, self.val_losses = [], []
+        self.train_losses, self.train_eval_losses, self.val_losses = [], [], []
 
     def _loss(self, x, x_hat, mu, logvar):
         recon = F.mse_loss(x_hat, x)
@@ -615,11 +631,13 @@ class VAETrainer:
     def fit(self, X_train, X_val=None):
         opt = torch.optim.AdamW(self.model.parameters(), lr=self.lr,
                                 weight_decay=self.weight_decay)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, self.epochs)
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode="min", factor=0.5, patience=2,
+            threshold=self.min_delta, min_lr=max(self.lr * 0.05, 1e-6))
         dl = DataLoader(TensorDataset(torch.FloatTensor(X_train)),
                         batch_size=self.batch_size, shuffle=True)
         best_val, pat_cnt, best_state = float("inf"), 0, None
-        self.train_losses, self.val_losses = [], []
+        self.train_losses, self.train_eval_losses, self.val_losses = [], [], []
 
         for epoch in range(self.epochs):
             self.model.train()
@@ -636,12 +654,14 @@ class VAETrainer:
                 opt.step()
                 tl += loss.item() * len(batch)
             tl /= len(X_train)
-            sched.step()
             self.train_losses.append(tl)
 
+            train_eval = self._eval_val(X_train)
+            self.train_eval_losses.append(train_eval)
             if X_val is not None:
                 vl = self._eval_val(X_val)
                 self.val_losses.append(vl)
+                sched.step(vl)
                 if vl < best_val - self.min_delta:
                     best_val, pat_cnt = vl, 0
                     best_state = {k: v.cpu().clone()
@@ -650,7 +670,7 @@ class VAETrainer:
                     pat_cnt += 1
                 if (epoch + 1) % 20 == 0:
                     print(f"  Epoch {epoch+1}/{self.epochs}: "
-                          f"train={tl:.6f}, val={vl:.6f}")
+                          f"train_eval={train_eval:.6f}, val={vl:.6f}")
                 if pat_cnt >= self.patience:
                     print(f"  Early stopping at epoch {epoch+1}")
                     break
@@ -660,15 +680,22 @@ class VAETrainer:
             self.model.to(self.device)
 
     def _eval_val(self, X):
-        # Validation is deterministic: use the posterior mean instead of
-        # resampling z on every early-stopping check.
+        # Deterministic and batched evaluation: use posterior mean instead of
+        # resampling z, and avoid version/device-dependent full-tensor peaks.
         self.model.eval()
+        total, count = 0.0, 0
+        dl = DataLoader(
+            TensorDataset(torch.FloatTensor(X)),
+            batch_size=max(self.batch_size, 1024), shuffle=False)
         with torch.no_grad():
-            t = torch.FloatTensor(X).to(self.device)
-            mu, lv = self.model.encode(t)
-            x_hat = self.model.decoder(mu)
-            loss, _, _ = self._loss(t, x_hat, mu, lv)
-        return loss.item()
+            for (batch,) in dl:
+                batch = batch.to(self.device)
+                mu, lv = self.model.encode(batch)
+                x_hat = self.model.decoder(mu)
+                loss, _, _ = self._loss(batch, x_hat, mu, lv)
+                total += loss.item() * len(batch)
+                count += len(batch)
+        return total / max(count, 1)
 
     def anomaly_score(self, X):
         # Deterministic score improves reproducibility and avoids adding
@@ -831,8 +858,8 @@ class SpecializedDetector:
         n_val = max(1, int(round(0.10 * len(X))))
         val_idx, fit_idx = perm[:n_val], perm[n_val:]
         trainer = AETrainer(
-            ae, 7e-4, 80, 256, patience=8,
-            weight_decay=1e-4, min_delta=1e-4)
+            ae, 4e-4, 60, 256, patience=4,
+            weight_decay=2e-4, min_delta=5e-4)
         trainer.fit(X[fit_idx], X[val_idx])
         self.models["ae"], self.models["ae_trainer"] = ae, trainer
 
@@ -1112,8 +1139,23 @@ class ResultsVisualizer:
 #  MAIN TRAINING & EVALUATION
 # ══════════════════════════════════════════════════════════
 
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except TypeError:
+        torch.use_deterministic_algorithms(True)
+
+
 def main():
     config = TrainingConfig()
+    set_global_seed(config.seed)
     os.makedirs(config.results_dir, exist_ok=True)
     os.makedirs(config.plots_dir, exist_ok=True)
 
@@ -1531,7 +1573,9 @@ def main():
 
     for name, trainer in trainers_dict.items():
         vals = np.asarray(trainer.val_losses, dtype=float)
-        trs = np.asarray(trainer.train_losses, dtype=float)
+        trs = np.asarray(
+            getattr(trainer, "train_eval_losses", trainer.train_losses),
+            dtype=float)
         if len(vals) and len(trs):
             best_idx = int(np.argmin(vals))
             overfit_diag["neural"][name] = {
@@ -1648,6 +1692,8 @@ def main():
     for name, trainer in trainers_dict.items():
         trainers_history[name] = {
             "train_losses": list(trainer.train_losses),
+            "train_eval_losses": list(
+                getattr(trainer, "train_eval_losses", trainer.train_losses)),
             "val_losses": list(trainer.val_losses),
         }
 
