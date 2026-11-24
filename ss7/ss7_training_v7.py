@@ -656,10 +656,26 @@ def run_zoo(M: Matrices, cfg: TrainingConfig, seed: int,
         except Exception as e:                                  # pragma: no cover
             rows.append({"model": name, "family": fam, "error": repr(e)})
             continue
-        r = score_row(name, fam, M, np.asarray(s_va, float),
-                      np.asarray(s_te, float), cfg)
+        s_va = np.asarray(s_va, float)
+        s_te = np.asarray(s_te, float)
+        r = score_row(name, fam, M, s_va, s_te, cfg)
         r["fit_seconds"] = round(time.time() - t0, 2)
         rows.append(r)
+
+        # Optional raw-score export for reproducible ROC/PR plotting.  Enabled
+        # only for the primary full-zoo call (not ablations) to avoid overwrites.
+        score_dir = os.environ.get("SNS_SCORE_EXPORT_DIR")
+        if score_dir and only is None:
+            os.makedirs(score_dir, exist_ok=True)
+            pd.DataFrame({
+                "model": name,
+                "family": fam,
+                "label": M.yte,
+                "score": s_te,
+                "nid": M.te["nid"].to_numpy(),
+                "t": M.te["t"].to_numpy(),
+                "episode_id": M.te["episode_id"].to_numpy(),
+            }).to_csv(os.path.join(score_dir, f"scores_{name}.csv"), index=False)
     return pd.DataFrame(rows)
 
 
