@@ -70,7 +70,12 @@ def main():
         mod=HighLossAlertTICD(prior,mode,bins,.993).fit(train).calibrate(validation,budget)
         models[name]=mod
         ref={str(m):compact(metrics(mod,df)) for m,df in validation.items()}
-        assert max(v["FPR"] for v in ref.values())<=budget+1e-12
+        for m,df in validation.items():
+            actual=mod.predict_masks(df)["confirmed_alert"]
+            expected=mod.normalized(df)>mod.scale
+            assert np.array_equal(actual,expected), f"Calibration/inference decision mismatch: {name}, loss={m}"
+        print("HIGHLOSS_CANDIDATE_REFERENCE",json.dumps({"candidate":name,"budget":budget,"scale":mod.scale,"fpr_by_loss":{k:v["FPR"] for k,v in ref.items()}}),flush=True)
+        assert max(v["FPR"] for v in ref.values())<=budget+1e-12, f"Normal FPR exceeds target: {name}, {ref}"
         refs[name]=ref
     print("HIGHLOSS_CALIBRATION",json.dumps({"normal_train_rows":len(train),"normal_validation_rows":sum(map(len,validation.values())),
         "reference_max_fpr":{k:max(v["FPR"] for v in r.values()) for k,r in refs.items()} }),flush=True)
