@@ -114,6 +114,14 @@ VOLUME_FEATURES = [
     "pcap_log_burst_mass",
     "pcap_log_pdus_per_active_command",
 ]
+WIRE_FEATURES = PROFILE_FEATURES + [
+    "pcap_log_total_pdus",
+    "pcap_log_duration_s",
+    "pcap_log_rate_hz",
+    "pcap_log_burst_mass",
+    "pcap_log_pdus_per_active_command",
+]
+
 TEMPORAL_FEATURES = [
     "pcap_iat_cv",
     "pcap_bin_count_cv",
@@ -576,49 +584,62 @@ def protocol_archetype_frame(
 
     def sample(profile_name: str, mix: Dict[str, float], attack: bool):
         if attack:
-            total = float(np.exp(rng.uniform(np.log(30.0), np.log(2500.0))))
+            s6a_total = float(
+                np.exp(rng.uniform(np.log(30.0), np.log(2500.0))))
             duration = float(np.exp(rng.uniform(np.log(0.05), np.log(12.0))))
         else:
-            total = float(np.exp(rng.uniform(np.log(2.0), np.log(48.0))))
+            s6a_total = float(
+                np.exp(rng.uniform(np.log(2.0), np.log(48.0))))
             # Orange calibration includes very short benign request/answer
             # exchanges, so benign timing must span sub-millisecond-scale
             # captures as well as ordinary paced procedures.
             duration = float(np.exp(
                 rng.uniform(np.log(0.001), np.log(40.0))))
 
+        # Diameter peer/session overhead (CER/CEA, DWR/DWA, DPR/DPA) is a
+        # protocol property, not a Kelly-specific observation.  It dominates
+        # short benign captures but is amortised by floods.  Model it broadly
+        # rather than assuming every decoded PDU belongs to S6a.
+        base_overhead = float(rng.integers(2, 9))
+        base_active_commands = int(rng.integers(1, 4))
+
         # Add broad overlap so the classifier cannot reduce the task to one
         # hard count cutoff.
         if rng.random() < 0.15:
             if attack:
-                total *= rng.uniform(0.35, 0.75)
+                s6a_total *= rng.uniform(0.35, 0.75)
                 duration *= rng.uniform(1.5, 4.0)
             else:
-                total *= rng.uniform(1.5, 3.0)
+                s6a_total *= rng.uniform(1.5, 3.0)
                 duration *= rng.uniform(0.3, 0.8)
 
+        total = s6a_total + base_overhead
         mix_vec = np.array([mix.get(c, 0.0) for c in S6A_COMMANDS], dtype=float)
         concentration = 80.0 if not attack else 55.0
         alpha = np.maximum(mix_vec * concentration, 0.02)
         noisy = rng.dirichlet(alpha)
         s6a_cmd = {
-            c: float(noisy[i] * total) for i, c in enumerate(S6A_COMMANDS)
+            c: float(noisy[i] * s6a_total) for i, c in enumerate(S6A_COMMANDS)
         }
         gx_cmd = {c: 0.0 for c in GX_COMMANDS}
         out = _normalised_command_features(
-            total, total, 0.0, 0.0, 0.0, 0.0, s6a_cmd, gx_cmd)
+            total, s6a_total, 0.0, 0.0, 0.0, base_overhead,
+            s6a_cmd, gx_cmd)
 
         rate = total / max(duration, 1e-3)
         count_cv = float(rng.uniform(0.10, 0.95 if attack else 0.75))
         peak = float(rng.uniform(1.05, 3.0 if attack else 2.2))
+        active_s6a = int(np.sum(noisy > 0.02))
+        active_commands = active_s6a + base_active_commands
         out.update({
             "pcap_log_total_pdus": float(np.log1p(total)),
             "pcap_log_duration_s": float(np.log1p(duration)),
             "pcap_log_rate_hz": float(np.log1p(rate)),
-            "pcap_s6a_fraction": 1.0,
+            "pcap_s6a_fraction": s6a_total / max(total, 1.0),
             "pcap_gx_fraction": 0.0,
             "pcap_rx_fraction": 0.0,
             "pcap_s13_fraction": 0.0,
-            "pcap_other_fraction": 0.0,
+            "pcap_other_fraction": base_overhead / max(total, 1.0),
             "pcap_iat_cv": float(rng.uniform(0.15, 1.4)),
             "pcap_bin_count_cv": count_cv,
             "pcap_bin_count_peak_ratio": peak,
@@ -628,13 +649,12 @@ def protocol_archetype_frame(
             "pcap_air_ratio_std": float(rng.uniform(0.0, 0.18)),
             "pcap_ulr_ratio_std": float(rng.uniform(0.0, 0.18)),
             "pcap_active_command_fraction": float(
-                np.sum(noisy > 0.02) /
+                active_commands /
                 (len(S6A_COMMANDS) + len(GX_COMMANDS) + 4)
             ),
-            "pcap_log_burst_mass": float(
-                np.log1p(total * rate)),
+            "pcap_log_burst_mass": float(np.log1p(total * rate)),
             "pcap_log_pdus_per_active_command": float(
-                np.log1p(total / max(np.sum(noisy > 0.02), 1))),
+                np.log1p(total / max(active_commands, 1))),
             "is_anomaly": int(attack),
             "attack_type": profile_name if attack else "none",
             "protocol_archetype": profile_name,
@@ -731,12 +751,14 @@ def train_detector(
         "profile": PROFILE_FEATURES,
         "volume": VOLUME_FEATURES,
         "temporal": TEMPORAL_FEATURES,
+        "wire_protocol": WIRE_FEATURES,
         "full_rf": PCAP_NATIVE_FEATURES,
     }
     branches = {
         "profile": _make_hgb(101),
         "volume": _make_hgb(102),
         "temporal": _make_hgb(103),
+        "wire_protocol": _make_hgb(106),
         "full_rf": RandomForestClassifier(
             n_estimators=500,
             class_weight="balanced_subsample",
@@ -753,7 +775,16 @@ def train_detector(
 
     y_train = train["is_anomaly"].astype(int).to_numpy()
     for name, model in branches.items():
-        model.fit(train[branch_features[name]], y_train)
+        if name == "wire_protocol":
+            # Train the wire expert only on protocol-valid low-volume
+            # archetypes.  Other branches retain simulator-scale evidence.
+            mask = train["protocol_archetype"].notna().to_numpy()
+            model.fit(
+                train.loc[mask, branch_features[name]],
+                y_train[mask],
+            )
+        else:
+            model.fit(train[branch_features[name]], y_train)
 
     temp_bundle = {
         "branches": branches,
