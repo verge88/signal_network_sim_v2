@@ -776,7 +776,7 @@ def train_detector(
             "protocol_attack_archetypes": [
                 "AIR flood", "ULR flood", "mixed flood", "tracking burst"
             ],
-            "holdout_specific_parameters_used": false,
+            "holdout_specific_parameters_used": False,
         },
         "threshold": threshold,
         "threshold_method": bundle["threshold_method"],
