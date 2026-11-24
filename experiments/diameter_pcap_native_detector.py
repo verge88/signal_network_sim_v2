@@ -1445,101 +1445,53 @@ def score_with_local_calibration(
     )
     guard_score = float(max(rate_guard_score, burst_guard_score))
 
-    if channel_scores:
-        burst_timing_score = float(
-            channel_scores["burst_timing"]["local_score"])
-        protocol_shape_score = float(
-            channel_scores["protocol_shape"]["local_score"])
-
-        # A burst alarm needs two independent benign-only conditions:
-        # (1) multivariate burst/timing nonconformity and
-        # (2) rate or burst-mass above every benign conformal capture.
-        # This rejects sparse short benign sessions that can be geometrically
-        # unusual but are not high-rate signalling bursts.
-        confirmed_burst_score = float(
-            min(burst_timing_score, guard_score))
-        final_score = float(max(
-            protocol_shape_score, confirmed_burst_score))
-
-        if protocol_shape_score >= confirmed_burst_score:
-            trigger_channel = "protocol_shape"
-            strongest = channel_scores["protocol_shape"]
-        else:
-            trigger_channel = "confirmed_burst_timing"
-            strongest = channel_scores["burst_timing"]
-
-        return {
-            "nn_distance": float(strongest["nn_distance"]),
-            "envelope_distance": float(strongest["envelope_distance"]),
-            "local_score": final_score,
-            "shape_score": protocol_shape_score,
-            "burst_timing_score": burst_timing_score,
-            "confirmed_burst_score": confirmed_burst_score,
-            "rate_guard_score": float(rate_guard_score),
-            "burst_guard_score": float(burst_guard_score),
-            "guard_score": guard_score,
-            "matched_benign_profile": (
-                min(profile_scores.items(),
-                    key=lambda kv: kv[1]["local_score"])[0]
-                if profile_scores else "global"
-            ),
-            "global_local_score": float(global_score["local_score"]),
-            "profile_scores": {
-                str(k): float(v["local_score"])
-                for k, v in profile_scores.items()
-            },
-            "channel_scores": {
-                str(k): float(v["local_score"])
-                for k, v in channel_scores.items()
-            },
-            "trigger_channel": trigger_channel,
-        }
-
+    # Channel manifolds are retained as explanatory diagnostics, but do not
+    # directly trigger the hard decision. In development they overreacted to
+    # legitimate short benign procedures. The hard shape decision therefore
+    # uses the closest known benign procedure as a rescue path, while the
+    # independent benign-only rate/burst envelope remains able to detect
+    # high-intensity wire behaviour.
     if profile_scores:
         best_name, best = min(
             profile_scores.items(), key=lambda kv: kv[1]["local_score"])
-        # Profile matching can rescue a benign procedure that is globally
-        # unusual, while the independent benign-only burst guard retains
-        # sensitivity to short high-rate attacks.
         shape_score = float(min(
             global_score["local_score"], best["local_score"]))
-        final_score = float(max(shape_score, guard_score))
-        return {
-            "nn_distance": float(best["nn_distance"]),
-            "envelope_distance": float(best["envelope_distance"]),
-            "local_score": final_score,
-            "shape_score": shape_score,
-            "rate_guard_score": float(rate_guard_score),
-            "burst_guard_score": float(burst_guard_score),
-            "guard_score": guard_score,
-            "matched_benign_profile": str(best_name),
-            "global_local_score": float(global_score["local_score"]),
-            "profile_scores": {
-                str(k): float(v["local_score"])
-                for k, v in profile_scores.items()
-            },
-            "channel_scores": {},
-            "trigger_channel": (
-                "rate_burst_guard" if guard_score > shape_score
-                else "profile_fallback"
-            ),
-        }
+        matched_name = str(best_name)
+        nn_distance = float(best["nn_distance"])
+        envelope_distance = float(best["envelope_distance"])
+    else:
+        shape_score = float(global_score["local_score"])
+        matched_name = "global"
+        nn_distance = float(global_score["nn_distance"])
+        envelope_distance = float(global_score["envelope_distance"])
 
-    shape_score = float(global_score["local_score"])
     final_score = float(max(shape_score, guard_score))
+    strongest_channel = (
+        max(channel_scores.items(), key=lambda kv: kv[1]["local_score"])[0]
+        if channel_scores else "none"
+    )
     return {
-        **global_score,
+        "nn_distance": nn_distance,
+        "envelope_distance": envelope_distance,
         "local_score": final_score,
         "shape_score": shape_score,
         "rate_guard_score": float(rate_guard_score),
         "burst_guard_score": float(burst_guard_score),
         "guard_score": guard_score,
-        "matched_benign_profile": "global",
-        "global_local_score": shape_score,
-        "profile_scores": {},
-        "channel_scores": {},
+        "matched_benign_profile": matched_name,
+        "global_local_score": float(global_score["local_score"]),
+        "profile_scores": {
+            str(k): float(v["local_score"])
+            for k, v in profile_scores.items()
+        },
+        "channel_scores": {
+            str(k): float(v["local_score"])
+            for k, v in channel_scores.items()
+        },
+        "strongest_diagnostic_channel": str(strongest_channel),
         "trigger_channel": (
-            "rate_burst_guard" if guard_score > shape_score else "global"
+            "rate_burst_guard" if guard_score > shape_score
+            else "benign_profile_rescued_shape"
         ),
     }
 
