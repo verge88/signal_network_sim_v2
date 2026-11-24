@@ -132,6 +132,14 @@ class TrainingConfig:
     seq_len: int = 24
     seq_epochs: int = 60
     ocsvm_max_train: int = 6000
+
+    # Episode counts are explicit experimental-design parameters.  The canonical
+    # generator defaults to only six compromise episodes, which is too small for
+    # stable train/validation/test incident metrics in a dissertation experiment.
+    n_compromise: int = 6
+    n_normal: int = 18
+    n_ext: int = 6
+
     quick: bool = False
 
     # воспроизводимость / артефакты
@@ -767,7 +775,10 @@ def detectability_curve(cfg: TrainingConfig, rates=(0.0, 0.05, 0.15, 0.4, 1.0, 2
         sc = cfg.sim_config()
         sc.seed = cfg.seed + 4000 + int(h * 1000)
         df, _, _ = build_dataset(sc, episodes_kw=dict(
-            n_compromise=10, n_normal=6, n_ext=4, force_hidden=float(h),
+            n_compromise=max(10, cfg.n_compromise // 2),
+            n_normal=max(12, cfg.n_normal // 2),
+            n_ext=max(4, cfg.n_ext // 2),
+            force_hidden=float(h),
             soph=Sophistication(cfg.sophistication)))
         cols = resolve_feature_columns(df, base)
         tr, va, te = blocked_split(df, sc, RngBook(sc.seed)["split"])
@@ -787,7 +798,11 @@ def sophistication_sweep(cfg: TrainingConfig) -> pd.DataFrame:
     for s in Sophistication:
         sc = cfg.sim_config()
         sc.seed = cfg.seed + 7000 + hash(s.value) % 1000
-        df, _, _ = build_dataset(sc, episodes_kw=dict(soph=s))
+        df, _, _ = build_dataset(sc, episodes_kw=dict(
+            n_compromise=cfg.n_compromise,
+            n_normal=cfg.n_normal,
+            n_ext=cfg.n_ext,
+            soph=s))
         cols = resolve_feature_columns(df, base)
         tr, va, te = blocked_split(df, sc, RngBook(sc.seed)["split"])
         if te["label"].sum() < 10:
@@ -803,7 +818,11 @@ def sophistication_sweep(cfg: TrainingConfig) -> pd.DataFrame:
 def lomfo_ablation(cfg: TrainingConfig) -> pd.DataFrame:
     """Leave-one-masking-family-out: обучение без семейства, тест на нём."""
     sc = cfg.sim_config()
-    df, _, _ = build_dataset(sc)
+    df, _, _ = build_dataset(sc, episodes_kw=dict(
+        n_compromise=cfg.n_compromise,
+        n_normal=cfg.n_normal,
+        n_ext=cfg.n_ext,
+        soph=Sophistication(cfg.sophistication)))
     cols = resolve_feature_columns(df, FEATURE_SETS[cfg.feature_set])
     rng = RngBook(sc.seed)["split"]
     out = []
@@ -883,6 +902,9 @@ def multiseed(cfg: TrainingConfig, seeds: Sequence[int],
         c = TrainingConfig(**{**asdict(cfg), "seed": int(s)})
         sc = c.sim_config()
         df, _, _ = build_dataset(sc, episodes_kw=dict(
+            n_compromise=cfg.n_compromise,
+            n_normal=cfg.n_normal,
+            n_ext=cfg.n_ext,
             soph=Sophistication(cfg.sophistication)))
         cols = resolve_feature_columns(df, base)
         tr, va, te = blocked_split(df, sc, RngBook(sc.seed)["split"])
@@ -935,6 +957,9 @@ def load_or_build(cfg: TrainingConfig) -> pd.DataFrame:
     if cfg.use_cache and os.path.exists(path):
         return pd.read_parquet(path)
     df, _, _ = build_dataset(sc, episodes_kw=dict(
+        n_compromise=cfg.n_compromise,
+        n_normal=cfg.n_normal,
+        n_ext=cfg.n_ext,
         soph=Sophistication(cfg.sophistication)))
     if cfg.use_cache:
         os.makedirs(cfg.cache_dir, exist_ok=True)
@@ -960,6 +985,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     choices=[s.value for s in Sophistication])
     ap.add_argument("--alerts-per-day", type=float, default=20.0)
     ap.add_argument("--op-prevalence", type=float, default=1e-4)
+    ap.add_argument("--n-compromise", type=int, default=6)
+    ap.add_argument("--n-normal", type=int, default=18)
+    ap.add_argument("--n-ext", type=int, default=6)
     ap.add_argument("--seeds", type=int, nargs="*", default=None)
     ap.add_argument("--metric", default="episode_recall")
     ap.add_argument("--ablations", action="store_true")
@@ -988,6 +1016,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          feature_set=a.feature_set,
                          alerts_per_day=a.alerts_per_day,
                          op_prevalence=a.op_prevalence,
+                         n_compromise=a.n_compromise,
+                         n_normal=a.n_normal,
+                         n_ext=a.n_ext,
                          use_torch=not a.no_torch, use_cache=not a.no_cache,
                          quick=a.quick, data_path=a.data, out_dir=a.out_dir)
     run_dir = os.path.join(cfg.out_dir, f"{cfg.fingerprint()}_seed{cfg.seed}")
@@ -1012,6 +1043,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             json.dump(cols, stream, ensure_ascii=False, indent=2)
     print(f"    окон={len(df)}  узлов={df['nid'].nunique()}  "
           f"доля аномальных окон={df['label'].mean():.5f}  признаков={len(cols)}")
+    print(f"    эпизоды: compromise={cfg.n_compromise} normal={cfg.n_normal} ext={cfg.n_ext}")
     print(f"    guard: OK, все {len(cols)} столбцов выводятся из реестра")
 
     print("\n[2] Нулевой тест (шлюз)")
@@ -1046,9 +1078,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("\n[3] Блочный сплит")
     sc = cfg.sim_config()
     tr, va, te = blocked_split(df, sc, RngBook(sc.seed)["split"])
+    n_test_episodes = int(te.loc[te.episode_id >= 0, "episode_id"].nunique())
     print(f"    train={len(tr)} val={len(va)} test={len(te)}  "
           f"purge={sc.feat_window + sc.z_window} интервалов  "
-          f"эпизодов в тесте={te.loc[te.episode_id >= 0, 'episode_id'].nunique()}")
+          f"эпизодов в тесте={n_test_episodes}")
+    if cfg.n_compromise >= 20 and n_test_episodes < 5:
+        raise RuntimeError(
+            f"Недостаточно attack-эпизодов в test: {n_test_episodes}; "
+            "для полного эксперимента требуется >=5. Увеличьте days/episode count."
+        )
     M = prepare_matrices(tr, va, te, cols)
 
     print("\n[4] Зоопарк моделей (порог из val по бюджету тревог)")
