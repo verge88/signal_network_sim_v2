@@ -172,8 +172,8 @@ jobs:
           {
             echo "Source implementation: KellyKinyama/diameter-protocol"
             echo "Pinned commit: ${KELLY_COMMIT}"
-            echo "Role: untouched final external attack/benign holdout"
-            echo "Not used in training, feature selection, domain randomisation, or thresholds"
+            echo "Role: external development-domain regression set after first inspection"
+            echo "Not used for numeric threshold fitting; after first inspection it is not claimed as final untouched confirmation"
           } > kelly_attack_holdout/PROVENANCE.txt
 
       - name: Score attack holdout with PCAP-native model
@@ -247,7 +247,7 @@ jobs:
               "hybrid_external_f1": float(f1_score(y, h, zero_division=0)),
               "hybrid_external_balanced_accuracy": float(
                   balanced_accuracy_score(y, h)),
-              "holdout_role": "Kelly untouched final external holdout",
+              "holdout_role": "Kelly external development-domain regression set; not final untouched confirmation",
           }
           Path("results_pcap_native_hybrid").mkdir(exist_ok=True)
           merged.to_csv(
