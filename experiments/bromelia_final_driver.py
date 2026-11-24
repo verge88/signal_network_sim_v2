@@ -14,7 +14,7 @@ import argparse
 import socket
 import time
 
-from bromelia import DiameterAnswer, DiameterMessage, DiameterRequest
+from bromelia.base import DiameterAnswer, DiameterMessage, DiameterRequest
 
 APP_BASE = 0
 APP_S6A = 16777251
