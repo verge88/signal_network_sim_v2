@@ -237,7 +237,7 @@ jobs:
           path: |
             results_bromelia_frozen_repair/
             frozen/results_bromelia_model/deployment_calibration.json
-            frozen/bromelia_test_pcaps/manifest.csv
+            frozen/bromelia_test_pcaps/
             frozen/original_test_SHA256SUMS.txt
             frozen/repaired_test_SHA256SUMS.txt
             bromelia_repair_server.log
