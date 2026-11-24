@@ -1237,8 +1237,42 @@ def fit_local_benign_calibration(
     nn_threshold = _conformal_upper(nn_scores, target_fpr)
     envelope_threshold = _conformal_upper(env_scores, target_fpr)
 
+    profiles = {}
+    if has_roles and "scenario" in manifest.columns:
+        scenarios = manifest["scenario"].astype(str).to_numpy()
+        for scenario in sorted(set(scenarios)):
+            p_ref_mask = ref_mask & (scenarios == scenario)
+            p_cal_mask = cal_mask & (scenarios == scenario)
+            Xp_ref = Xall[p_ref_mask]
+            Xp_cal = Xall[p_cal_mask]
+            # Profile-specific manifolds are deliberately modest in size; the
+            # global manifold remains available when a deployment cannot supply
+            # enough examples for a procedure family.
+            if len(Xp_ref) < 4 or len(Xp_cal) < 6:
+                continue
+            p_scale = _robust_scale_matrix(Xp_ref)
+            p_nn = np.asarray(
+                [_nn_distance(x, Xp_ref, p_scale) for x in Xp_cal],
+                dtype=float)
+            p_env = np.asarray(
+                [_envelope_distance(x, Xp_ref, p_scale) for x in Xp_cal],
+                dtype=float)
+            profiles[str(scenario)] = {
+                "reference_vectors": Xp_ref.tolist(),
+                "scale": p_scale.tolist(),
+                "reference_capture_count": int(len(Xp_ref)),
+                "conformal_capture_count": int(len(Xp_cal)),
+                "nn_threshold": float(_conformal_upper(p_nn, target_fpr)),
+                "envelope_threshold": float(
+                    _conformal_upper(p_env, target_fpr)),
+                "calibration_nn_scores": p_nn.tolist(),
+                "calibration_envelope_scores": p_env.tolist(),
+            }
+        if profiles:
+            method = "deployment_benign_mixture_manifold_split_conformal"
+
     return {
-        "version": 2,
+        "version": 3,
         "method": method,
         "scope": (
             "deployment-local one-class detector; frozen global model; "
@@ -1256,6 +1290,7 @@ def fit_local_benign_calibration(
         "envelope_threshold": float(envelope_threshold),
         "calibration_nn_scores": nn_scores.tolist(),
         "calibration_envelope_scores": env_scores.tolist(),
+        "profiles": profiles,
         "captures": meta_rows,
     }
 
@@ -1269,11 +1304,42 @@ def score_with_local_calibration(
     x = np.asarray([float(feat[c]) for c in names], dtype=float)
     ref = np.asarray(calibration["reference_vectors"], dtype=float)
     scale = np.asarray(calibration["scale"], dtype=float)
-    return _local_reference_score(
+    global_score = _local_reference_score(
         x, ref, scale,
         float(calibration["nn_threshold"]),
         float(calibration["envelope_threshold"]),
     )
+
+    profile_scores = {}
+    for name, profile in calibration.get("profiles", {}).items():
+        p_ref = np.asarray(profile["reference_vectors"], dtype=float)
+        p_scale = np.asarray(profile["scale"], dtype=float)
+        profile_scores[name] = _local_reference_score(
+            x, p_ref, p_scale,
+            float(profile["nn_threshold"]),
+            float(profile["envelope_threshold"]),
+        )
+
+    if profile_scores:
+        best_name, best = min(
+            profile_scores.items(), key=lambda kv: kv[1]["local_score"])
+        return {
+            "nn_distance": float(best["nn_distance"]),
+            "envelope_distance": float(best["envelope_distance"]),
+            "local_score": float(best["local_score"]),
+            "matched_benign_profile": str(best_name),
+            "global_local_score": float(global_score["local_score"]),
+            "profile_scores": {
+                str(k): float(v["local_score"])
+                for k, v in profile_scores.items()
+            },
+        }
+    return {
+        **global_score,
+        "matched_benign_profile": "global",
+        "global_local_score": float(global_score["local_score"]),
+        "profile_scores": {},
+    }
 
 
 def calibrate_local_cli(args) -> None:
@@ -1448,6 +1514,7 @@ def score_cli(args) -> None:
         if local_meta.get("method") not in {
                 "deployment_benign_local_manifold_conformal",
                 "deployment_benign_local_manifold_split_conformal",
+                "deployment_benign_mixture_manifold_split_conformal",
         }:
             raise SystemExit("Unsupported local calibration method")
 
@@ -1481,6 +1548,8 @@ def score_cli(args) -> None:
                 "reference_capture_count"),
             "conformal_capture_count": local_meta.get(
                 "conformal_capture_count"),
+            "profile_count": len(local_meta.get("profiles", {})),
+            "profile_names": sorted(local_meta.get("profiles", {}).keys()),
             "nn_threshold": local_meta["nn_threshold"],
             "envelope_threshold": local_meta["envelope_threshold"],
         }
