@@ -6,6 +6,7 @@ on:
       - ss7-full-all-models-run-20261124
     paths:
       - "ss7/ss7_training_v7.py"
+      - "ss7/run_full_model_experiment.py"
       - "ss7/fix.py"
       - "ss7/plot_full_model_experiment.py"
       - ".github/workflows/ss7-full-all-models-experiment.yml"
@@ -39,20 +40,20 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Train full model zoo
-        env:
-          SNS_EXPORT_DIR: results/full_all_models/seed_${{ matrix.seed }}/export
+      - name: Train full high-coverage model zoo
         run: |
           set -o pipefail
           mkdir -p results/full_all_models/seed_${{ matrix.seed }}
-          python -m ss7.ss7_training_v7 \
+          python -m ss7.run_full_model_experiment \
             --seed ${{ matrix.seed }} \
-            --days 2.0 \
+            --days 4.0 \
+            --n-compromise 24 \
+            --n-normal 48 \
+            --n-ext 8 \
             --feature-set OWN+INV \
-            --soph adaptive \
             --alerts-per-day 20 \
             --op-prevalence 0.0001 \
-            --out-dir results/full_all_models/seed_${{ matrix.seed }} \
+            --output-dir results/full_all_models/seed_${{ matrix.seed }} \
             2>&1 | tee results/full_all_models/seed_${{ matrix.seed }}/training.log
 
       - name: Upload seed results
@@ -84,24 +85,21 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Train all models and run all diagnostics
-        env:
-          SNS_EXPORT_DIR: results/full_all_models/seed_42/export
+      - name: Train high-coverage zoo and run diagnostics
         run: |
           set -o pipefail
           mkdir -p results/full_all_models/seed_42
-          python -m ss7.ss7_training_v7 \
+          python -m ss7.run_full_model_experiment \
             --seed 42 \
-            --days 2.0 \
+            --days 4.0 \
+            --n-compromise 24 \
+            --n-normal 48 \
+            --n-ext 8 \
             --feature-set OWN+INV \
-            --soph adaptive \
             --alerts-per-day 20 \
             --op-prevalence 0.0001 \
-            --ablations \
-            --lomfo \
-            --curve \
-            --soph-sweep \
-            --out-dir results/full_all_models/seed_42 \
+            --diagnostics \
+            --output-dir results/full_all_models/seed_42 \
             2>&1 | tee results/full_all_models/seed_42/training_and_diagnostics.log
 
       - name: Upload diagnostics results
