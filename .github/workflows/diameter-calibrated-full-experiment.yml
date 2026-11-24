@@ -63,7 +63,7 @@ jobs:
 
       - name: Compile calibration and experiment code
         run: |
-          python -m py_compile             diameter/diameter_sim_v1.py             diameter/diameter_training_v1.py             experiments/diameter_calibrate_from_independent_pcaps.py             experiments/diameter_verify_calibrated_dataset.py             experiments/diameter_external_pcap_validation.py             experiments/diameter_external_attack_validation.py
+          python -m py_compile             diameter/diameter_sim_v1.py             diameter/diameter_training_v1.py             diameter/diameter_generate_plots.py             experiments/diameter_calibrate_from_independent_pcaps.py             experiments/diameter_verify_calibrated_dataset.py             experiments/diameter_external_pcap_validation.py             experiments/diameter_external_attack_validation.py
 
       - name: Download independent calibration corpus from Orange diafuzzer
         run: |
@@ -218,6 +218,17 @@ jobs:
       - name: Revalidate calibrated portable branch on attack holdout
         run: |
           python experiments/diameter_external_attack_validation.py             --manifest holdout_attack_pcaps/manifest.csv             --pcap-dir holdout_attack_pcaps             --out-dir results_calibrated_external_attacks
+
+      - name: Generate publication plots from saved experiment artifacts
+        run: |
+          python diameter/diameter_generate_plots.py \
+            --results-dir results_diameter_v1 \
+            --out-dir results_diameter_v1/publication_plots \
+            --external-benign results_calibrated_external_benign/summary.json \
+            --external-attacks results_calibrated_external_attacks/summary.json \
+            --calibration-verification results_diameter_calibration/calibrated_dataset_verification.json
+          test -s results_diameter_v1/publication_plots/figures_manifest.json
+          find results_diameter_v1/publication_plots -maxdepth 1 -type f -print | sort
 
       - name: Stop independent HSS
         if: always()
