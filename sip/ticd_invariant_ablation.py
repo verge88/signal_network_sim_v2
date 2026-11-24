@@ -13,8 +13,8 @@ import copy
 import numpy as np
 from ticd_causal_ack import HISTORY_FIELDS
 
-VARIANTS=("full","no_i1_instant","no_i1_history","no_i1_all","no_i2",
-          "no_d_instant","no_d_zone","no_d_history","no_d_all","no_ack_all",
+VARIANTS=("full","no_i1_deficit","no_i1_excess","no_i1_instant","no_i1_history","no_i1_all","no_i2",
+          "no_d_instant","no_d_zone","no_d_history","no_d_all","no_ack_all","no_all_invariants",
           "no_gateway_weight","no_warning_load","no_warning_scope","no_warning")
 
 class InvariantAblationTICD:
@@ -46,25 +46,29 @@ class InvariantAblationTICD:
         if v in ("full","no_gateway_weight","no_warning_load","no_warning_scope","no_warning"):
             return df
         x=df.copy()
-        if v in ("no_i1_instant","no_i1_all"):
+        if v in ("no_i1_deficit","no_i1_excess"):
+            signed=1.-x["obs_dialog_completion_ratio"]-x["obs_dangling_dialog_ratio"]
+            mask=(signed>0) if v=="no_i1_deficit" else (signed<0)
+            x.loc[mask,["obs_dialog_completion_ratio","obs_dangling_dialog_ratio"]]=.5
+        if v in ("no_i1_instant","no_i1_all","no_all_invariants"):
             # Set complement, preserving reported completion and independent
             # precomputed mismatch. Avoid floating point cancellation by
             # setting both report fractions to exact binary halves.
             x["obs_dialog_completion_ratio"]=.5
             x["obs_dangling_dialog_ratio"]=.5
-        if v in ("no_i1_history","no_i1_all"):
+        if v in ("no_i1_history","no_i1_all","no_all_invariants"):
             x["mean_txn_state_consistency_error"]=0.
-        if v=="no_i1_all":
+        if v in ("no_i1_all","no_all_invariants"):
             x["dev_txn_consistency_vs_zone"]=0.
             x["cu_txn_state_consistency_error"]=0.
-        if v in ("no_i2","no_ack_all"):
+        if v in ("no_i2","no_ack_all","no_all_invariants"):
             x["cu_ack_closure_mismatch"]=0.
             if "dev_ack_mismatch_vs_zone" in x:x["dev_ack_mismatch_vs_zone"]=0.
-        if v in ("no_d_instant","no_d_all","no_ack_all"):
+        if v in ("no_d_instant","no_d_all","no_ack_all","no_all_invariants"):
             x["master_ack_shortfall_adjusted"]=0.
-        if v in ("no_d_zone","no_d_all","no_ack_all"):
+        if v in ("no_d_zone","no_d_all","no_ack_all","no_all_invariants"):
             x["dev_master_ack_shortfall_vs_zone"]=0.
-        if v in ("no_d_history","no_d_all","no_ack_all"):
+        if v in ("no_d_history","no_d_all","no_ack_all","no_all_invariants"):
             for c in HISTORY_FIELDS.values():x[c]=0.
             x["zone_causal_median"]=0.
         return x
@@ -121,4 +125,4 @@ class InvariantAblationTICD:
                 "gateway_weight":self.model.gateway_weight,"warning_mode":self.zonal.mode,
                 "warning_roles":self.role.eligible_roles,
                 "zone_D_active_in_full":self.physical.physical_mode=="physical_zone",
-                "all_ack_removed":self.variant=="no_ack_all"}
+                "all_ack_removed":self.variant in ("no_ack_all","no_all_invariants")}
