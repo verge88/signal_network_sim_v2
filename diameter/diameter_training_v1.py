@@ -1904,7 +1904,8 @@ def main():
         "importances": importances,
         "feature_cols": pipeline.feature_cols,
         "cascade_s1": cascade.predict_proba_stage1(X_test),
-        "cascade_s2": cascade.predict_proba_stage2(X_test_comp),
+        "cascade_s2": cascade.predict_proba_stage2(
+            X_test_comp, X_test),
         "cascade_comb": casc_pt,
         "trainers_history": trainers_history,
     }
