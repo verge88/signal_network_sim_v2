@@ -5,6 +5,7 @@ on:
     branches:
       - improve/diameter-pcap-native-transfer
       - main
+      - fix/diameter-pcap-native-primary-gate
     paths:
       - "experiments/diameter_pcap_native_detector.py"
       - "experiments/diameter_external_pcap_validation.py"
