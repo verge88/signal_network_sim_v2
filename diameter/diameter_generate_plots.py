@@ -451,8 +451,16 @@ def plot_external_validation(summary: dict, out_dir: Path) -> List[str]:
 def plot_calibration(verification: dict, out_dir: Path) -> List[str]:
     if not verification:
         return []
-    target = verification.get("target_s6a_distribution") or verification.get("target_s6a")
-    simulated = verification.get("simulated_benign_s6a_distribution") or verification.get("simulated_benign_s6a")
+    target = (
+        verification.get("target_s6a_command_dist")
+        or verification.get("target_s6a_distribution")
+        or verification.get("target_s6a")
+    )
+    simulated = (
+        verification.get("simulated_benign_s6a_command_dist")
+        or verification.get("simulated_benign_s6a_distribution")
+        or verification.get("simulated_benign_s6a")
+    )
     if not isinstance(target, dict) or not isinstance(simulated, dict):
         return []
     keys = [k for k in target.keys() if k in simulated]
