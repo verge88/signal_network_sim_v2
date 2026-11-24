@@ -1,0 +1,62 @@
+name: Diagnose SIP TICD warning false-positive sources
+on:
+  push:
+    branches: [research/ticd-warning-root-cause]
+    paths:
+      - '.github/workflows/sip-ticd-warning-diagnostics.yml'
+      - 'experiments/diagnose_ticd_warning_sources.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  explain-warning-errors:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install runtime and compile
+        run: |
+          python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+          python -m compileall -q experiments/diagnose_ticd_warning_sources.py
+      - name: Recover frozen zonal TICD decisions
+        run: |
+          set -euo pipefail
+          mkdir -p previous
+          gh run download 45252940147 --repo "${{ github.repository }}" --name sip-ticd-zonal-warning-model-and-evaluation --dir previous
+          saved="$(find previous -type f -name ticd_zone_context_model.pkl -print -quit)"
+          test -n "$saved"
+          echo "PREVIOUS_DIR=$(dirname "$saved")" >> "$GITHUB_ENV"
+      - name: Explain FWR for old heldout sets without fitting to labels
+        run: |
+          python -m experiments.diagnose_ticd_warning_sources --prior "$PREVIOUS_DIR" --out results_warning_root_cause
+      - name: Confirm diagnostic-only labels never used to refit detector
+        run: |
+          python - <<'PY'
+          import json
+          p=json.load(open('results_warning_root_cause/warning_source_diagnosis.json'))
+          assert p['frozen_decisions'] and not p['real_network_validation']
+          assert 'DIAGNOSTIC' in p['data_reuse']
+          for name,pair in p['results'].items():
+              assert pair['baseline']['false_alarms']==pair['zone_selected']['false_alarms']
+              for model in pair.values():
+                  types=model['tables']['node_type']
+                  assert sum(x['false_warning_rows'] for x in types)==model['false_warnings']
+          print('WARNING_SOURCE_DIAGNOSTICS_VERIFIED')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-ticd-warning-source-diagnostics
+          path: results_warning_root_cause/
+          if-no-files-found: warn
+          retention-days: 30
