@@ -217,6 +217,46 @@ def two_stage_score(inv_scores: np.ndarray, suppressor_scores: np.ndarray) -> np
     return np.asarray(inv_scores, float) * np.asarray(suppressor_scores, float)
 
 
+def robust_temporal_threshold(
+    frame: pd.DataFrame,
+    score: np.ndarray,
+    target_fpr: float,
+    n_blocks: int = 4,
+    min_negatives: int = 100,
+) -> Tuple[float, dict]:
+    """Conservative validation-only threshold robust to temporal score drift.
+
+    The ordinary global q(1-FPR) is computed first. Validation timestamps are then
+    split into ordered blocks; each sufficiently populated block gets its own q99.
+    The deployed threshold is the maximum of the global and block thresholds.
+    No test data participate.
+    """
+    y = frame["label"].to_numpy(int)
+    neg = y == 0
+    global_thr = fpr_threshold(np.asarray(score)[neg], target_fpr)
+    times = np.array(sorted(frame["t"].unique()))
+    block_thresholds = []
+    block_rows = []
+    for block in np.array_split(times, n_blocks):
+        if len(block) == 0:
+            continue
+        mask = neg & frame["t"].isin(set(block)).to_numpy()
+        n = int(mask.sum())
+        if n < min_negatives:
+            continue
+        thr = fpr_threshold(np.asarray(score)[mask], target_fpr)
+        block_thresholds.append(float(thr))
+        block_rows.append(n)
+    threshold = float(max([global_thr] + block_thresholds))
+    return threshold, {
+        "global_threshold": float(global_thr),
+        "block_thresholds": block_thresholds,
+        "block_negative_rows": block_rows,
+        "selected_threshold": threshold,
+        "raised_above_global": bool(threshold > global_thr),
+    }
+
+
 def development_models(
     seeds: Sequence[int],
     days: float,
@@ -330,11 +370,24 @@ def evaluate_seed(
     thr_full = fpr_threshold(full_va[neg_va], TARGET_FPR)
     thr_rule = fpr_threshold(rule_va[neg_va], TARGET_FPR)
 
+    robust_inv, robust_inv_diag = robust_temporal_threshold(
+        va, inv_va, TARGET_FPR
+    )
+    robust_two, robust_two_diag = robust_temporal_threshold(
+        va, two_va, TARGET_FPR
+    )
+    robust_full, robust_full_diag = robust_temporal_threshold(
+        va, full_va, TARGET_FPR
+    )
+
     scores = {
         "rule_baseline": (rule_te, thr_rule),
         "inv_rf": (inv_te, thr_inv),
+        "inv_rf_robust": (inv_te, robust_inv),
         "full_rf": (full_te, thr_full),
+        "full_rf_robust": (full_te, robust_full),
         "two_stage_inv_own": (two_te, thr_two),
+        "two_stage_inv_own_robust": (two_te, robust_two),
     }
 
     metrics = []
@@ -372,6 +425,11 @@ def evaluate_seed(
         "rates": rate_rows,
         "families": family_rows,
         "two_stage_validation_threshold": float(thr_two),
+        "robust_threshold_diagnostics": {
+            "inv_rf": robust_inv_diag,
+            "full_rf": robust_full_diag,
+            "two_stage_inv_own": robust_two_diag,
+        },
         "frozen_metric": frozen_metric,
         "split_audit": split_audit,
         "rows": {
@@ -481,6 +539,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             "rows": result["rows"],
             "split_audit": result["split_audit"],
             "local_two_stage_threshold": result["two_stage_validation_threshold"],
+            "robust_threshold_diagnostics": result["robust_threshold_diagnostics"],
         })
 
     metrics_df = pd.DataFrame(all_metrics)
@@ -510,6 +569,10 @@ def main(argv: Iterable[str] | None = None) -> int:
                 "local validation-negative q99 on each target realization"
             ),
             "target_fpr": TARGET_FPR,
+            "robust_threshold_policy": (
+                "max(global validation q99, q99 in each of four ordered "
+                "validation-time blocks); validation only"
+            ),
             "test_used_for_tuning": False,
         },
         "development": {
