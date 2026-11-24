@@ -1,6 +1,13 @@
 name: Diameter independent aiodiameter final confirmation
 
 on:
+  push:
+    branches:
+      - improve/diameter-pcap-native-transfer
+    paths:
+      - "experiments/diameter_pcap_native_detector.py"
+      - "experiments/aiodiameter_final_driver.py"
+      - ".github/workflows/diameter-aiodiameter-final-confirmation.yml"
   workflow_dispatch:
 
 permissions:
