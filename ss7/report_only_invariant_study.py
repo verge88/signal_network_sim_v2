@@ -108,11 +108,22 @@ def train(out):
     y=d.label.to_numpy();w=np.where(y==1,(y==0).sum()/max(1,(y==1).sum()),1.)
     models={}
     for name,base in specs.items():
-        c=columns(d,base)
+        candidates=columns(d,base)
+        X=d[candidates].replace([np.inf,-np.inf],np.nan)
+        # Fit the preprocessing exclusively on development data, uniformly
+        # for all variants. HGB binning cannot handle all-missing/constant
+        # coordinates reliably in the pinned library version.
+        med=X.median()
+        X=X.fillna(med).fillna(0.)
+        c=[x for x in candidates if X[x].nunique(dropna=False)>1]
+        if not c:
+            raise ValueError(f"No varying development features: {name}")
+        dropped=[x for x in candidates if x not in c]
+        print("preprocessing",name,"dropped",dropped,flush=True)
         model=HistGradientBoostingClassifier(max_iter=300,learning_rate=.06,
            min_samples_leaf=20,l2_regularization=1.,early_stopping=False,
-           random_state=8300).fit(d[c],y,sample_weight=w)
-        models[name]=(c,model)
+           random_state=8300).fit(X[c],y,sample_weight=w)
+        models[name]=(c,med[c].fillna(0.),model)
         print("fitted",name,len(c),flush=True)
     joblib.dump(models,out/"models.joblib",compress=3)
     (out/"manifest.json").write_text(json.dumps({"dev":DEV,"test":TEST,
@@ -140,9 +151,11 @@ def test(seed,out,modelpath):
     y=d.label.to_numpy(int);neg=y==0
     rows=[];events=[]
     models=joblib.load(modelpath)
-    for name,(cols,model) in models.items():
-        sv=model.predict_proba(cal[cols])[:,1]
-        st=model.predict_proba(d[cols])[:,1]
+    for name,(cols,med,model) in models.items():
+        cv=cal[cols].replace([np.inf,-np.inf],np.nan).fillna(med)
+        tv=d[cols].replace([np.inf,-np.inf],np.nan).fillna(med)
+        sv=model.predict_proba(cv)[:,1]
+        st=model.predict_proba(tv)[:,1]
         thr=float(np.quantile(sv,1-alpha,method="higher"))
         fire=st>thr
         hits=[]
