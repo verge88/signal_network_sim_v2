@@ -1,0 +1,212 @@
+name: Diameter Bromelia expanded benign local one-class development
+
+on:
+  push:
+    branches:
+      - improve/diameter-pcap-native-transfer
+    paths:
+      - "experiments/diameter_pcap_native_detector.py"
+      - ".github/workflows/diameter-bromelia-local-oneclass-expanded-dev.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  expanded-local-dev:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      BROMELIA_COMMIT: 5af44c25de159733133e4f09b90c1852d95d5120
+
+    steps:
+      - name: Checkout detector
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update -o Acquire::Retries=3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark tcpdump netcat-openbsd
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn pyyaml
+
+      - name: Download frozen model artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: diameter-bromelia-local-calibration-confirmation
+          path: original
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 45435041027
+
+      - name: Download repaired development test PCAPs
+        uses: actions/download-artifact@v4
+        with:
+          name: diameter-bromelia-frozen-repaired-confirmation
+          path: repaired
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 45438122161
+
+      - name: Checkout pinned Bromelia
+        run: |
+          git clone https://github.com/heimiricmr/bromelia.git external_bromelia
+          git -C external_bromelia checkout "${BROMELIA_COMMIT}"
+          cp experiments/bromelia_final_driver.py external_bromelia/frozen_validation_driver.py
+          (
+            cd external_bromelia
+            python -m py_compile frozen_validation_driver.py bromelia/base.py
+          )
+
+      - name: Start Bromelia server
+        run: |
+          (
+            cd external_bromelia
+            python frozen_validation_driver.py --mode server --host 127.0.0.1 --port 3868
+          ) > bromelia_expanded_server.log 2>&1 &
+          echo $! > /tmp/bromelia_expanded_server.pid
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 3868; then exit 0; fi
+            sleep 1
+          done
+          cat bromelia_expanded_server.log
+          exit 1
+
+      - name: Capture 64 benign PCAPs with source-separated roles
+        run: |
+          set -euo pipefail
+          mkdir -p bromelia_expanded_benign
+          manifest="bromelia_expanded_benign/manifest.csv"
+          echo "capture,expected_label,scenario,role" > "${manifest}"
+
+          capture_case() {
+            name="$1"; scenario="$2"; count="$3"; delay="$4"; role="$5"
+            out="$GITHUB_WORKSPACE/bromelia_expanded_benign/${name}"
+            sudo tcpdump -i lo -U -s 0 -B 4096 -w "${out}" 'tcp port 3868' >"/tmp/${name}.log" 2>&1 &
+            cap_pid=$!
+            for i in {1..40}; do
+              grep -q "listening on lo" "/tmp/${name}.log" && break
+              sleep 0.05
+            done
+            sleep 0.15
+            (
+              cd external_bromelia
+              python frozen_validation_driver.py --mode client --host 127.0.0.1 --port 3868 \
+                --scenario "${scenario}" --count "${count}" --delay-ms "${delay}"
+            )
+            sleep 0.20
+            sudo kill -INT "${cap_pid}" || true
+            wait "${cap_pid}" || true
+            sudo chown "$USER":"$USER" "${out}"
+            test "$(stat -c%s "${out}")" -gt 24
+            echo "${name},benign,${scenario},${role}" >> "${manifest}"
+          }
+
+          # 24 manifold-reference captures: 8 per benign procedure.
+          for i in {1..8}; do
+            count=$((1 + (i - 1) % 8))
+            delay=$((120 + 35 * i))
+            capture_case "ref_attach_${i}.pcap" benign_attach "${count}" "${delay}" reference
+            capture_case "ref_reauth_${i}.pcap" benign_reauth "${count}" "$((delay + 40))" reference
+            capture_case "ref_update_${i}.pcap" benign_update "${count}" "$((delay + 80))" reference
+          done
+
+          # 40 independent conformal captures. These are benign only and are
+          # never used to fit the reference manifold.
+          for i in {1..14}; do
+            count=$((1 + (i * 3) % 10))
+            delay=$((105 + 27 * i))
+            capture_case "cal_attach_${i}.pcap" benign_attach "${count}" "${delay}" calibration
+          done
+          for i in {1..13}; do
+            count=$((1 + (i * 5) % 11))
+            delay=$((135 + 31 * i))
+            capture_case "cal_reauth_${i}.pcap" benign_reauth "${count}" "${delay}" calibration
+          done
+          for i in {1..13}; do
+            count=$((1 + (i * 7) % 11))
+            delay=$((155 + 29 * i))
+            capture_case "cal_update_${i}.pcap" benign_update "${count}" "${delay}" calibration
+          done
+
+          python - <<'PY'
+          import pandas as pd
+          m = pd.read_csv("bromelia_expanded_benign/manifest.csv")
+          assert len(m) == 64
+          assert (m["role"] == "reference").sum() == 24
+          assert (m["role"] == "calibration").sum() == 40
+          assert set(m["expected_label"]) == {"benign"}
+          print(m.groupby(["role", "scenario"]).size())
+          PY
+
+      - name: Fit split-conformal local one-class calibration
+        run: |
+          python experiments/diameter_pcap_native_detector.py calibrate-local \
+            --model original/results_bromelia_model/pcap_native_bundle.pkl \
+            --manifest bromelia_expanded_benign/manifest.csv \
+            --pcap-dir bromelia_expanded_benign \
+            --target-fpr 0.05 \
+            --out results_bromelia_split_local.json
+
+      - name: Score fixed Bromelia development test
+        run: |
+          python experiments/diameter_pcap_native_detector.py score \
+            --model original/results_bromelia_model/pcap_native_bundle.pkl \
+            --local-calibration results_bromelia_split_local.json \
+            --manifest repaired/frozen/bromelia_test_pcaps/manifest.csv \
+            --pcap-dir repaired/frozen/bromelia_test_pcaps \
+            --out-dir results_bromelia_split_dev
+
+      - name: Summarize
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          s = json.loads(Path(
+              "results_bromelia_split_dev/summary.json").read_text())
+          c = json.loads(Path(
+              "results_bromelia_split_local.json").read_text())
+          out = {
+              "role": "development-domain only; Bromelia attack labels were previously inspected",
+              "calibration_method": c["method"],
+              "reference_capture_count": c["reference_capture_count"],
+              "conformal_capture_count": c["conformal_capture_count"],
+              "target_fpr": c["target_fpr"],
+              "attack_tpr": s["external_attack_tpr"],
+              "benign_fpr": s["external_benign_fpr"],
+              "f1": s["external_f1"],
+              "balanced_accuracy": s["external_balanced_accuracy"],
+              "per_scenario": s["per_scenario"],
+          }
+          Path("bromelia_split_local_comparison.json").write_text(
+              json.dumps(out, indent=2), encoding="utf-8")
+          print(json.dumps(out, indent=2))
+          PY
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f /tmp/bromelia_expanded_server.pid ]; then
+            kill "$(cat /tmp/bromelia_expanded_server.pid)" || true
+          fi
+          tail -n 80 bromelia_expanded_server.log || true
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diameter-bromelia-expanded-local-oneclass-development
+          path: |
+            bromelia_expanded_benign/
+            results_bromelia_split_local.json
+            results_bromelia_split_dev/
+            bromelia_split_local_comparison.json
+            bromelia_expanded_server.log
+          if-no-files-found: warn
