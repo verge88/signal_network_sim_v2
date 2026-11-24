@@ -170,17 +170,19 @@ def main():
         print("LOSS_HELDOUT",json.dumps({"cohort":k,**{n:short(v) for n,v in heldout[k].items()}}),flush=True)
     paired={}
     for family,ks in (("primary",NATIVE),("audit",NATIVE+POLICY)):
-        for metric,cohorts in (("confirmed_recall",ks),("confirmed_recall_weak",WEAK),("confirmed_recall_shift",SHIFT_ATTACK),
-              ("confirmed_alert_FPR",ks),("false_warning_rate",ks)):
-            key=metric.removesuffix("_weak").removesuffix("_shift")
-            ds=[]
-            for k in cohorts:
-                u=per_seed[k]["selected_"+family];v=per_seed[k]["recalibrated_"+family]
-                ds.append(np.array([a[key]-b[key] for a,b in zip(u,v)]))
-            d=np.concatenate(ds);rng=np.random.default_rng(7611)
-            boot=np.mean([g[rng.integers(0,len(g),(4000,len(g)))].mean(1) for g in ds],axis=0)
-            paired[family+"_"+metric]={"delta_selected_minus_recalibrated":float(d.mean()),"n":len(d),
-               "CI95":np.quantile(boot,[.025,.975]).tolist(),"p_unadjusted":1. if np.all(d==0) else float(wilcoxon(d).pvalue)}
+        for contrast,left,right,items in (
+          ("selected_vs_control","selected_","recalibrated_",(("confirmed_recall",ks),("confirmed_recall_weak",WEAK),("confirmed_recall_shift",SHIFT_ATTACK),("confirmed_alert_FPR",ks),("false_warning_rate",ks))),
+          ("probe_vs_cu","probe_","cu_",(("confirmed_recall",ks),("confirmed_recall_weak",WEAK),("confirmed_recall_shift",SHIFT_ATTACK),("confirmed_alert_FPR",ks)))):
+            for metric,cohorts in items:
+                key=metric.removesuffix("_weak").removesuffix("_shift")
+                ds=[]
+                for k in cohorts:
+                    u=per_seed[k][left+family];v=per_seed[k][right+family]
+                    ds.append(np.array([a[key]-b[key] for a,b in zip(u,v)]))
+                d=np.concatenate(ds);rng=np.random.default_rng(7611)
+                boot=np.mean([g[rng.integers(0,len(g),(4000,len(g)))].mean(1) for g in ds],axis=0)
+                paired[contrast+"_"+family+"_"+metric]={"delta":float(d.mean()),"n":len(d),
+                   "CI95":np.quantile(boot,[.025,.975]).tolist(),"p_unadjusted":1. if np.all(d==0) else float(wilcoxon(d).pvalue)}
     prev=0.
     for i,v in enumerate(sorted(paired.values(),key=lambda x:x["p_unadjusted"])):
         prev=max(prev,min(1.,(len(paired)-i)*v["p_unadjusted"]));v["p_holm"]=prev
@@ -206,7 +208,7 @@ def main():
         "development":dev,"development_by_seed":dev_per,"heldout":heldout,"per_seed":per_seed,"summary":summary,
         "diagnostics":diagnostics,"paired":paired,"master_audit":masters,"metadata":meta,
         "prefix_causality":True,"label_and_batch_invariance":True,"observational_equivalence_verified":True,
-        "old_count_preserved":True,"actual_transport_loss_not_observed":True,"independent_commissioning":True,"commissioning_runs":len(seeds),"missing_probe_fallback_verified":True,"probe_is_synthetic":True,"probe_load_not_modeled":True,"paired_comparator":"recalibrated_no_loss_channel","reload_verified":True}
+        "old_count_preserved":True,"actual_transport_loss_not_observed":True,"independent_commissioning":True,"commissioning_runs":len(seeds),"missing_probe_fallback_verified":True,"probe_is_synthetic":True,"probe_load_not_modeled":True,"paired_comparator":"selected_vs_recalibrated_no_loss_channel_and_probe_vs_cu","reload_verified":True}
     (a.out/"independent_loss_report.json").write_text(json.dumps(report,indent=2)+"\n")
     print("LOSS_FINAL",json.dumps({"main_runs":len(seeds),"test_runs":180,"commissioning_runs":len(seeds),"candidates":len(candidates),
          "selected":report["selected"],"paired":paired,"audits_passed":True}),flush=True)
