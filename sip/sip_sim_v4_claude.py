@@ -894,6 +894,11 @@ class SIPControlUnitEngine:
             "cu_txn_state_consistency_error": txn_state_consistency_error,
             # I2 (Вариант A): транзитный ACK-инвариант — главный рычаг
             "cu_dcr_transit": dcr_transit if cu_delivered else 1.0,
+            # Export the same independent transit counters that already form
+            # dcr_transit, with the same observation availability semantics.
+            # No additional oracle information or random draw is introduced.
+            "cu_n_200_transit": int(n_200_tr) if cu_delivered else 0,
+            "cu_n_ack_transit": int(n_ack_tr) if cu_delivered else 0,
             "cu_ack_closure_mismatch": ack_closure_mismatch if cu_delivered else 0.0,
 
         }
