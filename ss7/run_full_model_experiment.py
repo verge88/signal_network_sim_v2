@@ -23,6 +23,7 @@ from typing import Iterable, Sequence
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import precision_recall_curve, roc_curve
 
 from ss7.fix import (
     FEATURE_SETS,
@@ -109,6 +110,93 @@ def run_all_models_with_scores(M, cfg: TrainingConfig, seed: int):
         pd.concat(score_frames, ignore_index=True, sort=False)
         if score_frames else pd.DataFrame()
     )
+
+
+def compact_score_diagnostics(test_scores: pd.DataFrame, seed: int):
+    roc_rows = []
+    pr_rows = []
+    event_rows = []
+    family_rows = []
+    rate_rows = []
+    quantile_rows = []
+    qgrid = np.linspace(0.0, 1.0, 101)
+
+    def grouped_episode_metrics(d: pd.DataFrame, group_col: str):
+        rows = []
+        pos = d[(d["label"] == 1) & d[group_col].notna()]
+        for group, g in pos.groupby(group_col):
+            episodes = []
+            ttd = []
+            for eid, e in g.groupby("episode_id"):
+                e = e.sort_values("t")
+                fire = e["fire"].to_numpy(int)
+                run = 0
+                hit = None
+                for i, v in enumerate(fire):
+                    run = run + 1 if v else 0
+                    if run >= 3:
+                        hit = i - 2
+                        break
+                episodes.append(hit is not None)
+                if hit is not None:
+                    ttd.append(int(e["t"].iloc[hit] - e["t"].iloc[0]))
+            rows.append({
+                "group": str(group),
+                "episodes": int(len(episodes)),
+                "episode_recall": float(np.mean(episodes)) if episodes else np.nan,
+                "median_ttd_intervals": float(np.median(ttd)) if ttd else np.nan,
+            })
+        return rows
+
+    for model, d in test_scores.groupby("model"):
+        finite = np.isfinite(d["score"].to_numpy(float))
+        y = d["label"].to_numpy(int)[finite]
+        s = d["score"].to_numpy(float)[finite]
+        if len(np.unique(y)) > 1:
+            fpr, tpr, thr = roc_curve(y, s)
+            for i in np.linspace(0, len(fpr) - 1, min(500, len(fpr))).astype(int):
+                roc_rows.append({
+                    "seed": int(seed), "model": model, "fpr": float(fpr[i]),
+                    "tpr": float(tpr[i]), "threshold": float(thr[i]),
+                })
+            precision, recall, pr_thr = precision_recall_curve(y, s)
+            for i in np.linspace(0, len(precision) - 1, min(500, len(precision))).astype(int):
+                pr_rows.append({
+                    "seed": int(seed), "model": model,
+                    "precision": float(precision[i]), "recall": float(recall[i]),
+                    "threshold": float(pr_thr[i]) if i < len(pr_thr) else np.nan,
+                })
+
+        neg = d["label"].to_numpy(int) == 0
+        for event, g in d.loc[neg].groupby("normal_event_truth"):
+            event_rows.append({
+                "seed": int(seed), "model": model, "normal_event": str(event),
+                "windows": int(len(g)), "alerts": int(g["fire"].sum()),
+                "window_fpr": float(g["fire"].mean()),
+            })
+
+        for row in grouped_episode_metrics(d, "episode_family_truth"):
+            family_rows.append({"seed": int(seed), "model": model, **row})
+        for row in grouped_episode_metrics(d, "episode_hidden_rate"):
+            rate_rows.append({"seed": int(seed), "model": model, **row})
+
+        for label_value, g in d[np.isfinite(d["score"])].groupby("label"):
+            values = g["score"].to_numpy(float)
+            qs = np.quantile(values, qgrid)
+            for q, val in zip(qgrid, qs):
+                quantile_rows.append({
+                    "seed": int(seed), "model": model, "label": int(label_value),
+                    "quantile": float(q), "score": float(val),
+                })
+
+    return {
+        "roc": pd.DataFrame(roc_rows),
+        "pr": pd.DataFrame(pr_rows),
+        "normal_events": pd.DataFrame(event_rows),
+        "families": pd.DataFrame(family_rows),
+        "hidden_rates": pd.DataFrame(rate_rows),
+        "score_quantiles": pd.DataFrame(quantile_rows),
+    }
 
 
 def lomfo_high_coverage(df: pd.DataFrame, cfg: TrainingConfig) -> pd.DataFrame:
@@ -273,7 +361,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     models.to_csv(outdir / "models.csv", index=False)
     if not test_scores.empty:
         test_scores["seed"] = int(args.seed)
-        test_scores.to_csv(outdir / "test_scores.csv.gz", index=False, compression="gzip")
+        compact = compact_score_diagnostics(test_scores, int(args.seed))
+        compact["roc"].to_csv(outdir / "roc_curve.csv", index=False)
+        compact["pr"].to_csv(outdir / "pr_curve.csv", index=False)
+        compact["normal_events"].to_csv(outdir / "normal_event_fpr.csv", index=False)
+        compact["families"].to_csv(outdir / "recall_by_mask_family.csv", index=False)
+        compact["hidden_rates"].to_csv(outdir / "recall_by_hidden_rate.csv", index=False)
+        compact["score_quantiles"].to_csv(outdir / "score_quantiles.csv", index=False)
 
     manifest = {
         "seed": int(args.seed),
