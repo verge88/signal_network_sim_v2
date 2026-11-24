@@ -1,0 +1,58 @@
+name: Diameter joint conformal calibration development
+on:
+  push:
+    branches: [improve/diameter-joint-conformal]
+    paths:
+      - experiments/diameter_joint_conformal.py
+      - tests/test_diameter_joint_conformal.py
+      - .github/workflows/diameter-joint-conformal.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  joint-calibration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify finite-sample decision
+        run: python -m unittest tests.test_diameter_joint_conformal -v
+      - name: Install dependencies
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark
+          python -m pip install numpy pandas scipy networkx scikit-learn pyyaml
+      - uses: actions/download-artifact@v4
+        with:
+          name: diameter-bromelia-local-calibration-confirmation
+          path: frozen_model
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 45435041027
+      - uses: actions/download-artifact@v4
+        with:
+          name: diameter-jdiameter-untouched-final-confirmation
+          path: historical_jdiameter
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 45446315366
+      - name: Replay archived captures as development data only
+        run: |
+          python experiments/diameter_joint_conformal.py \
+            --model frozen_model/results_bromelia_model/pcap_native_bundle.pkl \
+            --calibration-dir historical_jdiameter/jdiameter_benign_calibration \
+            --evaluation-dir historical_jdiameter/jdiameter_final_test \
+            --historical-predictions historical_jdiameter/results_jdiameter_final/predictions.csv \
+            --out results_joint --alpha 0.05
+      - name: Publish development results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diameter-joint-conformal-development
+          path: results_joint/
+          if-no-files-found: warn
