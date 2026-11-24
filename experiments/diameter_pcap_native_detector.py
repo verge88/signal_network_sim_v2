@@ -1164,15 +1164,20 @@ def fit_local_benign_calibration(
 
     rows = []
     meta_rows = []
+    roles = []
+    has_roles = "role" in manifest.columns
     for rec in manifest.to_dict("records"):
         path = pcap_dir / str(rec["capture"])
         feat = pcap_to_native_features(path)
         rows.append([float(feat[c]) for c in LOCAL_ADAPT_FEATURES])
 
+        role = str(rec.get("role", "")).lower().strip()
+        roles.append(role)
         X = pd.DataFrame([{k: feat[k] for k in PCAP_NATIVE_FEATURES}])
         branch_scores = _branch_scores(bundle, X)[0]
         meta_rows.append({
             "capture": str(rec["capture"]),
+            "role": role if has_roles else "loo_calibration",
             "decoded_pdus": int(feat["_decoded_pdus"]),
             "duration_s": float(feat["_duration_s"]),
             "frozen_supervised_score": float(_meta_score(bundle, X)[0]),
@@ -1183,38 +1188,74 @@ def fit_local_benign_calibration(
             },
         })
 
-    Xcal = np.asarray(rows, dtype=float)
-    scale = _robust_scale_matrix(Xcal)
+    Xall = np.asarray(rows, dtype=float)
 
-    loo_nn = []
-    loo_env = []
-    for i in range(len(Xcal)):
-        ref = np.delete(Xcal, i, axis=0)
-        loo_nn.append(_nn_distance(Xcal[i], ref, scale))
-        loo_env.append(_envelope_distance(Xcal[i], ref, scale))
-    loo_nn = np.asarray(loo_nn, dtype=float)
-    loo_env = np.asarray(loo_env, dtype=float)
+    if has_roles:
+        allowed = {"reference", "calibration"}
+        unknown = sorted(set(roles) - allowed)
+        if unknown:
+            raise SystemExit(
+                "Local calibration role must be reference/calibration only; "
+                f"unknown roles: {unknown}")
+        ref_mask = np.asarray([r == "reference" for r in roles], dtype=bool)
+        cal_mask = np.asarray([r == "calibration" for r in roles], dtype=bool)
+        Xref = Xall[ref_mask]
+        Xconf = Xall[cal_mask]
+        if len(Xref) < 12:
+            raise SystemExit(
+                f"At least 12 benign reference PCAPs required; got {len(Xref)}")
+        if len(Xconf) < 8:
+            raise SystemExit(
+                f"At least 8 benign conformal PCAPs required; got {len(Xconf)}")
 
-    nn_threshold = _conformal_upper(loo_nn, target_fpr)
-    envelope_threshold = _conformal_upper(loo_env, target_fpr)
+        scale = _robust_scale_matrix(Xref)
+        nn_scores = np.asarray(
+            [_nn_distance(x, Xref, scale) for x in Xconf], dtype=float)
+        env_scores = np.asarray(
+            [_envelope_distance(x, Xref, scale) for x in Xconf], dtype=float)
+        method = "deployment_benign_local_manifold_split_conformal"
+        reference_count = int(len(Xref))
+        conformal_count = int(len(Xconf))
+    else:
+        # Backwards-compatible leave-one-out mode for small development sets.
+        # A production deployment should prefer explicit reference/calibration
+        # roles so the manifold fit and conformal threshold are source-separated.
+        Xref = Xall
+        scale = _robust_scale_matrix(Xref)
+        nn_scores = []
+        env_scores = []
+        for i in range(len(Xref)):
+            ref = np.delete(Xref, i, axis=0)
+            nn_scores.append(_nn_distance(Xref[i], ref, scale))
+            env_scores.append(_envelope_distance(Xref[i], ref, scale))
+        nn_scores = np.asarray(nn_scores, dtype=float)
+        env_scores = np.asarray(env_scores, dtype=float)
+        method = "deployment_benign_local_manifold_conformal"
+        reference_count = int(len(Xref))
+        conformal_count = int(len(Xref))
+
+    nn_threshold = _conformal_upper(nn_scores, target_fpr)
+    envelope_threshold = _conformal_upper(env_scores, target_fpr)
 
     return {
-        "version": 1,
-        "method": "deployment_benign_local_manifold_conformal",
+        "version": 2,
+        "method": method,
         "scope": (
             "deployment-local one-class detector; frozen global model; "
             "benign PCAPs only; no attack labels"
         ),
         "model_sha256": None,
         "feature_names": LOCAL_ADAPT_FEATURES,
-        "reference_vectors": Xcal.tolist(),
+        "reference_vectors": Xref.tolist(),
         "scale": scale.tolist(),
         "target_fpr": float(target_fpr),
-        "calibration_capture_count": int(len(Xcal)),
+        "calibration_capture_count": int(len(Xall)),
+        "reference_capture_count": reference_count,
+        "conformal_capture_count": conformal_count,
         "nn_threshold": float(nn_threshold),
         "envelope_threshold": float(envelope_threshold),
-        "loo_nn_scores": loo_nn.tolist(),
-        "loo_envelope_scores": loo_env.tolist(),
+        "calibration_nn_scores": nn_scores.tolist(),
+        "calibration_envelope_scores": env_scores.tolist(),
         "captures": meta_rows,
     }
 
@@ -1404,8 +1445,10 @@ def score_cli(args) -> None:
         if expected_sha != actual_sha:
             raise SystemExit(
                 "Local one-class calibration was produced for a different model")
-        if local_meta.get("method") != (
-                "deployment_benign_local_manifold_conformal"):
+        if local_meta.get("method") not in {
+                "deployment_benign_local_manifold_conformal",
+                "deployment_benign_local_manifold_split_conformal",
+        }:
             raise SystemExit("Unsupported local calibration method")
 
         local_scores = []
@@ -1434,6 +1477,10 @@ def score_cli(args) -> None:
             "target_fpr": local_meta["target_fpr"],
             "calibration_capture_count": local_meta[
                 "calibration_capture_count"],
+            "reference_capture_count": local_meta.get(
+                "reference_capture_count"),
+            "conformal_capture_count": local_meta.get(
+                "conformal_capture_count"),
             "nn_threshold": local_meta["nn_threshold"],
             "envelope_threshold": local_meta["envelope_threshold"],
         }
