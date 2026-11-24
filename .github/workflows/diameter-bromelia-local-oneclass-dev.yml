@@ -1,0 +1,116 @@
+name: Diameter Bromelia local one-class development check
+
+on:
+  push:
+    branches:
+      - improve/diameter-pcap-native-transfer
+    paths:
+      - "experiments/diameter_pcap_native_detector.py"
+      - ".github/workflows/diameter-bromelia-local-oneclass-dev.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  bromelia-local-oneclass-dev:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout detector
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update -o Acquire::Retries=3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn pyyaml
+
+      - name: Download original frozen Bromelia artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: diameter-bromelia-local-calibration-confirmation
+          path: original
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 45435041027
+
+      - name: Download repaired Bromelia test artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: diameter-bromelia-frozen-repaired-confirmation
+          path: repaired
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 45436761738
+
+      - name: Fit local one-class adaptation on benign calibration only
+        run: |
+          python experiments/diameter_pcap_native_detector.py calibrate-local \
+            --model original/results_bromelia_model/pcap_native_bundle.pkl \
+            --manifest original/bromelia_benign_calibration/manifest.csv \
+            --pcap-dir original/bromelia_benign_calibration \
+            --target-fpr 0.05 \
+            --out results_bromelia_local_oneclass.json
+
+      - name: Score repaired disjoint Bromelia development test
+        run: |
+          python experiments/diameter_pcap_native_detector.py score \
+            --model original/results_bromelia_model/pcap_native_bundle.pkl \
+            --local-calibration results_bromelia_local_oneclass.json \
+            --manifest repaired/frozen/bromelia_test_pcaps/manifest.csv \
+            --pcap-dir repaired/frozen/bromelia_test_pcaps \
+            --out-dir results_bromelia_local_dev
+
+      - name: Summarize development-domain effect
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          old = json.loads(Path(
+              "repaired/results_bromelia_frozen_repair/summary.json"
+          ).read_text())
+          new = json.loads(Path(
+              "results_bromelia_local_dev/summary.json"
+          ).read_text())
+          summary = {
+              "role": (
+                  "development-domain check after Bromelia labels/scores were "
+                  "already inspected; not final external confirmation"
+              ),
+              "frozen_supervised": {
+                  "attack_tpr": old["external_attack_tpr"],
+                  "benign_fpr": old["external_benign_fpr"],
+                  "balanced_accuracy": old["external_balanced_accuracy"],
+              },
+              "benign_local_oneclass": {
+                  "attack_tpr": new["external_attack_tpr"],
+                  "benign_fpr": new["external_benign_fpr"],
+                  "f1": new["external_f1"],
+                  "balanced_accuracy": new["external_balanced_accuracy"],
+              },
+          }
+          Path("bromelia_local_oneclass_comparison.json").write_text(
+              json.dumps(summary, indent=2), encoding="utf-8")
+          print(json.dumps(summary, indent=2))
+          PY
+
+      - name: Upload development result
+        uses: actions/upload-artifact@v4
+        with:
+          name: diameter-bromelia-local-oneclass-development
+          path: |
+            results_bromelia_local_oneclass.json
+            results_bromelia_local_dev/
+            bromelia_local_oneclass_comparison.json
+          if-no-files-found: error
