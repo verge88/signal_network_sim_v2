@@ -1636,33 +1636,11 @@ def main():
               f"{r['auc_pr']:8.4f} {r['f1']:8.4f} {r['fpr']:8.4f}")
 
     # ══════════════════════════════════════════════════
-    #  Generate Plots
+    #  Save raw artifacts for the dedicated plot generator
     # ══════════════════════════════════════════════════
-    print("\n" + "=" * 60)
-    print("  Generating plots...")
-    print("=" * 60)
-
-    viz = ResultsVisualizer(config.plots_dir)
-    main_models = [
-        'Isolation Forest', 'One-Class SVM', 'Autoencoder', 'VAE',
-        'Random Forest', 'Gradient Boosting', 'Cascade', 'Meta-Ensemble'
-    ]
-
-    viz.plot_roc_curves(results_list, y_test, main_models)
-    viz.plot_pr_curves(results_list, y_test, main_models)
-    viz.plot_attack_heatmap(results_list, main_models)
-    viz.plot_summary_bars(results_list, main_models)
-    viz.plot_feature_importance(pipeline.feature_cols, importances,
-                                MS_FEATURES)
-    viz.plot_ablation(ablation)
-    viz.plot_training_curves(trainers_dict)
-    viz.plot_confusion_matrices(
-        results_list, y_test,
-        ['VAE', 'Random Forest', 'Cascade', 'Meta-Ensemble'])
-
-        # ══════════════════════════════════════════════════
-    #  Сохранение артефактов для отдельной визуализации
-    # ══════════════════════════════════════════════════
+    # Canonical publication figures are generated only by
+    # diameter/diameter_generate_plots.py.  Keeping plotting outside the
+    # training pipeline makes the figures reproducible without retraining.
     import pickle
 
     # История обучения нейросетевых моделей
@@ -1697,7 +1675,7 @@ def main():
 
 
     print(f"\n  All results saved to {config.results_dir}/")
-    print(f"  Plots saved to {config.plots_dir}/")
+    print("  Plot generation delegated to diameter/diameter_generate_plots.py")
 
 
 if __name__ == "__main__":
