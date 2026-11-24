@@ -137,18 +137,22 @@ class TrainingConfig:
     tat_min_delta: float = 1e-4
 
     # Supervised models — constrain tree capacity to reduce memorisation.
-    rf_trees: int = 400
-    rf_max_depth: int = 14
-    rf_min_samples_leaf: int = 4
-    rf_min_samples_split: int = 8
+    rf_trees: int = 450
+    rf_max_depth: int = 18
+    rf_min_samples_leaf: int = 2
+    rf_min_samples_split: int = 4
     rf_max_features: str = "sqrt"
-    rf_max_samples: float = 0.80
+    rf_max_samples: float = 0.90
 
-    gb_estimators: int = 220
-    gb_lr: float = 0.03
-    gb_max_depth: int = 3
-    gb_min_samples_leaf: int = 20
-    gb_subsample: float = 0.80
+    gb_estimators: int = 260
+    gb_lr: float = 0.035
+    gb_max_depth: int = 4
+    gb_min_samples_leaf: int = 12
+    gb_subsample: float = 0.90
+
+    # Supervised decision thresholds are tuned only on validation labels,
+    # never on test, with an explicit false-positive-rate budget.
+    supervised_max_fpr: float = 0.02
 
     # Cascade
     cascade_rf_trees: int = 500
@@ -715,6 +719,36 @@ def find_threshold(scores, y_true, percentile=95.0):
     return th_pct, "percentile"
 
 
+def select_supervised_threshold(scores, y_true, max_fpr=0.02):
+    """Choose the validation threshold with maximum F1 under an FPR budget.
+
+    This uses validation labels only.  The returned threshold is frozen before
+    the untouched test split is scored.
+    """
+    scores = np.asarray(scores, dtype=float)
+    y_true = np.asarray(y_true, dtype=int)
+    fpr_arr, tpr_arr, thresholds = roc_curve(y_true, scores)
+    positives = max(1, int((y_true == 1).sum()))
+    negatives = max(1, int((y_true == 0).sum()))
+
+    tp = tpr_arr * positives
+    fp = fpr_arr * negatives
+    precision = tp / np.maximum(tp + fp, 1e-12)
+    recall = tpr_arr
+    f1s = 2 * precision * recall / np.maximum(precision + recall, 1e-12)
+
+    feasible = np.isfinite(thresholds) & (fpr_arr <= max_fpr)
+    if not feasible.any():
+        # Conservative fallback: threshold at the validation benign quantile
+        # corresponding to the FPR budget.
+        return float(np.quantile(
+            scores[y_true == 0], 1.0 - max_fpr)), "validation_fpr_quantile"
+
+    idxs = np.flatnonzero(feasible)
+    best = idxs[int(np.argmax(f1s[feasible]))]
+    return float(thresholds[best]), "validation_max_f1_with_fpr_cap"
+
+
 def evaluate_model(name, scores, y_true, attack_types,
                    threshold=None, percentile=95.0):
     if threshold is None:
@@ -853,13 +887,13 @@ class CascadeCompromiseDetector:
             bootstrap=True, max_samples=config.rf_max_samples)
         self.stage2_gb = GradientBoostingClassifier(
             n_estimators=config.cascade_gb_estimators, learning_rate=0.03,
-            max_depth=3, min_samples_leaf=30, subsample=0.80,
+            max_depth=3, min_samples_leaf=20, subsample=0.90,
             random_state=seed)
         self.stage2_rf = RandomForestClassifier(
             n_estimators=config.cascade_rf_trees, random_state=seed,
-            class_weight="balanced_subsample", max_depth=8,
-            min_samples_leaf=15, min_samples_split=20,
-            max_features="sqrt", bootstrap=True, max_samples=0.80,
+            class_weight="balanced_subsample", max_depth=10,
+            min_samples_leaf=10, min_samples_split=12,
+            max_features="sqrt", bootstrap=True, max_samples=0.90,
             n_jobs=-1)
 
     def fit(self, X_full, y, X_comp, y_comp):
@@ -1275,9 +1309,13 @@ def main():
         max_features=config.rf_max_features,
         bootstrap=True, max_samples=config.rf_max_samples)
     rf.fit(X_train, y_train)
+    rf_pv = rf.predict_proba(X_val)[:, 1]
     rf_pt = rf.predict_proba(X_test)[:, 1]
+    th_rf, th_rf_method = select_supervised_threshold(
+        rf_pv, y_val, config.supervised_max_fpr)
+    print(f"  RF validation threshold: {th_rf:.6f} ({th_rf_method})")
     results_list.append(evaluate_model("Random Forest", rf_pt, y_test,
-                                       attack_types_test, threshold=0.5))
+                                       attack_types_test, threshold=th_rf))
 
     importances = rf.feature_importances_
     print("\n  Feature importance (top 20):")
@@ -1301,17 +1339,25 @@ def main():
         subsample=config.gb_subsample,
         random_state=config.seed)
     gb.fit(X_train, y_train)
+    gb_pv = gb.predict_proba(X_val)[:, 1]
     gb_pt = gb.predict_proba(X_test)[:, 1]
+    th_gb, th_gb_method = select_supervised_threshold(
+        gb_pv, y_val, config.supervised_max_fpr)
+    print(f"  GB validation threshold: {th_gb:.6f} ({th_gb_method})")
     results_list.append(evaluate_model("Gradient Boosting", gb_pt, y_test,
-                                       attack_types_test, threshold=0.5))
+                                       attack_types_test, threshold=th_gb))
 
     # ── 9. Cascade ──
     print("\n[9] Cascade Compromise Detector...")
     cascade = CascadeCompromiseDetector(config, config.seed)
     cascade.fit(X_train, y_train, X_train_comp, y_train_comp)
+    casc_pv = cascade.predict_proba(X_val, X_val_comp)
     casc_pt = cascade.predict_proba(X_test, X_test_comp)
+    th_casc, th_casc_method = select_supervised_threshold(
+        casc_pv, y_val, config.supervised_max_fpr)
+    print(f"  Cascade validation threshold: {th_casc:.6f} ({th_casc_method})")
     results_list.append(evaluate_model("Cascade", casc_pt, y_test,
-                                       attack_types_test, threshold=0.5))
+                                       attack_types_test, threshold=th_casc))
 
     # ── 10. Specialized Ensemble ──
     print("\n[10] Specialized Ensemble...")
@@ -1341,9 +1387,9 @@ def main():
         svm_sv,
         ae_sv,
         vae_sv,
-        cascade.predict_proba(X_val, X_val_comp),
-        rf.predict_proba(X_val)[:, 1],
-        gb.predict_proba(X_val)[:, 1],
+        casc_pv,
+        rf_pv,
+        gb_pv,
     ])
     meta_test_raw = np.column_stack([
         iso_st, svm_st, ae_st, vae_st, casc_pt, rf_pt, gb_pt,
@@ -1363,9 +1409,13 @@ def main():
         min_samples_leaf=20, subsample=0.80,
         random_state=config.seed)
     meta_gb.fit(meta_val, y_val)
+    meta_fit_scores = meta_gb.predict_proba(meta_val)[:, 1]
     meta_pt = meta_gb.predict_proba(meta_test)[:, 1]
+    th_meta, th_meta_method = select_supervised_threshold(
+        meta_fit_scores, y_val, config.supervised_max_fpr)
+    print(f"  Meta validation threshold: {th_meta:.6f} ({th_meta_method})")
     results_list.append(evaluate_model("Meta-Ensemble", meta_pt, y_test,
-                                       attack_types_test, threshold=0.5))
+                                       attack_types_test, threshold=th_meta))
 
     # ══════════════════════════════════════════════════
     #  Ablation Studies
@@ -1379,7 +1429,7 @@ def main():
     comp_total = comp_mask.sum()
 
     # Full
-    comp_full = (rf_pt[comp_mask] >= 0.5).sum()
+    comp_full = (rf_pt[comp_mask] >= th_rf).sum()
     rf_r = next(r for r in results_list if r['name'] == 'Random Forest')
     ablation.append({
         'config': f'Full\n({len(pipeline.feature_cols)} feat)',
@@ -1399,10 +1449,13 @@ def main():
         max_features=config.rf_max_features,
         bootstrap=True, max_samples=config.rf_max_samples)
     rf_no_ms.fit(X_train[:, non_ms_idx], y_train)
+    rf_no_ms_v = rf_no_ms.predict_proba(X_val[:, non_ms_idx])[:, 1]
     rf_no_ms_p = rf_no_ms.predict_proba(X_test[:, non_ms_idx])[:, 1]
+    th_no_ms, _ = select_supervised_threshold(
+        rf_no_ms_v, y_val, config.supervised_max_fpr)
     r_no_ms = evaluate_model("RF (no MS)", rf_no_ms_p, y_test,
-                             attack_types_test, threshold=0.5)
-    comp_no_ms = (rf_no_ms_p[comp_mask] >= 0.5).sum()
+                             attack_types_test, threshold=th_no_ms)
+    comp_no_ms = (rf_no_ms_p[comp_mask] >= th_no_ms).sum()
     ablation.append({
         'config': f'No MS\n({len(non_ms)} feat)',
         'f1': r_no_ms['f1'],
@@ -1422,10 +1475,13 @@ def main():
         max_features=config.rf_max_features,
         bootstrap=True, max_samples=config.rf_max_samples)
     rf_no_temp.fit(X_train[:, non_temp_idx], y_train)
+    rf_no_temp_v = rf_no_temp.predict_proba(X_val[:, non_temp_idx])[:, 1]
     rf_no_temp_p = rf_no_temp.predict_proba(X_test[:, non_temp_idx])[:, 1]
+    th_no_temp, _ = select_supervised_threshold(
+        rf_no_temp_v, y_val, config.supervised_max_fpr)
     r_no_temp = evaluate_model("RF (no temporal)", rf_no_temp_p, y_test,
-                               attack_types_test, threshold=0.5)
-    comp_no_temp = (rf_no_temp_p[comp_mask] >= 0.5).sum()
+                               attack_types_test, threshold=th_no_temp)
+    comp_no_temp = (rf_no_temp_p[comp_mask] >= th_no_temp).sum()
     ablation.append({
         'config': f'No temporal\n({len(non_temp)} feat)',
         'f1': r_no_temp['f1'],
@@ -1433,10 +1489,13 @@ def main():
     })
 
     # Cascade stage 1 only
+    s1_val_scores = cascade.predict_proba_stage1(X_val)
     s1_scores = cascade.predict_proba_stage1(X_test)
+    th_s1, _ = select_supervised_threshold(
+        s1_val_scores, y_val, config.supervised_max_fpr)
     r_s1 = evaluate_model("Cascade-S1", s1_scores, y_test,
-                          attack_types_test, threshold=0.5)
-    comp_s1 = (s1_scores[comp_mask] >= 0.5).sum()
+                          attack_types_test, threshold=th_s1)
+    comp_s1 = (s1_scores[comp_mask] >= th_s1).sum()
     ablation.append({
         'config': 'Cascade\nStage-1 only',
         'f1': r_s1['f1'],
@@ -1445,7 +1504,7 @@ def main():
 
     # Cascade full
     casc_r = next(r for r in results_list if r['name'] == 'Cascade')
-    comp_casc = (casc_pt[comp_mask] >= 0.5).sum()
+    comp_casc = (casc_pt[comp_mask] >= th_casc).sum()
     ablation.append({
         'config': 'Cascade\nBoth levels',
         'f1': casc_r['f1'],
@@ -1460,6 +1519,10 @@ def main():
             "neural_early_stopping": "best benign-validation loss, restored weights",
             "unsupervised_thresholds": "95th percentile of benign validation only",
             "meta_stacking": "fit on validation predictions; normalization fit on validation only",
+            "supervised_thresholds": (
+                f"validation-only max-F1 subject to FPR <= "
+                f"{config.supervised_max_fpr:.3f}"
+            ),
             "test_role": "untouched until final evaluation",
         },
         "neural": {},
@@ -1513,11 +1576,11 @@ def main():
     )
     overfit_diag["supervised"]["Meta-Ensemble"] = {
         "fit_auc_pr_on_validation": float(
-            average_precision_score(y_val, meta_gb.predict_proba(meta_val)[:, 1])
+            average_precision_score(y_val, meta_fit_scores)
         ),
         "test_auc_pr": float(average_precision_score(y_test, meta_pt)),
         "fit_minus_test_auc_pr": float(
-            average_precision_score(y_val, meta_gb.predict_proba(meta_val)[:, 1])
+            average_precision_score(y_val, meta_fit_scores)
             - average_precision_score(y_test, meta_pt)
         ),
     }
