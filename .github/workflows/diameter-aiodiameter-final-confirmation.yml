@@ -6,6 +6,7 @@ on:
       - improve/diameter-pcap-native-transfer
     paths:
       - "experiments/diameter_pcap_native_detector.py"
+      - "experiments/diameter_external_pcap_validation.py"
       - "experiments/aiodiameter_final_driver.py"
       - ".github/workflows/diameter-aiodiameter-final-confirmation.yml"
   workflow_dispatch:
