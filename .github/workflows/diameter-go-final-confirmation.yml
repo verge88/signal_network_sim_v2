@@ -80,11 +80,11 @@ jobs:
         run: |
           (
             cd external_go_diameter
-            go run ./cmd/final-validation -mode server -addr 127.0.0.1:3869
+            go run ./cmd/final-validation -mode server -addr 127.0.0.1:3868
           ) > go_final_server.log 2>&1 &
           echo $! > /tmp/go_final_server.pid
           for i in {1..60}; do
-            if nc -z 127.0.0.1 3869; then exit 0; fi
+            if nc -z 127.0.0.1 3868; then exit 0; fi
             sleep 1
           done
           cat go_final_server.log
@@ -100,12 +100,12 @@ jobs:
           capture_case() {
             name="$1"; label="$2"; scenario="$3"; count="$4"; delay="$5"
             out="$GITHUB_WORKSPACE/go_final_pcaps/${name}"
-            sudo tcpdump -i lo -U -s 0 -w "${out}" 'tcp port 3869' >/tmp/go-final-tcpdump.log 2>&1 &
+            sudo tcpdump -i lo -U -s 0 -w "${out}" 'tcp port 3868' >/tmp/go-final-tcpdump.log 2>&1 &
             cap_pid=$!
             sleep 0.7
             (
               cd external_go_diameter
-              go run ./cmd/final-validation                 -mode client -addr 127.0.0.1:3869                 -scenario "${scenario}" -count "${count}" -delay-ms "${delay}"
+              go run ./cmd/final-validation                 -mode client -addr 127.0.0.1:3868                 -scenario "${scenario}" -count "${count}" -delay-ms "${delay}"
             )
             sleep 0.35
             sudo pkill -INT -x tcpdump || true
