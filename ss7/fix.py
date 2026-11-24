@@ -357,9 +357,20 @@ def mm1k_loss(rho: float, k: int) -> float:
         return 1.0 / (k + 1)
     if rho > 12.0:
         return 1.0 - 1.0 / rho
-    num = (1.0 - rho) * rho ** k
-    den = 1.0 - rho ** (k + 1)
-    return float(np.clip(num / den, 0.0, 1.0))
+    # Preserve the historical floating-point result wherever representable.
+    # For overload, divide numerator and denominator by rho**(k+1).
+    # This equivalent form avoids overflow without changing the queue model.
+    try:
+        num = (1.0 - rho) * rho ** k
+        den = 1.0 - rho ** (k + 1)
+        value = num / den
+        if not np.isfinite(value):
+            raise OverflowError("nonfinite blocking probability")
+    except OverflowError:
+        if rho <= 1.0:
+            raise
+        value = (1.0 - 1.0 / rho) / (1.0 - rho ** (-(k + 1)))
+    return float(np.clip(value, 0.0, 1.0))
 
 
 def link_state(offered_bps: float, lsx: "Linkset",
