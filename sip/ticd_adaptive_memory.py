@@ -48,6 +48,8 @@ class AdaptiveMemoryReference:
             if m.sum()>=400:
                 self.center[key]=float(np.mean(np.clip(z[m],-3.,3.)))
         y=self.raw(train)
+        # raw restores original row order: align reference groups to it.
+        g=self.bounded.prior.groups(y);r=y.node_type.astype(str).to_numpy()
         self.q={}
         for c in ("seq_fast_raw","seq_slow_raw"):
             v=y[c].to_numpy()
