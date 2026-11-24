@@ -1048,6 +1048,33 @@ def summarise_external(
 
 
 
+BURST_LOCAL_FEATURES = [
+    "pcap_log_total_pdus",
+    "pcap_log_duration_s",
+    "pcap_log_rate_hz",
+    "pcap_iat_cv",
+    "pcap_bin_count_cv",
+    "pcap_bin_count_peak_ratio",
+    "pcap_bin_count_autocorr",
+    "pcap_log_burst_mass",
+    "pcap_log_pdus_per_active_command",
+]
+
+SHAPE_LOCAL_FEATURES = list(dict.fromkeys(
+    PORTABLE_FEATURES + [
+        "pcap_s6a_fraction",
+        "pcap_gx_fraction",
+        "pcap_rx_fraction",
+        "pcap_s13_fraction",
+        "pcap_other_fraction",
+        "pcap_bin_entropy_std",
+        "pcap_bin_s6a_fraction_std",
+        "pcap_air_ratio_std",
+        "pcap_ulr_ratio_std",
+        "pcap_active_command_fraction",
+    ]
+))
+
 LOCAL_ADAPT_FEATURES = list(dict.fromkeys(
     PORTABLE_FEATURES + [
         "pcap_log_total_pdus",
@@ -1289,6 +1316,51 @@ def fit_local_benign_calibration(
         if profiles:
             method = "deployment_benign_mixture_manifold_split_conformal"
 
+    channels = {}
+    if has_roles:
+        channel_specs = {
+            "burst_timing": BURST_LOCAL_FEATURES,
+            "protocol_shape": SHAPE_LOCAL_FEATURES,
+        }
+        # Bonferroni allocation keeps the two-channel union within the
+        # requested nominal benign FPR budget under arbitrary dependence.
+        channel_alpha = float(target_fpr) / len(channel_specs)
+        name_to_idx = {
+            name: i for i, name in enumerate(LOCAL_ADAPT_FEATURES)
+        }
+        for channel_name, feature_names in channel_specs.items():
+            idx = [name_to_idx[name] for name in feature_names]
+            Cref = Xref[:, idx]
+            if has_roles:
+                Ccal = Xall[cal_mask][:, idx]
+            else:
+                Ccal = np.empty((0, len(idx)))
+            if len(Cref) < 12 or len(Ccal) < 8:
+                continue
+            c_scale = _robust_scale_matrix(Cref)
+            c_nn = np.asarray(
+                [_nn_distance(x, Cref, c_scale) for x in Ccal],
+                dtype=float)
+            c_env = np.asarray(
+                [_envelope_distance(x, Cref, c_scale) for x in Ccal],
+                dtype=float)
+            channels[channel_name] = {
+                "feature_names": feature_names,
+                "reference_vectors": Cref.tolist(),
+                "scale": c_scale.tolist(),
+                "reference_capture_count": int(len(Cref)),
+                "conformal_capture_count": int(len(Ccal)),
+                "alpha": channel_alpha,
+                "nn_threshold": float(
+                    _conformal_upper(c_nn, channel_alpha)),
+                "envelope_threshold": float(
+                    _conformal_upper(c_env, channel_alpha)),
+                "calibration_nn_scores": c_nn.tolist(),
+                "calibration_envelope_scores": c_env.tolist(),
+            }
+        if len(channels) == len(channel_specs):
+            method = "deployment_benign_channel_ensemble_split_conformal"
+
     return {
         "version": 3,
         "method": method,
@@ -1315,6 +1387,7 @@ def fit_local_benign_calibration(
         "calibration_nn_scores": nn_scores.tolist(),
         "calibration_envelope_scores": env_scores.tolist(),
         "profiles": profiles,
+        "channels": channels,
         "captures": meta_rows,
     }
 
@@ -1344,60 +1417,66 @@ def score_with_local_calibration(
             float(profile["envelope_threshold"]),
         )
 
-    rate_threshold = float(calibration.get(
-        "rate_guard_threshold", float("inf")))
-    burst_threshold = float(calibration.get(
-        "burst_guard_threshold", float("inf")))
-    rate_score = (
-        float(feat["pcap_log_rate_hz"]) / max(rate_threshold, 1e-9)
-        if np.isfinite(rate_threshold) else 0.0
-    )
-    burst_score = (
-        float(feat["pcap_log_burst_mass"]) / max(burst_threshold, 1e-9)
-        if np.isfinite(burst_threshold) else 0.0
-    )
-    guard_score = float(max(rate_score, burst_score))
+    channel_scores = {}
+    for name, channel in calibration.get("channels", {}).items():
+        c_names = list(channel["feature_names"])
+        cx = np.asarray([float(feat[c]) for c in c_names], dtype=float)
+        c_ref = np.asarray(channel["reference_vectors"], dtype=float)
+        c_scale = np.asarray(channel["scale"], dtype=float)
+        channel_scores[name] = _local_reference_score(
+            cx, c_ref, c_scale,
+            float(channel["nn_threshold"]),
+            float(channel["envelope_threshold"]),
+        )
+
+    if channel_scores:
+        best_channel, strongest = max(
+            channel_scores.items(), key=lambda kv: kv[1]["local_score"])
+        return {
+            "nn_distance": float(strongest["nn_distance"]),
+            "envelope_distance": float(strongest["envelope_distance"]),
+            "local_score": float(strongest["local_score"]),
+            "matched_benign_profile": (
+                min(profile_scores.items(),
+                    key=lambda kv: kv[1]["local_score"])[0]
+                if profile_scores else "global"
+            ),
+            "global_local_score": float(global_score["local_score"]),
+            "profile_scores": {
+                str(k): float(v["local_score"])
+                for k, v in profile_scores.items()
+            },
+            "channel_scores": {
+                str(k): float(v["local_score"])
+                for k, v in channel_scores.items()
+            },
+            "trigger_channel": str(best_channel),
+        }
 
     if profile_scores:
         best_name, best = min(
             profile_scores.items(), key=lambda kv: kv[1]["local_score"])
-        # A benign profile may rescue a globally unusual but legitimate
-        # procedure, so shape anomaly requires disagreement with both the
-        # global and the closest benign profile.  High-rate/high-mass bursts
-        # remain independently detectable through the benign-only guard.
-        shape_score = float(min(
-            global_score["local_score"], best["local_score"]))
-        final_score = float(max(shape_score, guard_score))
         return {
             "nn_distance": float(best["nn_distance"]),
             "envelope_distance": float(best["envelope_distance"]),
-            "local_score": final_score,
-            "shape_score": shape_score,
-            "rate_guard_score": float(rate_score),
-            "burst_guard_score": float(burst_score),
-            "guard_score": guard_score,
+            "local_score": float(best["local_score"]),
             "matched_benign_profile": str(best_name),
             "global_local_score": float(global_score["local_score"]),
             "profile_scores": {
                 str(k): float(v["local_score"])
                 for k, v in profile_scores.items()
             },
+            "channel_scores": {},
+            "trigger_channel": "profile_fallback",
         }
-
-    shape_score = float(global_score["local_score"])
-    final_score = float(max(shape_score, guard_score))
     return {
         **global_score,
-        "local_score": final_score,
-        "shape_score": shape_score,
-        "rate_guard_score": float(rate_score),
-        "burst_guard_score": float(burst_score),
-        "guard_score": guard_score,
         "matched_benign_profile": "global",
-        "global_local_score": shape_score,
+        "global_local_score": float(global_score["local_score"]),
         "profile_scores": {},
+        "channel_scores": {},
+        "trigger_channel": "global",
     }
-
 
 def calibrate_local_cli(args) -> None:
     with args.model.open("rb") as f:
@@ -1572,6 +1651,7 @@ def score_cli(args) -> None:
                 "deployment_benign_local_manifold_conformal",
                 "deployment_benign_local_manifold_split_conformal",
                 "deployment_benign_mixture_manifold_split_conformal",
+                "deployment_benign_channel_ensemble_split_conformal",
         }:
             raise SystemExit("Unsupported local calibration method")
 
@@ -1636,6 +1716,7 @@ def score_cli(args) -> None:
                 "conformal_capture_count"),
             "profile_count": len(local_meta.get("profiles", {})),
             "profile_names": sorted(local_meta.get("profiles", {}).keys()),
+            "channel_names": sorted(local_meta.get("channels", {}).keys()),
             "nn_threshold": local_meta["nn_threshold"],
             "envelope_threshold": local_meta["envelope_threshold"],
             "rate_guard_threshold": local_meta.get("rate_guard_threshold"),
