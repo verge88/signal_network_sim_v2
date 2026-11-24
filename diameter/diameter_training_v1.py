@@ -29,7 +29,8 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 
 from sklearn.ensemble import (
-    IsolationForest, RandomForestClassifier, GradientBoostingClassifier
+    IsolationForest, RandomForestClassifier, GradientBoostingClassifier,
+    ExtraTreesClassifier,
 )
 from sklearn.svm import OneClassSVM
 from sklearn.preprocessing import StandardScaler, LabelEncoder
@@ -155,9 +156,13 @@ class TrainingConfig:
     # never on test, with an explicit false-positive-rate budget.
     supervised_max_fpr: float = 0.02
 
-    # Cascade
+    # Cascade / node-compromise branch.
     cascade_rf_trees: int = 500
     cascade_gb_estimators: int = 300
+    compromise_gb_positive_weight: float = 6.0
+    compromise_general_fpr_budget: float = 0.012
+    compromise_total_fpr_budget: float = 0.020
+    compromise_target_recall: float = 0.85
 
     threshold_percentile: float = 95.0
 
@@ -776,6 +781,86 @@ def select_supervised_threshold(scores, y_true, max_fpr=0.02):
     return float(thresholds[best]), "validation_max_f1_with_fpr_cap"
 
 
+def select_compromise_aware_thresholds(
+        p_general, p_compromise, y_any, y_compromise,
+        general_fpr_budget=0.012, total_fpr_budget=0.020,
+        target_recall=0.85):
+    """Select two validation-only thresholds for the cascade.
+
+    The general branch receives only part of the false-positive budget.  The
+    remaining budget is allocated to the node-compromise branch.  The
+    compromise threshold is made as permissive as validation benign FPR
+    allows, which maximises compromise recall without touching the test split.
+    """
+    p_general = np.asarray(p_general, dtype=float)
+    p_compromise = np.asarray(p_compromise, dtype=float)
+    y_any = np.asarray(y_any, dtype=int)
+    y_compromise = np.asarray(y_compromise, dtype=int)
+
+    th_general, general_method = select_supervised_threshold(
+        p_general, y_any, general_fpr_budget)
+    base_pred = p_general >= th_general
+    benign = y_any == 0
+    comp = y_compromise == 1
+    n_benign = max(1, int(benign.sum()))
+
+    max_fp = int(np.floor(total_fpr_budget * n_benign))
+    base_fp = int(np.sum(base_pred & benign))
+    remaining_fp = max(0, max_fp - base_fp)
+
+    candidates = np.sort(p_compromise[benign & ~base_pred])
+    if remaining_fp <= 0 or len(candidates) == 0:
+        th_compromise = float(np.nextafter(
+            np.max(p_compromise) if len(p_compromise) else 1.0, np.inf))
+    elif remaining_fp >= len(candidates):
+        th_compromise = float(np.nextafter(candidates[0], -np.inf))
+    else:
+        # Strictly above the cutoff avoids exceeding the budget when values tie.
+        cutoff = candidates[-remaining_fp]
+        th_compromise = float(np.nextafter(cutoff, np.inf))
+
+    combined = base_pred | (p_compromise >= th_compromise)
+    validation_fpr = float(np.mean(combined[benign])) if benign.any() else 0.0
+    validation_compromise_recall = (
+        float(np.mean(combined[comp])) if comp.any() else 0.0)
+    validation_f1 = f1_score(y_any, combined, zero_division=0)
+
+    # Normalised score keeps a single threshold=1.0 for downstream metrics.
+    eps = 1e-12
+    comp_den = th_compromise if np.isfinite(th_compromise) else 1e12
+    score = np.maximum(
+        p_general / max(th_general, eps),
+        p_compromise / max(comp_den, eps),
+    )
+
+    info = {
+        "general_threshold": float(th_general),
+        "compromise_threshold": float(th_compromise),
+        "general_threshold_method": general_method,
+        "validation_fpr": validation_fpr,
+        "validation_compromise_recall": validation_compromise_recall,
+        "validation_f1": float(validation_f1),
+        "target_compromise_recall": float(target_recall),
+        "target_met": bool(validation_compromise_recall >= target_recall),
+        "general_fpr_budget": float(general_fpr_budget),
+        "total_fpr_budget": float(total_fpr_budget),
+        "base_benign_fp": base_fp,
+        "allowed_benign_fp": max_fp,
+    }
+    return float(th_general), float(th_compromise), score, info
+
+
+def combine_cascade_scores(p_general, p_compromise,
+                           general_threshold, compromise_threshold):
+    eps = 1e-12
+    comp_den = (
+        compromise_threshold if np.isfinite(compromise_threshold) else 1e12)
+    return np.maximum(
+        np.asarray(p_general, dtype=float) / max(general_threshold, eps),
+        np.asarray(p_compromise, dtype=float) / max(comp_den, eps),
+    )
+
+
 def evaluate_model(name, scores, y_true, attack_types,
                    threshold=None, percentile=95.0):
     if threshold is None:
@@ -904,6 +989,7 @@ class EnsembleDetector:
 
 class CascadeCompromiseDetector:
     def __init__(self, config, seed=42):
+        self.config = config
         self.stage1_rf = RandomForestClassifier(
             n_estimators=config.cascade_rf_trees, random_state=seed,
             class_weight="balanced_subsample", n_jobs=-1,
@@ -914,34 +1000,59 @@ class CascadeCompromiseDetector:
             bootstrap=True, max_samples=config.rf_max_samples)
         self.stage2_gb = GradientBoostingClassifier(
             n_estimators=config.cascade_gb_estimators, learning_rate=0.03,
-            max_depth=3, min_samples_leaf=20, subsample=0.90,
+            max_depth=3, min_samples_leaf=16, subsample=0.90,
             random_state=seed)
         self.stage2_rf = RandomForestClassifier(
             n_estimators=config.cascade_rf_trees, random_state=seed,
-            class_weight="balanced_subsample", max_depth=10,
-            min_samples_leaf=10, min_samples_split=12,
+            class_weight="balanced_subsample", max_depth=12,
+            min_samples_leaf=6, min_samples_split=10,
             max_features="sqrt", bootstrap=True, max_samples=0.90,
             n_jobs=-1)
+        self.stage2_extra = ExtraTreesClassifier(
+            n_estimators=config.cascade_rf_trees, random_state=seed + 17,
+            class_weight="balanced", max_depth=14,
+            min_samples_leaf=4, min_samples_split=8,
+            max_features="sqrt", n_jobs=-1)
+        # A dedicated full-feature compromise classifier captures context that
+        # can be lost by the hand-selected stage-2 subset.
+        self.stage2_full_rf = RandomForestClassifier(
+            n_estimators=config.cascade_rf_trees, random_state=seed + 29,
+            class_weight="balanced_subsample", n_jobs=-1,
+            max_depth=14, min_samples_leaf=4, min_samples_split=8,
+            max_features="sqrt", bootstrap=True, max_samples=0.90)
 
     def fit(self, X_full, y, X_comp, y_comp):
         print("  Cascade Stage 1: General RF...")
         self.stage1_rf.fit(X_full, y)
-        print("  Cascade Stage 2: Compromise-specific GB + RF...")
-        self.stage2_gb.fit(X_comp, y_comp)
+        print("  Cascade Stage 2: compromise-aware GB + RF + ExtraTrees...")
+        sample_weight = np.where(
+            y_comp == 1, self.config.compromise_gb_positive_weight, 1.0)
+        self.stage2_gb.fit(X_comp, y_comp, sample_weight=sample_weight)
         self.stage2_rf.fit(X_comp, y_comp)
+        self.stage2_extra.fit(X_comp, y_comp)
+        self.stage2_full_rf.fit(X_full, y_comp)
+
+    def predict_components(self, X_full, X_comp):
+        p1 = self.stage1_rf.predict_proba(X_full)[:, 1]
+        p2_gb = self.stage2_gb.predict_proba(X_comp)[:, 1]
+        p2_rf = self.stage2_rf.predict_proba(X_comp)[:, 1]
+        p2_extra = self.stage2_extra.predict_proba(X_comp)[:, 1]
+        p2_full = self.stage2_full_rf.predict_proba(X_full)[:, 1]
+        # Max pooling is intentional: the validation-only threshold controls
+        # FPR, while any independent compromise signal may raise sensitivity.
+        p2 = np.maximum.reduce([p2_gb, p2_rf, p2_extra, p2_full])
+        return p1, p2
 
     def predict_proba(self, X_full, X_comp):
-        p1 = self.stage1_rf.predict_proba(X_full)[:, 1]
-        p2 = 0.5 * (self.stage2_gb.predict_proba(X_comp)[:, 1] +
-                     self.stage2_rf.predict_proba(X_comp)[:, 1])
+        p1, p2 = self.predict_components(X_full, X_comp)
         return np.maximum(p1, p2)
 
     def predict_proba_stage1(self, X):
         return self.stage1_rf.predict_proba(X)[:, 1]
 
-    def predict_proba_stage2(self, X):
-        return 0.5 * (self.stage2_gb.predict_proba(X)[:, 1] +
-                       self.stage2_rf.predict_proba(X)[:, 1])
+    def predict_proba_stage2(self, X_comp, X_full):
+        _, p2 = self.predict_components(X_full, X_comp)
+        return p2
 
 
 # ══════════════════════════════════════════════════════════
@@ -1393,13 +1504,29 @@ def main():
     print("\n[9] Cascade Compromise Detector...")
     cascade = CascadeCompromiseDetector(config, config.seed)
     cascade.fit(X_train, y_train, X_train_comp, y_train_comp)
-    casc_pv = cascade.predict_proba(X_val, X_val_comp)
-    casc_pt = cascade.predict_proba(X_test, X_test_comp)
-    th_casc, th_casc_method = select_supervised_threshold(
-        casc_pv, y_val, config.supervised_max_fpr)
-    print(f"  Cascade validation threshold: {th_casc:.6f} ({th_casc_method})")
-    results_list.append(evaluate_model("Cascade", casc_pt, y_test,
-                                       attack_types_test, threshold=th_casc))
+    casc1_pv, casc2_pv = cascade.predict_components(X_val, X_val_comp)
+    casc1_pt, casc2_pt = cascade.predict_components(X_test, X_test_comp)
+    th_casc1, th_casc2, casc_pv, compromise_threshold_info = (
+        select_compromise_aware_thresholds(
+            casc1_pv, casc2_pv, y_val, y_val_comp,
+            general_fpr_budget=config.compromise_general_fpr_budget,
+            total_fpr_budget=config.compromise_total_fpr_budget,
+            target_recall=config.compromise_target_recall,
+        )
+    )
+    casc_pt = combine_cascade_scores(
+        casc1_pt, casc2_pt, th_casc1, th_casc2)
+    print(
+        f"  Cascade dual thresholds: general={th_casc1:.6f}, "
+        f"compromise={th_casc2:.6f}; "
+        f"validation compromise recall="
+        f"{compromise_threshold_info['validation_compromise_recall']:.3f}, "
+        f"validation FPR={compromise_threshold_info['validation_fpr']:.4f}"
+    )
+    casc_result = evaluate_model(
+        "Cascade", casc_pt, y_test, attack_types_test, threshold=1.0)
+    casc_result["compromise_threshold_info"] = compromise_threshold_info
+    results_list.append(casc_result)
 
     # ── 10. Specialized Ensemble ──
     print("\n[10] Specialized Ensemble...")
@@ -1430,11 +1557,12 @@ def main():
         ae_sv,
         vae_sv,
         casc_pv,
+        casc2_pv,
         rf_pv,
         gb_pv,
     ])
     meta_test_raw = np.column_stack([
-        iso_st, svm_st, ae_st, vae_st, casc_pt, rf_pt, gb_pt,
+        iso_st, svm_st, ae_st, vae_st, casc_pt, casc2_pt, rf_pt, gb_pt,
     ])
     meta_p1 = np.percentile(meta_val_raw, 1, axis=0)
     meta_p99 = np.percentile(meta_val_raw, 99, axis=0)
@@ -1453,11 +1581,42 @@ def main():
     meta_gb.fit(meta_val, y_val)
     meta_fit_scores = meta_gb.predict_proba(meta_val)[:, 1]
     meta_pt = meta_gb.predict_proba(meta_test)[:, 1]
-    th_meta, th_meta_method = select_supervised_threshold(
-        meta_fit_scores, y_val, config.supervised_max_fpr)
-    print(f"  Meta validation threshold: {th_meta:.6f} ({th_meta_method})")
-    results_list.append(evaluate_model("Meta-Ensemble", meta_pt, y_test,
-                                       attack_types_test, threshold=th_meta))
+    # Meta threshold is also compromise-aware: lower it only as far as the
+    # validation benign FPR budget permits, using node_compromise labels solely
+    # from validation.  Test labels remain untouched.
+    meta_base_th, _ = select_supervised_threshold(
+        meta_fit_scores, y_val, config.compromise_general_fpr_budget)
+    meta_base = meta_fit_scores >= meta_base_th
+    benign_val = y_val == 0
+    comp_val = y_val_comp == 1
+    max_meta_fp = int(np.floor(
+        config.compromise_total_fpr_budget * max(1, benign_val.sum())))
+    candidate_th = np.unique(meta_fit_scores)
+    candidate_th = np.sort(candidate_th)[::-1]
+    th_meta = meta_base_th
+    best_meta_recall = (
+        float(np.mean(meta_base[comp_val])) if comp_val.any() else 0.0)
+    best_meta_f1 = f1_score(y_val, meta_base, zero_division=0)
+    for th in candidate_th:
+        pred = meta_fit_scores >= th
+        if int(np.sum(pred & benign_val)) > max_meta_fp:
+            continue
+        rec = float(np.mean(pred[comp_val])) if comp_val.any() else 0.0
+        f1v = f1_score(y_val, pred, zero_division=0)
+        if (rec > best_meta_recall + 1e-12 or
+                (abs(rec - best_meta_recall) <= 1e-12 and
+                 f1v > best_meta_f1)):
+            th_meta, best_meta_recall, best_meta_f1 = float(th), rec, f1v
+    print(
+        f"  Meta compromise-aware threshold: {th_meta:.6f}; "
+        f"validation compromise recall={best_meta_recall:.3f}, "
+        f"F1={best_meta_f1:.3f}"
+    )
+    meta_result = evaluate_model(
+        "Meta-Ensemble", meta_pt, y_test, attack_types_test,
+        threshold=th_meta)
+    meta_result["validation_compromise_recall"] = best_meta_recall
+    results_list.append(meta_result)
 
     # ══════════════════════════════════════════════════
     #  Ablation Studies
@@ -1546,7 +1705,7 @@ def main():
 
     # Cascade full
     casc_r = next(r for r in results_list if r['name'] == 'Cascade')
-    comp_casc = (casc_pt[comp_mask] >= th_casc).sum()
+    comp_casc = (casc_pt[comp_mask] >= 1.0).sum()
     ablation.append({
         'config': 'Cascade\nBoth levels',
         'f1': casc_r['f1'],
@@ -1612,10 +1771,14 @@ def main():
         gb.predict_proba(X_val)[:, 1],
         gb_pt,
     )
+    casc1_train, casc2_train = cascade.predict_components(
+        X_train, X_train_comp)
+    casc_train = combine_cascade_scores(
+        casc1_train, casc2_train, th_casc1, th_casc2)
     split_ap(
         "Cascade",
-        cascade.predict_proba(X_train, X_train_comp),
-        cascade.predict_proba(X_val, X_val_comp),
+        casc_train,
+        casc_pv,
         casc_pt,
     )
     overfit_diag["supervised"]["Meta-Ensemble"] = {
@@ -1628,6 +1791,38 @@ def main():
             - average_precision_score(y_test, meta_pt)
         ),
     }
+
+    # Explicit node-compromise recall report for reproducible acceptance.
+    comp_test_mask = attack_types_test == "node_compromise"
+    cascade_test_pred = casc_pt >= 1.0
+    meta_test_pred = meta_pt >= th_meta
+    compromise_diag = {
+        "validation": compromise_threshold_info,
+        "test": {
+            "cascade_compromise_recall": float(
+                np.mean(cascade_test_pred[comp_test_mask])
+                if comp_test_mask.any() else 0.0),
+            "cascade_benign_fpr": float(
+                np.mean(cascade_test_pred[y_test == 0])
+                if np.any(y_test == 0) else 0.0),
+            "meta_compromise_recall": float(
+                np.mean(meta_test_pred[comp_test_mask])
+                if comp_test_mask.any() else 0.0),
+            "meta_benign_fpr": float(
+                np.mean(meta_test_pred[y_test == 0])
+                if np.any(y_test == 0) else 0.0),
+        },
+        "targets": {
+            "compromise_recall": config.compromise_target_recall,
+            "benign_fpr_max": config.compromise_total_fpr_budget,
+        },
+    }
+    with open(os.path.join(
+            config.results_dir, "compromise_recall_diagnostics.json"),
+            "w", encoding="utf-8") as f:
+        json.dump(compromise_diag, f, indent=2, ensure_ascii=False)
+    print("\n  Compromise recall diagnostics:")
+    print(json.dumps(compromise_diag, indent=2, ensure_ascii=False))
 
     diag_path = os.path.join(config.results_dir, "overfitting_diagnostics.json")
     with open(diag_path, "w", encoding="utf-8") as f:
