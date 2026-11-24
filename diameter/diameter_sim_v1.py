@@ -29,6 +29,8 @@ Key architectural differences from SS7 simulator:
   7. Attack types adapted to Diameter-specific commands per GSMA FS.19
 """
 
+import argparse
+
 import numpy as np
 import pandas as pd
 import networkx as nx
@@ -1492,14 +1494,14 @@ def add_zone_deviation_features(df: pd.DataFrame) -> pd.DataFrame:
 #  Main
 # ──────────────────────────────────────────────────────────
 
-def main():
+def main(seed=42, output="diameter_dataset_v1.csv"):
     config = SimulationConfig(
         duration_hours=24.0,
         interval_s=15.0,
         n_mme=4, n_hss=2, n_pcrf=2,
         n_sgw=2, n_pgw=2, n_dra=3, n_dea=2,
         master_node_ids=[0, 1],  # DRA-0 and DRA-1
-        seed=42,
+        seed=seed,
     )
 
     calibration_path = os.environ.get("DIAMETER_CALIBRATION_PROFILE", "").strip()
@@ -1640,7 +1642,6 @@ def main():
                   f"comp={cm:9.4f}")
 
     # Save
-    output = "diameter_dataset_v1.csv"
     df.to_csv(output, index=False)
     print(f"\nDataset saved to {output}")
     print(f"Shape: {df.shape}")
@@ -1657,4 +1658,8 @@ def main():
 
 
 if __name__ == "__main__":
-    df = main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--out", default="diameter_dataset_v1.csv")
+    args = parser.parse_args()
+    main(seed=args.seed, output=args.out)

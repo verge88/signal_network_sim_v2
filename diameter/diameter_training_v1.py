@@ -19,6 +19,9 @@ Models:
 Plus ablation studies for MS-features and temporal features.
 """
 
+import argparse
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import os
@@ -28,12 +31,13 @@ import warnings
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 
+from sklearn.base import clone
 from sklearn.ensemble import (
     IsolationForest, RandomForestClassifier, GradientBoostingClassifier,
     HistGradientBoostingClassifier,
 )
 from sklearn.svm import OneClassSVM
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, f1_score,
@@ -75,6 +79,10 @@ GX_COMMANDS = ["CCR_I", "CCR_U", "CCR_T", "RAR"]
 @dataclass
 class TrainingConfig:
     data_path: str = "diameter_dataset_v1.csv"
+    validation_path: Optional[str] = None
+    stack_path: Optional[str] = None
+    test_path: Optional[str] = None
+    compare_tree_reference: bool = False
     results_dir: str = "results_diameter_v1"
     plots_dir: str = "results_diameter_v1/plots"
     test_size: float = 0.25
@@ -140,17 +148,17 @@ class TrainingConfig:
 
     # Supervised models — constrain tree capacity to reduce memorisation.
     rf_trees: int = 450
-    rf_max_depth: int = 16
-    rf_min_samples_leaf: int = 3
-    rf_min_samples_split: int = 6
+    rf_max_depth: int = 12
+    rf_min_samples_leaf: int = 8
+    rf_min_samples_split: int = 16
     rf_max_features: str = "sqrt"
-    rf_max_samples: float = 0.85
+    rf_max_samples: float = 0.75
 
     gb_estimators: int = 260
     gb_lr: float = 0.035
-    gb_max_depth: int = 4
-    gb_min_samples_leaf: int = 12
-    gb_subsample: float = 0.90
+    gb_max_depth: int = 3
+    gb_min_samples_leaf: int = 24
+    gb_subsample: float = 0.80
 
     # Supervised decision thresholds are tuned only on validation labels,
     # never on test, with an explicit false-positive-rate budget.
@@ -260,7 +268,6 @@ class DataPipeline:
         self.config = config
         self.scaler = StandardScaler()
         self.imputer = SimpleImputer(strategy="median")
-        self.le_node_type = LabelEncoder()
         self.feature_cols: List[str] = []
         self.compromise_scaler = StandardScaler()
         self.compromise_imputer = SimpleImputer(strategy="median")
@@ -283,44 +290,52 @@ class DataPipeline:
         if "node_type_enc" in df.columns:
             self.compromise_feature_cols.append("node_type_enc")
 
-    def load_and_prepare(self) -> Tuple[pd.DataFrame, pd.DataFrame,
-                                        pd.DataFrame]:
-        df = pd.read_csv(self.config.data_path)
-        print(f"Loaded {len(df)} records, anomalies: "
-              f"{df[self.LABEL_COL].sum()} "
-              f"({100 * df[self.LABEL_COL].mean():.2f}%)")
-        print(f"Attack distribution:\n{df[self.ATTACK_COL].value_counts()}\n")
+    def load_and_prepare(self):
+        config = self.config
+        optional_paths = (config.validation_path, config.stack_path, config.test_path)
+        if any(optional_paths):
+            if not all(optional_paths):
+                raise ValueError("Provide validation, stacking and test files together")
+            paths = [Path(p).resolve() for p in (config.data_path, *optional_paths)]
+            if len(set(paths)) != 4:
+                raise ValueError("Each partition requires a separate simulation file")
+            partitions = tuple(pd.read_csv(path) for path in paths)
+            if any(partitions[i].equals(partitions[j])
+                   for i in range(4) for j in range(i)):
+                raise ValueError("Duplicate simulations in evaluation partitions")
+            self.split_protocol = "separate simulation files"
+        else:
+            df = pd.read_csv(config.data_path)
+            # Keep all nodes in each time block in the same partition.
+            blocks = df["interval"] // 120
+            block_labels = df.groupby(blocks)[self.LABEL_COL].max()
+            fit_val, test = train_test_split(
+                block_labels, test_size=config.test_size,
+                stratify=block_labels, random_state=config.seed)
+            fit, val_stack = train_test_split(
+                fit_val, test_size=config.val_size / (1 - config.test_size),
+                stratify=fit_val, random_state=config.seed)
+            validation, stack = train_test_split(
+                val_stack, test_size=0.5, stratify=val_stack, random_state=config.seed)
+            partitions = tuple(df[blocks.isin(group.index)].copy()
+                               for group in (fit, validation, stack, test))
+            self.split_protocol = "disjoint 30-minute blocks of one simulation"
 
-        if "node_type" in df.columns and "node_type_enc" not in df.columns:
-            df["node_type_enc"] = self.le_node_type.fit_transform(
-                df["node_type"])
-
-        self._build_feature_cols(df)
-
-        # Verify no GT leakage
-        for c in self.feature_cols:
-            if c.startswith("gt_"):
-                raise ValueError(f"GT column '{c}' in feature set!")
-
+        train = partitions[0]
+        if "node_type" in train and "node_type_enc" not in train:
+            codes = {name: i for i, name in enumerate(sorted(train["node_type"].unique()))}
+            for df in partitions:
+                df["node_type_enc"] = df["node_type"].map(codes).fillna(-1)
+        self._build_feature_cols(train)
+        if any(c.startswith("gt_") for c in self.feature_cols):
+            raise ValueError("Ground-truth columns found in feature set")
+        for name, df in zip(("train", "validation", "stack", "test"), partitions):
+            if set(df[self.LABEL_COL].unique()) != {0, 1}:
+                raise ValueError(f"{name} needs both benign and anomalous records")
+            print(f"{name}: {len(df)} rows; anomaly rate {df[self.LABEL_COL].mean():.4f}")
+        print(f"Split protocol: {self.split_protocol}")
         print(f"Observable features: {len(self.feature_cols)}")
-        print(f"Compromise-specific features: "
-              f"{len(self.compromise_feature_cols)}")
-
-        train_val, test = train_test_split(
-            df, test_size=self.config.test_size,
-            stratify=df[self.LABEL_COL], random_state=self.config.seed)
-        train, val = train_test_split(
-            train_val,
-            test_size=self.config.val_size / (1 - self.config.test_size),
-            stratify=train_val[self.LABEL_COL],
-            random_state=self.config.seed)
-
-        print(f"Split — Train: {len(train)}, Val: {len(val)}, "
-              f"Test: {len(test)}")
-        print(f"Train anomaly rate: {train[self.LABEL_COL].mean():.4f}")
-        print(f"Val anomaly rate:   {val[self.LABEL_COL].mean():.4f}")
-        print(f"Test anomaly rate:  {test[self.LABEL_COL].mean():.4f}\n")
-        return train, val, test
+        return partitions
 
     def get_features_labels(self, df, fit=False):
         X = df[self.feature_cols].copy()
@@ -348,15 +363,29 @@ class DataPipeline:
         return self.get_features_labels(normal, fit=fit)
 
     def get_sequential_data(self, df, seq_len):
-        X_all, y_all = self.get_features_labels(df, fit=False)
-        seqs, labs = [], []
-        for nid in df["node_id"].unique():
-            mask = df["node_id"].values == nid
-            Xn, yn = X_all[mask], y_all[mask]
-            for i in range(len(Xn) - seq_len + 1):
-                seqs.append(Xn[i:i + seq_len])
-                labs.append(yn[i + seq_len - 1])
-        return np.array(seqs), np.array(labs)
+        ordered = df.sort_values(["node_id", "interval"], kind="stable")
+        X_all, y_all = self.get_features_labels(ordered)
+        seqs, labels, attack_types, benign = [], [], [], []
+        for positions in ordered.groupby("node_id", sort=False).indices.values():
+            if len(positions) < seq_len:
+                continue
+            rows = ordered.iloc[positions]
+            times = rows["interval"].to_numpy()
+            if np.any(np.diff(times) <= 0):
+                raise ValueError("Duplicate interval for a Diameter node")
+            contiguous = times[seq_len - 1:] - times[:len(times) - seq_len + 1] == seq_len - 1
+            windows = np.lib.stride_tricks.sliding_window_view(
+                X_all[positions], seq_len, axis=0).swapaxes(1, 2)
+            y_node = y_all[positions]
+            seqs.append(windows[contiguous])
+            labels.append(y_node[seq_len - 1:][contiguous])
+            attack_types.append(rows[self.ATTACK_COL].to_numpy()[seq_len - 1:][contiguous])
+            benign.append(~np.lib.stride_tricks.sliding_window_view(
+                y_node.astype(bool), seq_len).any(axis=1)[contiguous])
+        if not seqs:
+            return (np.empty((0, seq_len, X_all.shape[1])), np.array([], dtype=int),
+                    np.array([], dtype=str), np.array([], dtype=bool))
+        return tuple(np.concatenate(parts) for parts in (seqs, labels, attack_types, benign))
 
 
 # ══════════════════════════════════════════════════════════
@@ -544,7 +573,9 @@ class AETrainer:
         crit = nn.MSELoss()
         dl = DataLoader(TensorDataset(torch.FloatTensor(X_train)),
                         batch_size=self.batch_size, shuffle=True)
-        best_val, pat_cnt, best_state = float("inf"), 0, None
+        best_val, significant_val = float("inf"), float("inf")
+        pat_cnt, best_state = 0, None
+        self.best_epoch = None
         self.train_losses, self.train_eval_losses, self.val_losses = [], [], []
 
         for epoch in range(self.epochs):
@@ -572,10 +603,12 @@ class AETrainer:
                 vl = self._eval(X_val, crit)
                 self.val_losses.append(vl)
                 sched.step(vl)
-                if vl < best_val - self.min_delta:
-                    best_val, pat_cnt = vl, 0
+                if vl < best_val:
+                    best_val, self.best_epoch = vl, epoch + 1
                     best_state = {k: v.cpu().clone()
                                   for k, v in self.model.state_dict().items()}
+                if vl < significant_val - self.min_delta:
+                    significant_val, pat_cnt = vl, 0
                 else:
                     pat_cnt += 1
                 if (epoch + 1) % 20 == 0:
@@ -641,7 +674,9 @@ class VAETrainer:
             threshold=self.min_delta, min_lr=max(self.lr * 0.05, 1e-6))
         dl = DataLoader(TensorDataset(torch.FloatTensor(X_train)),
                         batch_size=self.batch_size, shuffle=True)
-        best_val, pat_cnt, best_state = float("inf"), 0, None
+        best_val, significant_val = float("inf"), float("inf")
+        pat_cnt, best_state = 0, None
+        self.best_epoch = None
         self.train_losses, self.train_eval_losses, self.val_losses = [], [], []
 
         for epoch in range(self.epochs):
@@ -667,10 +702,12 @@ class VAETrainer:
                 vl = self._eval_val(X_val)
                 self.val_losses.append(vl)
                 sched.step(vl)
-                if vl < best_val - self.min_delta:
-                    best_val, pat_cnt = vl, 0
+                if vl < best_val:
+                    best_val, self.best_epoch = vl, epoch + 1
                     best_state = {k: v.cpu().clone()
                                   for k, v in self.model.state_dict().items()}
+                if vl < significant_val - self.min_delta:
+                    significant_val, pat_cnt = vl, 0
                 else:
                     pat_cnt += 1
                 if (epoch + 1) % 20 == 0:
@@ -927,39 +964,38 @@ class SpecializedDetector:
         self.name, self.feature_indices, self.seed = name, feature_indices, seed
         self.models = {}
 
-    def fit(self, X_normal):
-        X = X_normal[:, self.feature_indices]
+    def transform(self, X):
+        values = X[:, self.feature_indices]
+        # S6a dominance Z-scores can be very large when local variance is tiny.
+        return np.arcsinh(values) if self.name == "s6a_profile" else values
+
+    def fit(self, X_normal, X_val_normal):
+        X = self.transform(X_normal)
+        X_val = self.transform(X_val_normal)
         n = X.shape[1]
         self.models["iso"] = IsolationForest(
             n_estimators=200, contamination=0.05,
             random_state=self.seed).fit(X)
         self.models["svm"] = OneClassSVM(
             nu=0.05, kernel="rbf", gamma="scale").fit(X)
-        ae = CompactAE(n, max(2, n // 3))
-        # Keep a benign-only validation slice for the specialized AE instead
-        # of training to a fixed epoch budget with no stopping signal.
-        rng = np.random.default_rng(self.seed)
-        perm = rng.permutation(len(X))
-        n_val = max(1, int(round(0.10 * len(X))))
-        val_idx, fit_idx = perm[:n_val], perm[n_val:]
         trainer = AETrainer(
-            ae, 4e-4, 60, 256, patience=4,
+            CompactAE(n, max(2, n // 3)), 4e-4, 60, 256, patience=4,
             weight_decay=2e-4, min_delta=5e-4)
-        trainer.fit(X[fit_idx], X[val_idx])
-        self.models["ae"], self.models["ae_trainer"] = ae, trainer
+        trainer.fit(X, X_val)
+        self.models["ae_trainer"] = trainer
+        self.score_low, score_high = np.percentile(self.raw_scores(X), [1, 99], axis=0)
+        self.score_span = np.maximum(score_high - self.score_low, 1e-9)
+
+    def raw_scores(self, X):
+        return np.column_stack([
+            -self.models["iso"].score_samples(X),
+            -self.models["svm"].score_samples(X),
+            self.models["ae_trainer"].reconstruction_error(X),
+        ])
 
     def score(self, X):
-        Xs = X[:, self.feature_indices]
-
-        def norm(s):
-            p1, p99 = np.percentile(s, 1), np.percentile(s, 99)
-            return np.clip((s - p1) / (p99 - p1 + 1e-9), 0, 1)
-
-        return np.max(np.column_stack([
-            norm(-self.models["iso"].score_samples(Xs)),
-            norm(-self.models["svm"].score_samples(Xs)),
-            norm(self.models["ae_trainer"].reconstruction_error(Xs)),
-        ]), axis=1)
+        scores = self.raw_scores(self.transform(X))
+        return np.max(np.clip((scores - self.score_low) / self.score_span, 0, 1), axis=1)
 
 
 class EnsembleDetector:
@@ -970,10 +1006,10 @@ class EnsembleDetector:
             if idx:
                 self.detectors[gn] = SpecializedDetector(gn, idx, seed)
 
-    def fit(self, X_normal):
+    def fit(self, X_normal, X_val_normal):
         for n, d in self.detectors.items():
             print(f"  Fitting: {n} ({len(d.feature_indices)} features)")
-            d.fit(X_normal)
+            d.fit(X_normal, X_val_normal)
 
     def score(self, X):
         r = {n: d.score(X) for n, d in self.detectors.items()}
@@ -1006,10 +1042,10 @@ class CascadeCompromiseDetector:
             HistGradientBoostingClassifier(
                 max_iter=180,
                 learning_rate=0.06,
-                max_leaf_nodes=31,
-                max_depth=8,
-                min_samples_leaf=20,
-                l2_regularization=1.0,
+                max_leaf_nodes=23,
+                max_depth=6,
+                min_samples_leaf=30,
+                l2_regularization=3.0,
                 class_weight="balanced",
                 random_state=seed + offset,
             )
@@ -1254,17 +1290,18 @@ def set_global_seed(seed: int) -> None:
         torch.use_deterministic_algorithms(True)
 
 
-def main():
-    config = TrainingConfig()
+def main(config=None):
+    config = config or TrainingConfig()
     set_global_seed(config.seed)
     os.makedirs(config.results_dir, exist_ok=True)
     os.makedirs(config.plots_dir, exist_ok=True)
 
     pipeline = DataPipeline(config)
-    train_df, val_df, test_df = pipeline.load_and_prepare()
+    train_df, val_df, stack_df, test_df = pipeline.load_and_prepare()
 
     X_train, y_train = pipeline.get_features_labels(train_df, fit=True)
     X_val, y_val = pipeline.get_features_labels(val_df)
+    X_stack, y_stack = pipeline.get_features_labels(stack_df)
     X_test, y_test = pipeline.get_features_labels(test_df)
 
     X_train_comp, y_train_comp = pipeline.get_compromise_features(
@@ -1376,11 +1413,16 @@ def main():
 
     # ── 5. LSTM-AE ──
     print("\n[5] LSTM-Autoencoder...")
-    train_normal_df = train_df[train_df[pipeline.LABEL_COL] == 0]
-    seq_train, _ = pipeline.get_sequential_data(train_normal_df,
-                                                 config.lstm_seq_len)
+    seq_train, _, _, benign_train = pipeline.get_sequential_data(
+        train_df, config.lstm_seq_len)
+    seq_train = seq_train[benign_train]
+    seq_val, _, _, benign_val_windows = pipeline.get_sequential_data(
+        val_df, config.lstm_seq_len)
+    seq_val_normal = seq_val[benign_val_windows]
+    seq_test, seq_y_test, seq_at_test, _ = pipeline.get_sequential_data(
+        test_df, config.lstm_seq_len)
     lstm_done = False
-    if len(seq_train) > 100:
+    if len(seq_train) > 100 and len(seq_val_normal) and len(seq_test):
         lstm = LSTMAutoencoder(n_feat, config.lstm_hidden,
                                config.lstm_layers,
                                config.lstm_seq_len,
@@ -1390,30 +1432,17 @@ def main():
             patience=config.lstm_patience,
             weight_decay=config.lstm_weight_decay,
             min_delta=config.lstm_min_delta)
-        seq_val, seq_y_val = pipeline.get_sequential_data(
-            val_df, config.lstm_seq_len)
-        seq_val_normal = seq_val[seq_y_val == 0]
-        lstm_trainer.fit(seq_train,
-                         seq_val_normal if len(seq_val_normal) > 0 else None)
+        lstm_trainer.fit(seq_train, seq_val_normal)
         trainers_dict['LSTM-AE'] = lstm_trainer
-
-        seq_test, seq_y_test = pipeline.get_sequential_data(
-            test_df, config.lstm_seq_len)
-        seq_at_test = []
-        for nid in test_df["node_id"].unique():
-            mask = test_df["node_id"].values == nid
-            atypes = test_df.loc[mask, "attack_type"].values
-            for i in range(len(atypes) - config.lstm_seq_len + 1):
-                seq_at_test.append(atypes[i + config.lstm_seq_len - 1])
-        seq_at_test = np.array(seq_at_test)
 
         lstm_st = lstm_trainer.reconstruction_error(seq_test)
         lstm_sv = lstm_trainer.reconstruction_error(seq_val)
         th_lstm = float(np.percentile(
-            lstm_sv[seq_y_val == 0], config.threshold_percentile))
+            lstm_sv[benign_val_windows], config.threshold_percentile))
         results_list.append(evaluate_model(
             "LSTM-Autoencoder", lstm_st, seq_y_test,
             seq_at_test, threshold=th_lstm))
+        results_list[-1]["y_true"] = seq_y_test
         lstm_done = True
     else:
         print("  Skipped: not enough sequences.")
@@ -1429,16 +1458,16 @@ def main():
             patience=config.tat_patience,
             weight_decay=config.tat_weight_decay,
             min_delta=config.tat_min_delta)
-        tat_trainer.fit(seq_train,
-                        seq_val_normal if len(seq_val_normal) > 0 else None)
+        tat_trainer.fit(seq_train, seq_val_normal)
         trainers_dict['TA-AE'] = tat_trainer
         tat_st = tat_trainer.reconstruction_error(seq_test)
         tat_sv = tat_trainer.reconstruction_error(seq_val)
         th_tat = float(np.percentile(
-            tat_sv[seq_y_val == 0], config.threshold_percentile))
+            tat_sv[benign_val_windows], config.threshold_percentile))
         results_list.append(evaluate_model(
             "Temporal-Attention-AE", tat_st, seq_y_test,
             seq_at_test, threshold=th_tat))
+        results_list[-1]["y_true"] = seq_y_test
 
     # ── 7. Random Forest ──
     print("\n[7] Random Forest...")
@@ -1522,7 +1551,7 @@ def main():
     print("\n[10] Specialized Ensemble...")
     ensemble = EnsembleDetector(FEATURE_GROUPS, pipeline.feature_cols,
                                 config.seed)
-    ensemble.fit(X_train_normal)
+    ensemble.fit(X_train_normal, X_val_normal)
     ens_sv = ensemble.score(X_val)
     ens_st = ensemble.score(X_test)
     ens_results = []
@@ -1538,70 +1567,43 @@ def main():
     # ── 11. Meta-Ensemble ──
     print("\n[11] Meta-Ensemble...")
 
-    # Stacking guard: the meta learner must never see in-sample predictions
-    # from base learners. Fit it on validation predictions only, then freeze
-    # the normalization and apply that transform to the untouched test set.
-    meta_val_raw = np.column_stack([
-        iso_sv,
-        svm_sv,
-        ae_sv,
-        vae_sv,
-        casc_pv,
-        casc2_pv,
-        rf_pv,
-        gb_pv,
+    # Use raw cascade branch probabilities, independent of validation labels.
+    stack_general = cascade.predict_proba_stage1(X_stack)
+    stack_compromise = cascade.predict_proba_stage2(None, X_stack)
+    meta_stack = np.column_stack([
+        -iso.score_samples(apply_iso_robust_bounds(X_stack, iso_low, iso_high)),
+        -svm.score_samples(X_stack),
+        ae_trainer.reconstruction_error(X_stack), vae_trainer.anomaly_score(X_stack),
+        stack_general, stack_compromise,
+        rf.predict_proba(X_stack)[:, 1], gb.predict_proba(X_stack)[:, 1],
     ])
-    meta_test_raw = np.column_stack([
-        iso_st, svm_st, ae_st, vae_st, casc_pt, casc2_pt, rf_pt, gb_pt,
+    meta_val = np.column_stack([
+        iso_sv, svm_sv, ae_sv, vae_sv, casc1_pv, casc2_pv, rf_pv, gb_pv,
     ])
-    meta_p1 = np.percentile(meta_val_raw, 1, axis=0)
-    meta_p99 = np.percentile(meta_val_raw, 99, axis=0)
-
-    def apply_meta_norm(a):
-        return np.clip(
-            (a - meta_p1) / (meta_p99 - meta_p1 + 1e-9), 0, 1)
-
-    meta_val = apply_meta_norm(meta_val_raw)
-    meta_test = apply_meta_norm(meta_test_raw)
-
+    meta_test = np.column_stack([
+        iso_st, svm_st, ae_st, vae_st, casc1_pt, casc2_pt, rf_pt, gb_pt,
+    ])
     meta_gb = GradientBoostingClassifier(
         n_estimators=120, learning_rate=0.03, max_depth=2,
-        min_samples_leaf=20, subsample=0.80,
+        min_samples_leaf=30, subsample=0.80,
         random_state=config.seed)
-    meta_gb.fit(meta_val, y_val)
-    meta_fit_scores = meta_gb.predict_proba(meta_val)[:, 1]
+    meta_gb.fit(meta_stack, y_stack)
+    meta_fit_scores = meta_gb.predict_proba(meta_stack)[:, 1]
+    meta_val_scores = meta_gb.predict_proba(meta_val)[:, 1]
     meta_pt = meta_gb.predict_proba(meta_test)[:, 1]
-    # Meta threshold is also compromise-aware: lower it only as far as the
-    # validation benign FPR budget permits, using node_compromise labels solely
-    # from validation.  Test labels remain untouched.
-    meta_base_th, _ = select_supervised_threshold(
-        meta_fit_scores, y_val, config.compromise_general_fpr_budget)
-    meta_base = meta_fit_scores >= meta_base_th
-    benign_val = y_val == 0
-    comp_val = y_val_comp == 1
-    max_meta_fp = int(np.floor(
-        config.compromise_total_fpr_budget * max(1, benign_val.sum())))
-    candidate_th = np.unique(meta_fit_scores)
-    candidate_th = np.sort(candidate_th)[::-1]
-    th_meta = meta_base_th
-    best_meta_recall = (
-        float(np.mean(meta_base[comp_val])) if comp_val.any() else 0.0)
-    best_meta_f1 = f1_score(y_val, meta_base, zero_division=0)
-    for th in candidate_th:
-        pred = meta_fit_scores >= th
-        if int(np.sum(pred & benign_val)) > max_meta_fp:
-            continue
-        rec = float(np.mean(pred[comp_val])) if comp_val.any() else 0.0
-        f1v = f1_score(y_val, pred, zero_division=0)
-        if (rec > best_meta_recall + 1e-12 or
-                (abs(rec - best_meta_recall) <= 1e-12 and
-                 f1v > best_meta_f1)):
-            th_meta, best_meta_recall, best_meta_f1 = float(th), rec, f1v
-    print(
-        f"  Meta compromise-aware threshold: {th_meta:.6f}; "
-        f"validation compromise recall={best_meta_recall:.3f}, "
-        f"F1={best_meta_f1:.3f}"
+    _, th_meta, _, meta_threshold_info = select_compromise_aware_thresholds(
+        meta_val_scores, meta_val_scores, y_val, y_val_comp,
+        general_fpr_budget=config.compromise_general_fpr_budget,
+        total_fpr_budget=config.compromise_total_fpr_budget,
+        target_recall=config.compromise_target_recall,
     )
+    # The two inputs are identical, so their OR uses the lower threshold.
+    th_meta = min(th_meta, meta_threshold_info["general_threshold"])
+    meta_threshold_info["decision_threshold"] = th_meta
+    best_meta_recall = meta_threshold_info["validation_compromise_recall"]
+    print(f"  Meta threshold: {th_meta:.6f}; validation compromise recall="
+          f"{best_meta_recall:.3f}")
+
     meta_result = evaluate_model(
         "Meta-Ensemble", meta_pt, y_test, attack_types_test,
         threshold=th_meta)
@@ -1709,7 +1711,10 @@ def main():
         "method": {
             "neural_early_stopping": "best benign-validation loss, restored weights",
             "unsupervised_thresholds": "95th percentile of benign validation only",
-            "meta_stacking": "fit on validation predictions; normalization fit on validation only",
+            "split_protocol": pipeline.split_protocol,
+            "sequences": "consecutive intervals; wholly benign fit and validation windows",
+            "specialized_scaling": "frozen quantiles from benign training scores",
+            "meta_stacking": "fit on separate stacking predictions; threshold on validation",
             "supervised_thresholds": (
                 f"validation-only max-F1 subject to FPR <= "
                 f"{config.supervised_max_fpr:.3f}"
@@ -1720,13 +1725,18 @@ def main():
         "supervised": {},
     }
 
-    for name, trainer in trainers_dict.items():
+    diagnostic_trainers = {
+        **trainers_dict,
+        **{f"Ens:{name}": detector.models["ae_trainer"]
+           for name, detector in ensemble.detectors.items()},
+    }
+    for name, trainer in diagnostic_trainers.items():
         vals = np.asarray(trainer.val_losses, dtype=float)
         trs = np.asarray(
             getattr(trainer, "train_eval_losses", trainer.train_losses),
             dtype=float)
         if len(vals) and len(trs):
-            best_idx = int(np.argmin(vals))
+            best_idx = trainer.best_epoch - 1
             overfit_diag["neural"][name] = {
                 "epochs_run": int(len(trs)),
                 "best_epoch": best_idx + 1,
@@ -1737,11 +1747,11 @@ def main():
                 "final_val_loss": float(vals[-1]),
             }
 
-    def split_ap(model_name, p_train, p_val, p_test):
+    def ap_across_splits(p_train, p_val, p_test):
         train_ap = float(average_precision_score(y_train, p_train))
         val_ap = float(average_precision_score(y_val, p_val))
         test_ap = float(average_precision_score(y_test, p_test))
-        overfit_diag["supervised"][model_name] = {
+        return {
             "train_auc_pr": train_ap,
             "val_auc_pr": val_ap,
             "test_auc_pr": test_ap,
@@ -1749,14 +1759,12 @@ def main():
             "val_minus_test_auc_pr": val_ap - test_ap,
         }
 
-    split_ap(
-        "Random Forest",
+    overfit_diag["supervised"]["Random Forest"] = ap_across_splits(
         rf.predict_proba(X_train)[:, 1],
         rf.predict_proba(X_val)[:, 1],
         rf_pt,
     )
-    split_ap(
-        "Gradient Boosting",
+    overfit_diag["supervised"]["Gradient Boosting"] = ap_across_splits(
         gb.predict_proba(X_train)[:, 1],
         gb.predict_proba(X_val)[:, 1],
         gb_pt,
@@ -1765,22 +1773,57 @@ def main():
         X_train, X_train_comp)
     casc_train = combine_cascade_scores(
         casc1_train, casc2_train, th_casc1, th_casc2)
-    split_ap(
-        "Cascade",
+    overfit_diag["supervised"]["Cascade"] = ap_across_splits(
         casc_train,
         casc_pv,
         casc_pt,
     )
+    meta_fit_ap = float(average_precision_score(y_stack, meta_fit_scores))
+    meta_val_ap = float(average_precision_score(y_val, meta_val_scores))
+    meta_test_ap = float(average_precision_score(y_test, meta_pt))
     overfit_diag["supervised"]["Meta-Ensemble"] = {
-        "fit_auc_pr_on_validation": float(
-            average_precision_score(y_val, meta_fit_scores)
-        ),
-        "test_auc_pr": float(average_precision_score(y_test, meta_pt)),
-        "fit_minus_test_auc_pr": float(
-            average_precision_score(y_val, meta_fit_scores)
-            - average_precision_score(y_test, meta_pt)
-        ),
+        "fit_auc_pr_on_stack": meta_fit_ap,
+        "val_auc_pr": meta_val_ap,
+        "test_auc_pr": meta_test_ap,
+        "fit_minus_val_auc_pr": meta_fit_ap - meta_val_ap,
+        "val_minus_test_auc_pr": meta_val_ap - meta_test_ap,
     }
+
+    if config.compare_tree_reference:
+        print("\n  Comparing previous tree capacities on the same partitions")
+        forest_params = dict(max_depth=16, min_samples_leaf=3,
+                             min_samples_split=6, max_samples=0.85)
+        ref_rf = clone(rf).set_params(**forest_params).fit(X_train, y_train)
+        ref_gb = clone(gb).set_params(
+            max_depth=4, min_samples_leaf=12, subsample=0.90).fit(X_train, y_train)
+        ref_cascade = CascadeCompromiseDetector(config, config.seed)
+        ref_cascade.stage1_rf.set_params(**forest_params)
+        for expert in ref_cascade.stage2_hgbs:
+            expert.set_params(max_leaf_nodes=31, max_depth=8,
+                              min_samples_leaf=20, l2_regularization=1.0)
+        ref_cascade.fit(X_train, y_train, X_train_comp, y_train_comp)
+        ref_v1, ref_v2 = ref_cascade.predict_components(X_val, X_val_comp)
+        ref_t1, ref_t2, ref_v, _ = select_compromise_aware_thresholds(
+            ref_v1, ref_v2, y_val, y_val_comp,
+            general_fpr_budget=config.compromise_general_fpr_budget,
+            total_fpr_budget=config.compromise_total_fpr_budget,
+            target_recall=config.compromise_target_recall,
+        )
+        ref_train = combine_cascade_scores(
+            *ref_cascade.predict_components(X_train, X_train_comp), ref_t1, ref_t2)
+        ref_test = combine_cascade_scores(
+            *ref_cascade.predict_components(X_test, X_test_comp), ref_t1, ref_t2)
+        overfit_diag["supervised_reference"] = {
+            "Random Forest": ap_across_splits(*[
+                ref_rf.predict_proba(X)[:, 1] for X in (X_train, X_val, X_test)]),
+            "Gradient Boosting": ap_across_splits(*[
+                ref_gb.predict_proba(X)[:, 1] for X in (X_train, X_val, X_test)]),
+            "Cascade": {
+                **ap_across_splits(ref_train, ref_v, ref_test),
+                "test_compromise_recall": float(np.mean(ref_test[y_test_comp == 1] >= 1)),
+                "test_benign_fpr": float(np.mean(ref_test[y_test == 0] >= 1)),
+            },
+        }
 
     # Explicit node-compromise recall report for reproducible acceptance.
     comp_test_mask = attack_types_test == "node_compromise"
@@ -1788,6 +1831,7 @@ def main():
     meta_test_pred = meta_pt >= th_meta
     compromise_diag = {
         "validation": compromise_threshold_info,
+        "meta_validation": meta_threshold_info,
         "test": {
             "cascade_compromise_recall": float(
                 np.mean(cascade_test_pred[comp_test_mask])
@@ -1874,7 +1918,7 @@ def main():
 
     # История обучения нейросетевых моделей
     trainers_history = {}
-    for name, trainer in trainers_dict.items():
+    for name, trainer in diagnostic_trainers.items():
         trainers_history[name] = {
             "train_losses": list(trainer.train_losses),
             "train_eval_losses": list(
@@ -1936,4 +1980,17 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train-data", default=TrainingConfig.data_path)
+    parser.add_argument("--validation-data")
+    parser.add_argument("--stack-data")
+    parser.add_argument("--test-data")
+    parser.add_argument("--compare-tree-reference", action="store_true")
+    parser.add_argument("--results-dir", default=TrainingConfig.results_dir)
+    args = parser.parse_args()
+    main(TrainingConfig(
+        data_path=args.train_data, validation_path=args.validation_data,
+        stack_path=args.stack_data, test_path=args.test_data,
+        results_dir=args.results_dir, compare_tree_reference=args.compare_tree_reference,
+        plots_dir=str(Path(args.results_dir) / "plots"),
+    ))

@@ -1,0 +1,85 @@
+name: Diameter generalization and publication figures
+
+on:
+  push:
+    branches: [regularize/diameter-generalization-v2]
+    paths:
+      - "diameter/diameter_training_v1.py"
+      - "diameter/diameter_sim_v1.py"
+      - "diameter/diameter_generate_plots.py"
+      - ".github/workflows/diameter-generalization.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: diameter-generalization-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generalization:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+      OPENBLAS_NUM_THREADS: "4"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install CPU training dependencies
+        run: |
+          python -m pip install numpy pandas scipy networkx scikit-learn matplotlib
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m py_compile diameter/diameter_{sim_v1,training_v1,generate_plots}.py
+      - name: Retrieve fixed calibration and training simulation
+        uses: actions/download-artifact@v4
+        with:
+          name: diameter-calibrated-full-experiment
+          path: archived
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 45449352344
+      - name: Generate separate validation, stacking and test simulations
+        env:
+          DIAMETER_CALIBRATION_PROFILE: archived/results_diameter_calibration/calibration_profile.json
+        run: |
+          test -s "$DIAMETER_CALIBRATION_PROFILE"
+          test -s archived/diameter_dataset_v1.csv
+          python diameter/diameter_sim_v1.py --seed 43 --out validation.csv
+          python diameter/diameter_sim_v1.py --seed 44 --out stacking.csv
+          python diameter/diameter_sim_v1.py --seed 45 --out test.csv
+          mkdir -p results_diameter_v1
+          sha256sum archived/diameter_dataset_v1.csv validation.csv stacking.csv test.csv "$DIAMETER_CALIBRATION_PROFILE" \
+            | tee results_diameter_v1/dataset_sha256.txt
+      - name: Train and compare tree capacities on identical partitions
+        run: |
+          python -u diameter/diameter_training_v1.py \
+            --train-data archived/diameter_dataset_v1.csv \
+            --validation-data validation.csv --stack-data stacking.csv --test-data test.csv \
+            --compare-tree-reference
+      - name: Generate publication PNG and SVG from saved results
+        run: |
+          python diameter/diameter_generate_plots.py \
+            --results-dir results_diameter_v1 \
+            --calibration-verification archived/results_diameter_calibration/calibrated_dataset_verification.json
+          for stem in 07_training_curves 09_supervised_generalization 13_node_compromise_recall 14_specialized_training_curves 15_tree_regularization; do
+            test -s "results_diameter_v1/publication_plots/${stem}.png"
+            test -s "results_diameter_v1/publication_plots/${stem}.svg"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diameter-generalization-results
+          path: |
+            results_diameter_v1/publication_plots/
+            results_diameter_v1/plot_artifacts.json
+            results_diameter_v1/overfitting_diagnostics.json
+            results_diameter_v1/compromise_recall_diagnostics.json
+            results_diameter_v1/full_comparison_diameter.csv
+            results_diameter_v1/dataset_sha256.txt
+          if-no-files-found: warn

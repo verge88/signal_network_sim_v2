@@ -156,9 +156,10 @@ def plot_roc(results_list: Sequence[dict], y_test: np.ndarray,
         if name not in ROC_MODELS:
             continue
         scores = np.asarray(r.get("scores", []))
-        if len(scores) != len(y_test):
+        labels = np.asarray(r.get("y_true", y_test))
+        if len(scores) != len(labels):
             continue
-        fpr, tpr, _ = roc_curve(y_test, scores)
+        fpr, tpr, _ = roc_curve(labels, scores)
         ax.plot(fpr, tpr, linestyle=styles[idx % len(styles)],
                 label=f"{name} (AUC={r['auc_roc']:.3f})")
         plotted += 1
@@ -182,9 +183,10 @@ def plot_pr(results_list: Sequence[dict], y_test: np.ndarray,
         if name not in ROC_MODELS:
             continue
         scores = np.asarray(r.get("scores", []))
-        if len(scores) != len(y_test):
+        labels = np.asarray(r.get("y_true", y_test))
+        if len(scores) != len(labels):
             continue
-        precision, recall, _ = precision_recall_curve(y_test, scores)
+        precision, recall, _ = precision_recall_curve(labels, scores)
         ax.plot(recall, precision, linestyle=styles[idx % len(styles)],
                 label=f"{name} (AP={r['auc_pr']:.3f})")
         plotted += 1
@@ -326,13 +328,18 @@ def plot_ablation(artifacts: dict, out_dir: Path) -> List[str]:
 
 
 def plot_training_curves(artifacts: dict, diagnostics: dict,
-                         out_dir: Path) -> List[str]:
-    histories = artifacts.get("trainers_history", {})
+                         out_dir: Path, specialized: bool = False) -> List[str]:
+    histories = {
+        name: hist for name, hist in artifacts.get("trainers_history", {}).items()
+        if name.startswith("Ens:") == specialized
+    }
     if not histories:
         return []
     n = len(histories)
-    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
-    axes = np.ravel(axes)
+    cols = 3 if specialized else 2
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(5.3 * cols, 3.8 * rows), squeeze=False)
+    axes = axes.ravel()
     neural_diag = diagnostics.get("neural", {})
 
     for ax, (name, hist) in zip(axes, histories.items()):
@@ -352,14 +359,20 @@ def plot_training_curves(artifacts: dict, diagnostics: dict,
                        label=f"Лучшая эпоха: {best_epoch}")
         ax.set_yscale("log")
         ax.set_xlabel("Эпоха")
-        ax.set_ylabel("Ошибка реконструкции")
-        ax.set_title(name)
+        ax.set_ylabel("Ошибка реконструкции + штраф KL" if name == "VAE"
+                      else "Ошибка реконструкции (MSE)")
+        ax.set_title(name.removeprefix("Ens:"))
         ax.legend()
     for ax in axes[n:]:
         ax.axis("off")
-    fig.suptitle("Кривые обучения нейросетевых детекторов Diameter", y=1.01)
+    if specialized:
+        fig.suptitle("Кривые обучения специализированных автоэнкодеров Diameter")
+        stem = "14_specialized_training_curves"
+    else:
+        fig.suptitle("Кривые обучения нейросетевых детекторов Diameter")
+        stem = "07_training_curves"
     fig.tight_layout()
-    return save_figure(fig, out_dir, "07_training_curves")
+    return save_figure(fig, out_dir, stem)
 
 
 def plot_confusion(results_list: Sequence[dict], y_test: np.ndarray,
@@ -409,17 +422,17 @@ def plot_supervised_generalization(diagnostics: dict,
     test = []
     for n in names:
         d = sup[n]
-        train.append(float(d.get("train_auc_pr", np.nan)))
+        train.append(float(d.get("train_auc_pr", d.get("fit_auc_pr_on_stack", np.nan))))
         val.append(float(d.get("val_auc_pr", d.get("fit_auc_pr_on_validation", np.nan))))
         test.append(float(d.get("test_auc_pr", np.nan)))
 
     x = np.arange(len(names))
     w = 0.25
     fig, ax = plt.subplots(figsize=(9.5, 5))
-    ax.bar(x-w, train, w, label="Train", facecolor="0.20", edgecolor="black")
-    ax.bar(x, val, w, label="Validation", facecolor="0.55",
+    ax.bar(x-w, train, w, label="Обучение (для Meta — stacking)", facecolor="0.20", edgecolor="black")
+    ax.bar(x, val, w, label="Валидация", facecolor="0.55",
            edgecolor="black", hatch="//")
-    ax.bar(x+w, test, w, label="Test", facecolor="0.85",
+    ax.bar(x+w, test, w, label="Тест", facecolor="0.85",
            edgecolor="black", hatch="..")
     ax.set_xticks(x)
     ax.set_xticklabels(names, rotation=20, ha="right")
@@ -429,6 +442,33 @@ def plot_supervised_generalization(diagnostics: dict,
     ax.legend(ncol=3)
     fig.tight_layout()
     return save_figure(fig, out_dir, "09_supervised_generalization")
+
+
+def plot_tree_regularization(diagnostics: dict, out_dir: Path) -> List[str]:
+    reference = diagnostics.get("supervised_reference", {})
+    candidate = diagnostics.get("supervised", {})
+    names = [name for name in reference if name in candidate]
+    if not names:
+        return []
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    x = np.arange(len(names))
+    for ax, key, title, ylabel, scale in (
+        (axes[0], "train_minus_val_auc_pr", "Разрыв между обучением и валидацией", "Разрыв, п. п.", 100),
+        (axes[1], "test_auc_pr", "Качество на тестовой симуляции", "AUC-PR (AP)", 1),
+    ):
+        ax.bar(x - 0.18, [reference[name][key] * scale for name in names],
+               0.36, label="Прежние настройки", color="0.80", edgecolor="black", hatch="//")
+        ax.bar(x + 0.18, [candidate[name][key] * scale for name in names],
+               0.36, label="Новые настройки", color="0.35", edgecolor="black")
+        ax.axhline(0, color="0.2", linewidth=0.8)
+        ax.set_xticks(x, names)
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+    axes[1].set_ylim(0, 1)
+    axes[0].legend()
+    fig.tight_layout()
+    return save_figure(fig, out_dir, "15_tree_regularization")
 
 
 def plot_fpr_vs_f1(df: pd.DataFrame, out_dir: Path) -> List[str]:
@@ -621,8 +661,10 @@ def main() -> None:
     generated += plot_feature_importance(artifacts, out_dir)
     generated += plot_ablation(artifacts, out_dir)
     generated += plot_training_curves(artifacts, diagnostics, out_dir)
+    generated += plot_training_curves(artifacts, diagnostics, out_dir, specialized=True)
     generated += plot_confusion(results_list, y_test, out_dir)
     generated += plot_supervised_generalization(diagnostics, out_dir)
+    generated += plot_tree_regularization(diagnostics, out_dir)
     generated += plot_fpr_vs_f1(metrics, out_dir)
     generated += plot_external_validation(external_attacks, out_dir)
     generated += plot_calibration(calibration, out_dir)
