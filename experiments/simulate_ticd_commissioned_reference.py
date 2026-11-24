@@ -8,6 +8,7 @@ observed counters, inventory and CU telemetry.
 """
 from __future__ import annotations
 from unittest.mock import patch
+import json
 import numpy as np
 import pandas as pd
 from sip_sim_v4_claude import SIPSimulator
@@ -80,5 +81,7 @@ def observed_group(seeds,cal,kind,causal):
                    "independent_dynamic_rng":True,"persistent_link_heterogeneity":True,
                    "within_run_shift":shift})
         references.append(c);parts.append(x);masters.append(m);meta.append(md)
+    print("NODE_RUNS",json.dumps({"kind":kind,"seeds":seeds,"operational_rows":sum(map(len,parts)),
+          "commissioning_rows":sum(map(len,references))}),flush=True)
     return (pd.concat(parts,ignore_index=True),pd.concat(masters,ignore_index=True),meta,
             pd.concat(references,ignore_index=True))
