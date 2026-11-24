@@ -1709,6 +1709,9 @@ def score_cli(args) -> None:
         guard_scores = []
         matched_profiles = []
         matched_profile_scores = []
+        burst_channel_scores = []
+        shape_channel_scores = []
+        trigger_channels = []
         local_preds = []
         for rec in manifest.to_dict("records"):
             feat = pcap_to_native_features(
@@ -1730,6 +1733,13 @@ def score_cli(args) -> None:
             pvals = scored.get("profile_scores", {})
             matched_profile_scores.append(
                 float(min(pvals.values())) if pvals else float("nan"))
+            cvals = scored.get("channel_scores", {})
+            burst_channel_scores.append(float(
+                cvals.get("burst_timing", float("nan"))))
+            shape_channel_scores.append(float(
+                cvals.get("protocol_shape", float("nan"))))
+            trigger_channels.append(str(scored.get(
+                "trigger_channel", "unknown")))
             local_preds.append(int(scored["local_score"] > 1.0))
         pred["frozen_supervised_pred_anomaly"] = (
             pred["pcap_native_pred_anomaly"].astype(int))
@@ -1741,6 +1751,9 @@ def score_cli(args) -> None:
         pred["local_guard_score"] = guard_scores
         pred["matched_benign_profile"] = matched_profiles
         pred["matched_benign_profile_score"] = matched_profile_scores
+        pred["local_burst_timing_score"] = burst_channel_scores
+        pred["local_protocol_shape_score"] = shape_channel_scores
+        pred["local_trigger_channel"] = trigger_channels
         pred["local_oneclass_pred_anomaly"] = local_preds
         # Detection decision in deployment-local mode is one-class.  The
         # frozen supervised score remains available as explanatory evidence
