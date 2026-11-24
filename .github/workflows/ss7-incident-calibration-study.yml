@@ -1,0 +1,97 @@
+name: SS7 incident calibration and strict local controls
+on:
+  push:
+    branches: [ss7-incident-calibration-study]
+    paths: [.github/workflows/ss7-incident-calibration-study.yml, ss7/incident_calibration_study.py]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-incident-calibration-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  train-local:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/incident_calibration_study.py
+      - name: Check confirmation and notification semantics
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          import numpy as np
+          from ss7.incident_calibration_study import triple, notify, threshold, bucket_peaks
+          d=pd.DataFrame(dict(nid=[1]*6+[2]*4,t=[56,57,58,59,60,62,57,58,59,60]))
+          s=np.ones(len(d))
+          z=triple(d,s)
+          assert np.flatnonzero(z>.5).tolist()==[2,3,4,8,9]
+          assert notify(d,z,.5).tolist()==[2,4,8,9]
+          for budget in (0.,1.,2.):
+              p=np.array([.1,.4,.4,.9])
+              t=threshold(p,budget,1.)
+              assert (p>t).sum()<=budget
+          print("Confirmation, boundaries, deduplication and threshold checks passed")
+          PY
+      - run: python -u -m ss7.incident_calibration_study train --output results/local
+      - uses: actions/upload-artifact@v4
+        with:
+          name: incident-local-models
+          path: results/local
+  test:
+    needs: train-local
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        seed: [8701,8702,8703,8704,8705,8706,8707,8708]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: incident-local-models
+          path: results/local
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - run: python -u -m ss7.incident_calibration_study test --seed ${{ matrix.seed }} --local results/local/local_models.joblib --frozen results/frozen/models.joblib --output results/seed_${{ matrix.seed }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: incident-seed-${{ matrix.seed }}
+          path: results/seed_${{ matrix.seed }}
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: incident-seed-*
+          path: results/collected
+      - run: python -m ss7.incident_calibration_study aggregate --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-incident-summary
+          path: results/summary
