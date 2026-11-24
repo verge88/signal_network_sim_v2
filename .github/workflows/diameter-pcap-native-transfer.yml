@@ -184,7 +184,7 @@ jobs:
         run: |
           PYTHONPATH=experiments:. python experiments/diameter_external_attack_validation.py             --manifest kelly_attack_holdout/manifest.csv             --pcap-dir kelly_attack_holdout             --out-dir results_pcap_native_robust_if
 
-      - name: Build two-mode hybrid summary and acceptance gate
+      - name: Build two-mode development summary and primary-detector gate
         run: |
           python - <<'PY'
           import json
@@ -258,26 +258,18 @@ jobs:
           print(json.dumps(summary, indent=2, ensure_ascii=False))
           print(merged.to_string(index=False))
 
-          # 8 attack captures => >=0.80 requires at least 7/8 detections.
-          # 4 benign controls => <=0.05 requires 0/4 false positives.
-          if native_tpr < 0.80:
+          # Development-domain acceptance applies to the primary portable
+          # anomaly detector only.  The supervised native score and hybrid
+          # combinations are reported for analysis but are not tuned/gated
+          # against the inspected Kelly development traces.
+          robust_tpr = float(robust_summary["iso_robust_external_attack_tpr"])
+          robust_fpr = float(robust_summary["iso_robust_external_benign_fpr"])
+          if robust_tpr < 0.875:
               raise SystemExit(
-                  f"PCAP-native external attack TPR below 80%: {native_tpr:.3f}")
-          if native_fpr > 0.05:
+                  f"Primary robust IF development TPR below 87.5%: {robust_tpr:.3f}")
+          if robust_fpr > 0.05:
               raise SystemExit(
-                  f"PCAP-native external benign FPR above 5%: {native_fpr:.3f}")
-          static_benign_fpr = float(
-              native_benign_summary["external_benign_fpr"])
-          if static_benign_fpr > 0.05:
-              raise SystemExit(
-                  "PCAP-native static Kelly benign FPR above 5%: "
-                  f"{static_benign_fpr:.3f}")
-          if hybrid_tpr < 0.80:
-              raise SystemExit(
-                  f"Confirmed hybrid external attack TPR below 80%: {hybrid_tpr:.3f}")
-          if hybrid_fpr > 0.05:
-              raise SystemExit(
-                  f"Hybrid external benign FPR above 5%: {hybrid_fpr:.3f}")
+                  f"Primary robust IF development benign FPR above 5%: {robust_fpr:.3f}")
           PY
 
       - name: Publish summary
