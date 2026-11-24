@@ -50,7 +50,7 @@ def native(seed,cal,kind):
     slaves=[x for x in sim.topology.nodes.values() if x.role==NodeRole.SLAVE]
     frac=.04;m=10.;variable=False
     if kind.startswith("role_"):
-        _,role,loss=kind.split("_")
+        role,loss=kind.removeprefix("role_").rsplit("_",1)
         pool=[x.node_id for x in slaves if x.node_type.name==role.upper()]
         targets=[pool[seed%len(pool)]];m=float(loss.removeprefix("loss"))
     elif kind.startswith("group_"):
