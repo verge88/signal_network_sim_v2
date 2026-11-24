@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.stats import wilcoxon
+from itertools import combinations
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/"sip"),str(ROOT/"experiments")]
 from ticd_observability_factorial import FactorialTICD,FACTORS,PolicyEvidence,MultiObserverTICD
@@ -70,19 +71,17 @@ def factorial_effects(by_seed,policy):
     out={}
     for k,pairs in by_seed.items():
         out[k]={}
-        for factor in ("I1","I2","D"):
+        for subset in [s for order in (1,2,3) for s in combinations(("I1","I2","D"),order)]:
+            factor=":".join(subset)
             out[k][factor]={}
             for metric in ("confirmed_recall","confirmed_alert_FPR"):
                 differences=[]
                 for idx in range(len(TEST[k])):
-                    ds=[]
-                    for f in FACTORS:
-                        if factor in f:
-                            g=tuple(x for x in f if x!=factor)
-                            a=pairs[policy+"__"+factor_name(f)][idx][metric]
-                            b=pairs[policy+"__"+factor_name(g)][idx][metric]
-                            if a is not None and b is not None:ds.append(a-b)
-                    if ds:differences.append(float(np.mean(ds)))
+                    vals=[pairs[policy+"__"+factor_name(f)][idx][metric] for f in FACTORS]
+                    if any(v is None for v in vals):continue
+                    # Mean signed difference over the remaining factors.
+                    signed=[((-1)**(len(subset)-len(set(subset)&set(f))))*v for f,v in zip(FACTORS,vals)]
+                    differences.append(float(sum(signed)/(2**(3-len(subset)))))
                 if differences:
                     out[k][factor][metric]={"mean_paired_effect":float(np.mean(differences)),
                         "per_seed":differences}
@@ -173,7 +172,7 @@ def main():
       "real_field_validation":False,"observational_equivalence_verified":True,
       "source_run":45377337545,"training_seeds":TRAIN,"validation_seeds":VAL,"test_seeds":TEST,
       "references":references,"heldout":heldout,"per_seed":by_seed,"master_audit":masters,
-      "metadata":metadata,"factorial_main_effects":effects,"paired_full_vs_D":comparisons,
+      "metadata":metadata,"factorial_main_and_interaction_effects":effects,"paired_full_vs_D":comparisons,
       "test_used_for_selection":False,"external_audit_is_synthetic":True,
       "no_native_SBC_compromise_model":True,"label_and_batch_invariance":True,
       "normal_means_no_alert_not_known_benign":True}
