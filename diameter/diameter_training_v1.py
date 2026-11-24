@@ -30,7 +30,7 @@ from typing import List, Dict, Tuple, Optional
 
 from sklearn.ensemble import (
     IsolationForest, RandomForestClassifier, GradientBoostingClassifier,
-    ExtraTreesClassifier,
+    HistGradientBoostingClassifier,
 )
 from sklearn.svm import OneClassSVM
 from sklearn.preprocessing import StandardScaler, LabelEncoder
@@ -160,7 +160,7 @@ class TrainingConfig:
     cascade_rf_trees: int = 500
     cascade_gb_estimators: int = 300
     compromise_gb_positive_weight: float = 6.0
-    compromise_general_fpr_budget: float = 0.012
+    compromise_general_fpr_budget: float = 0.004
     compromise_total_fpr_budget: float = 0.020
     compromise_target_recall: float = 0.85
 
@@ -998,49 +998,30 @@ class CascadeCompromiseDetector:
             min_samples_split=config.rf_min_samples_split,
             max_features=config.rf_max_features,
             bootstrap=True, max_samples=config.rf_max_samples)
-        self.stage2_gb = GradientBoostingClassifier(
-            n_estimators=config.cascade_gb_estimators, learning_rate=0.03,
-            max_depth=3, min_samples_leaf=16, subsample=0.90,
-            random_state=seed)
-        self.stage2_rf = RandomForestClassifier(
-            n_estimators=config.cascade_rf_trees, random_state=seed,
-            class_weight="balanced_subsample", max_depth=12,
-            min_samples_leaf=6, min_samples_split=10,
-            max_features="sqrt", bootstrap=True, max_samples=0.90,
-            n_jobs=-1)
-        self.stage2_extra = ExtraTreesClassifier(
-            n_estimators=config.cascade_rf_trees, random_state=seed + 17,
-            class_weight="balanced", max_depth=14,
-            min_samples_leaf=4, min_samples_split=8,
-            max_features="sqrt", n_jobs=-1)
-        # A dedicated full-feature compromise classifier captures context that
-        # can be lost by the hand-selected stage-2 subset.
-        self.stage2_full_rf = RandomForestClassifier(
-            n_estimators=config.cascade_rf_trees, random_state=seed + 29,
-            class_weight="balanced_subsample", n_jobs=-1,
-            max_depth=14, min_samples_leaf=4, min_samples_split=8,
-            max_features="sqrt", bootstrap=True, max_samples=0.90)
+
+        # Dedicated compromise expert. Histogram boosting ranks the subtle
+        # node-compromise class better than the generic stage-2 ensemble
+        # while retaining explicit regularisation.
+        self.stage2_hgb = HistGradientBoostingClassifier(
+            max_iter=180,
+            learning_rate=0.06,
+            max_leaf_nodes=31,
+            max_depth=8,
+            min_samples_leaf=20,
+            l2_regularization=1.0,
+            class_weight="balanced",
+            random_state=seed + 17,
+        )
 
     def fit(self, X_full, y, X_comp, y_comp):
         print("  Cascade Stage 1: General RF...")
         self.stage1_rf.fit(X_full, y)
-        print("  Cascade Stage 2: compromise-aware GB + RF + ExtraTrees...")
-        sample_weight = np.where(
-            y_comp == 1, self.config.compromise_gb_positive_weight, 1.0)
-        self.stage2_gb.fit(X_comp, y_comp, sample_weight=sample_weight)
-        self.stage2_rf.fit(X_comp, y_comp)
-        self.stage2_extra.fit(X_comp, y_comp)
-        self.stage2_full_rf.fit(X_full, y_comp)
+        print("  Cascade Stage 2: full-feature compromise HistGB...")
+        self.stage2_hgb.fit(X_full, y_comp)
 
     def predict_components(self, X_full, X_comp):
         p1 = self.stage1_rf.predict_proba(X_full)[:, 1]
-        p2_gb = self.stage2_gb.predict_proba(X_comp)[:, 1]
-        p2_rf = self.stage2_rf.predict_proba(X_comp)[:, 1]
-        p2_extra = self.stage2_extra.predict_proba(X_comp)[:, 1]
-        p2_full = self.stage2_full_rf.predict_proba(X_full)[:, 1]
-        # Max pooling is intentional: the validation-only threshold controls
-        # FPR, while any independent compromise signal may raise sensitivity.
-        p2 = np.maximum.reduce([p2_gb, p2_rf, p2_extra, p2_full])
+        p2 = self.stage2_hgb.predict_proba(X_full)[:, 1]
         return p1, p2
 
     def predict_proba(self, X_full, X_comp):
@@ -1051,8 +1032,7 @@ class CascadeCompromiseDetector:
         return self.stage1_rf.predict_proba(X)[:, 1]
 
     def predict_proba_stage2(self, X_comp, X_full):
-        _, p2 = self.predict_components(X_full, X_comp)
-        return p2
+        return self.stage2_hgb.predict_proba(X_full)[:, 1]
 
 
 # ══════════════════════════════════════════════════════════
