@@ -2,7 +2,7 @@ name: SS7 report-only invariant study
 on:
   push:
     branches: [ss7-report-only-invariant-study]
-    paths: [.github/workflows/ss7-report-only-invariant-study.yml]
+    paths: [.github/workflows/ss7-report-only-invariant-study.yml, ss7/report_only_invariant_study.py]
   workflow_dispatch:
 permissions:
   contents: read
