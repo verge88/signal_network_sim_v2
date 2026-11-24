@@ -63,9 +63,6 @@ from diameter_external_pcap_validation import (  # noqa: E402
     S6A_COMMANDS,
     _run_tshark,
     build_training_frame,
-    pcap_to_portable_features,
-    train_portable_models,
-    apply_robust_feature_transform,
 )
 
 SUPPORTED_PORTABLE_ATTACKS = {
@@ -79,7 +76,6 @@ EXTRA_FEATURES = [
     "pcap_log_total_pdus",
     "pcap_log_duration_s",
     "pcap_log_rate_hz",
-    "pcap_s6a_fraction",
     "pcap_s6a_fraction",
     "pcap_gx_fraction",
     "pcap_rx_fraction",
@@ -100,6 +96,7 @@ EXTRA_FEATURES = [
 PCAP_NATIVE_FEATURES = PORTABLE_FEATURES + EXTRA_FEATURES
 
 PROFILE_FEATURES = PORTABLE_FEATURES + [
+    "pcap_s6a_fraction",
     "pcap_gx_fraction",
     "pcap_rx_fraction",
     "pcap_s13_fraction",
@@ -437,7 +434,6 @@ def _parse_pcap_rows(path: Path):
 
 
 def pcap_to_native_features(path: Path) -> Dict[str, float]:
-    base = pcap_to_portable_features(path)
     rows = _parse_pcap_rows(path)
     times = np.asarray([r[0] for r in rows], dtype=float)
     duration = max(float(times[-1] - times[0]), 1e-3)
