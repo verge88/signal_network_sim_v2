@@ -1228,14 +1228,28 @@ def temporal_block(df: pd.DataFrame, cols: List[str], win: int) -> pd.DataFrame:
 
 def zone_deviation(df: pd.DataFrame, cols: List[str],
                    zone_of: Dict[int, int]) -> pd.DataFrame:
-    """Отклонение от медианы зоны БЕЗ самого узла (leave-one-out),
-    иначе узел влияет на собственный эталон."""
+    """Peer median excluding the evaluated node; at least two observed peers."""
     out = df.copy()
     out["zone"] = out["nid"].map(zone_of)
+    if out.duplicated(["nid", "t"]).any():
+        raise ValueError("Duplicate node/time observation")
     for c in cols:
-        med = out.groupby(["zone", "t"])[c].transform("median")
-        cnt = out.groupby(["zone", "t"])[c].transform("count")
-        out[f"{c}__dev_zone"] = np.where(cnt > 2, out[c] - med, np.nan)
+        result = pd.Series(np.nan, index=out.index, dtype=float)
+        for _, sub in out.groupby("zone", sort=False):
+            p = sub.pivot(index="t", columns="nid", values=c)
+            if p.shape[1] < 3:
+                continue
+            a = p.to_numpy(float)
+            for j, nid in enumerate(p.columns):
+                peer = np.delete(a, j, axis=1)
+                valid = np.isfinite(peer).sum(axis=1) >= 2
+                median = np.full(len(p), np.nan)
+                median[valid] = np.nanmedian(peer[valid], axis=1)
+                dev = pd.Series(a[:, j] - median, index=p.index)
+                mask = sub["nid"] == nid
+                ix = sub.index[mask]
+                result.loc[ix] = sub.loc[ix, "t"].map(dev).to_numpy()
+        out[f"{c}__dev_zone"] = result
     return out.drop(columns=["zone"])
 
 
