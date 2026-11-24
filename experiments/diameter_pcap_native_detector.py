@@ -35,6 +35,8 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     average_precision_score,
     balanced_accuracy_score,
@@ -90,6 +92,8 @@ EXTRA_FEATURES = [
     "pcap_air_ratio_std",
     "pcap_ulr_ratio_std",
     "pcap_active_command_fraction",
+    "pcap_log_burst_mass",
+    "pcap_log_pdus_per_active_command",
 ]
 PCAP_NATIVE_FEATURES = PORTABLE_FEATURES + EXTRA_FEATURES
 
@@ -108,6 +112,8 @@ VOLUME_FEATURES = [
     "pcap_bin_count_cv",
     "pcap_bin_count_peak_ratio",
     "pcap_bin_count_autocorr",
+    "pcap_log_burst_mass",
+    "pcap_log_pdus_per_active_command",
 ]
 TEMPORAL_FEATURES = [
     "pcap_iat_cv",
@@ -118,6 +124,14 @@ TEMPORAL_FEATURES = [
     "pcap_bin_s6a_fraction_std",
     "pcap_air_ratio_std",
     "pcap_ulr_ratio_std",
+]
+META_RAW_FEATURES = [
+    "pcap_log_total_pdus",
+    "pcap_log_duration_s",
+    "pcap_log_rate_hz",
+    "pcap_log_burst_mass",
+    "pcap_log_pdus_per_active_command",
+    "pcap_active_command_fraction",
 ]
 
 
@@ -296,6 +310,9 @@ def _aggregate_sim_window(win: pd.DataFrame, interval_s: float = 15.0):
         "pcap_air_ratio_std": float(np.std(air_rows)),
         "pcap_ulr_ratio_std": float(np.std(ulr_rows)),
         "pcap_active_command_fraction": float(active / (len(S6A_COMMANDS) + len(GX_COMMANDS))),
+        "pcap_log_burst_mass": float(np.log1p(max(total * rate, 0.0))),
+        "pcap_log_pdus_per_active_command": float(
+            np.log1p(total / max(active, 1))),
         "is_anomaly": label,
         "attack_type": attack_type,
     })
@@ -344,8 +361,18 @@ def domain_randomise(
         rate = np.expm1(x["pcap_log_rate_hz"].to_numpy(float))
         x["pcap_log_total_pdus"] = np.log1p(np.maximum(0.0, total * traffic_scale))
         x["pcap_log_duration_s"] = np.log1p(np.maximum(1e-3, duration * time_scale))
-        x["pcap_log_rate_hz"] = np.log1p(
-            np.maximum(0.0, rate * traffic_scale / time_scale))
+        scaled_total = np.maximum(0.0, total * traffic_scale)
+        scaled_rate = np.maximum(
+            0.0, rate * traffic_scale / time_scale)
+        x["pcap_log_rate_hz"] = np.log1p(scaled_rate)
+        x["pcap_log_burst_mass"] = np.log1p(
+            np.maximum(0.0, scaled_total * scaled_rate))
+        active_frac = np.maximum(
+            x["pcap_active_command_fraction"].to_numpy(float), 1e-6)
+        active_count = active_frac * (
+            len(S6A_COMMANDS) + len(GX_COMMANDS) + 4)
+        x["pcap_log_pdus_per_active_command"] = np.log1p(
+            scaled_total / np.maximum(active_count, 1.0))
 
         # Small domain-level shifts in command mixtures emulate vendor and
         # deployment differences while keeping attack structure intact.
@@ -487,6 +514,10 @@ def pcap_to_native_features(path: Path) -> Dict[str, float]:
         "pcap_active_command_fraction": float(
             len(command_pairs) / (len(S6A_COMMANDS) + len(GX_COMMANDS) + 4)
         ),
+        "pcap_log_burst_mass": float(
+            np.log1p(total * (total / duration))),
+        "pcap_log_pdus_per_active_command": float(
+            np.log1p(total / max(len(command_pairs), 1))),
         "_decoded_pdus": float(total),
         "_duration_s": float(duration),
     })
@@ -526,8 +557,12 @@ def protocol_archetype_frame(
             total = float(np.exp(rng.uniform(np.log(30.0), np.log(2500.0))))
             duration = float(np.exp(rng.uniform(np.log(0.05), np.log(12.0))))
         else:
-            total = float(np.exp(rng.uniform(np.log(4.0), np.log(36.0))))
-            duration = float(np.exp(rng.uniform(np.log(0.4), np.log(35.0))))
+            total = float(np.exp(rng.uniform(np.log(2.0), np.log(48.0))))
+            # Orange calibration includes very short benign request/answer
+            # exchanges, so benign timing must span sub-millisecond-scale
+            # captures as well as ordinary paced procedures.
+            duration = float(np.exp(
+                rng.uniform(np.log(0.001), np.log(40.0))))
 
         # Add broad overlap so the classifier cannot reduce the task to one
         # hard count cutoff.
@@ -573,6 +608,10 @@ def protocol_archetype_frame(
                 np.sum(noisy > 0.02) /
                 (len(S6A_COMMANDS) + len(GX_COMMANDS) + 4)
             ),
+            "pcap_log_burst_mass": float(
+                np.log1p(total * rate)),
+            "pcap_log_pdus_per_active_command": float(
+                np.log1p(total / max(np.sum(noisy > 0.02), 1))),
             "is_anomaly": int(attack),
             "attack_type": profile_name if attack else "none",
             "protocol_archetype": profile_name,
@@ -609,8 +648,15 @@ def _branch_scores(bundle: dict, X: pd.DataFrame) -> np.ndarray:
     return np.column_stack(scores)
 
 
+def _meta_matrix(bundle: dict, X: pd.DataFrame) -> np.ndarray:
+    branch = _branch_scores(bundle, X)
+    raw_cols = bundle.get("meta_raw_features", META_RAW_FEATURES)
+    raw = X[raw_cols].to_numpy(dtype=float)
+    return np.column_stack([branch, raw])
+
+
 def _meta_score(bundle: dict, X: pd.DataFrame) -> np.ndarray:
-    return bundle["meta"].predict_proba(_branch_scores(bundle, X))[:, 1]
+    return bundle["meta"].predict_proba(_meta_matrix(bundle, X))[:, 1]
 
 
 def _metrics(y: np.ndarray, score: np.ndarray, threshold: float) -> Dict[str, float]:
@@ -690,13 +736,17 @@ def train_detector(
         "branches": branches,
         "branch_features": branch_features,
     }
-    meta_X = _branch_scores(temp_bundle, meta_fit[PCAP_NATIVE_FEATURES])
+    temp_bundle["meta_raw_features"] = META_RAW_FEATURES
+    meta_X = _meta_matrix(temp_bundle, meta_fit[PCAP_NATIVE_FEATURES])
     y_meta = meta_fit["is_anomaly"].astype(int).to_numpy()
-    meta = LogisticRegression(
-        C=0.5,
-        class_weight="balanced",
-        max_iter=2000,
-        random_state=105,
+    meta = make_pipeline(
+        StandardScaler(),
+        LogisticRegression(
+            C=0.25,
+            class_weight="balanced",
+            max_iter=3000,
+            random_state=105,
+        ),
     ).fit(meta_X, y_meta)
 
     bundle = {
@@ -705,6 +755,7 @@ def train_detector(
         "branch_features": branch_features,
         "branches": branches,
         "meta": meta,
+        "meta_raw_features": META_RAW_FEATURES,
         "threshold": None,
         "threshold_method": None,
         "seed_roles": {
@@ -763,6 +814,7 @@ def train_detector(
             "standalone PCAP lacks CU/report inconsistency evidence"
         ),
         "feature_count": len(PCAP_NATIVE_FEATURES),
+        "meta_raw_features": META_RAW_FEATURES,
         "features": PCAP_NATIVE_FEATURES,
         "seed_roles": bundle["seed_roles"],
         "domain_randomisation": {
@@ -803,7 +855,7 @@ def score_pcaps(
         feat = pcap_to_native_features(path)
         X = pd.DataFrame([{k: feat[k] for k in PCAP_NATIVE_FEATURES}])
         branch = _branch_scores(bundle, X)[0]
-        score = float(bundle["meta"].predict_proba(branch.reshape(1, -1))[:, 1][0])
+        score = float(_meta_score(bundle, X)[0])
         out = {
             **rec,
             "pcap_native_score": score,
