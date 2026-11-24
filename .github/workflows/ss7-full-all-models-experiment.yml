@@ -3,15 +3,7 @@ name: SS7 full all-model retraining and plots
 on:
   push:
     branches:
-      - validate-ss7-real-cdr
-    paths:
-      - "ss7/ss7_training_v7.py"
-      - "ss7/fix.py"
-      - "ss7/plot_full_model_experiment.py"
-      - ".github/workflows/ss7-full-all-models-experiment.yml"
-  pull_request:
-    branches:
-      - main
+      - ss7-full-all-models-run-20261124
     paths:
       - "ss7/ss7_training_v7.py"
       - "ss7/fix.py"
