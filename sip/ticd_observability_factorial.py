@@ -88,7 +88,8 @@ class MultiObserverTICD:
         assert core.threshold>0 and audit.threshold>0
     def components(self,df):
         valid=df.primary_observer_valid.to_numpy(dtype=bool)
-        a=np.where(valid,self.core.score(df)/self.core.threshold,0.)
+        a=np.zeros(len(df),dtype=float)
+        if valid.any():a[valid]=self.core.score(df.loc[valid])/self.core.threshold
         b=self.audit.score(df)/self.audit.threshold
         return a,b
     def score(self,df):
@@ -100,8 +101,12 @@ class MultiObserverTICD:
         return self
     def predict_levels(self,df):
         strong=self.score(df)>self.threshold
-        w,e=self.core.warning(df)
-        warn=e&(w>self.core.warning_threshold)&df.primary_observer_valid.to_numpy(dtype=bool)&~strong
+        valid=df.primary_observer_valid.to_numpy(dtype=bool)
+        warn=np.zeros(len(df),dtype=bool)
+        if valid.any():
+            w,e=self.core.warning(df.loc[valid])
+            warn[valid]=e&(w>self.core.warning_threshold)
+        warn &= ~strong
         z=np.zeros(len(df),dtype=np.int8);z[warn]=1;z[strong]=2
         return z
     def predict_masks(self,df):
