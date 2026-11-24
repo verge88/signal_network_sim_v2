@@ -193,6 +193,10 @@ jobs:
           from sklearn.metrics import balanced_accuracy_score, f1_score, recall_score
 
           native = pd.read_csv("results_pcap_native_attacks/predictions.csv")
+          native_benign_summary = json.loads(Path(
+              "results_pcap_native_benign/summary.json").read_text())
+          robust_summary = json.loads(Path(
+              "results_pcap_native_robust_if/summary.json").read_text())
           robust = pd.read_csv("results_pcap_native_robust_if/external_attack_predictions.csv")
           merged = native.merge(
               robust[["capture", "iso_robust_pred_anomaly", "iso_robust_anomaly_score"]],
@@ -215,8 +219,18 @@ jobs:
                   "portable_detection": "robust IF OR PCAP-native supervised",
                   "supervised_confirmation": "robust IF AND PCAP-native supervised",
               },
+              "legacy_16_feature_rf_external_attack_tpr": float(
+                  robust_summary["rf_external_attack_tpr"]),
+              "legacy_16_feature_rf_external_benign_fpr": float(
+                  robust_summary["rf_external_benign_fpr"]),
+              "robust_if_external_attack_tpr": float(
+                  robust_summary["iso_robust_external_attack_tpr"]),
+              "robust_if_external_benign_fpr": float(
+                  robust_summary["iso_robust_external_benign_fpr"]),
               "pcap_native_external_attack_tpr": native_tpr,
               "pcap_native_external_benign_fpr": native_fpr,
+              "pcap_native_static_kelly_benign_fpr": float(
+                  native_benign_summary["external_benign_fpr"]),
               "pcap_native_external_f1": float(f1_score(y, n, zero_division=0)),
               "pcap_native_external_balanced_accuracy": float(
                   balanced_accuracy_score(y, n)),
@@ -244,6 +258,12 @@ jobs:
           if native_fpr > 0.05:
               raise SystemExit(
                   f"PCAP-native external benign FPR above 5%: {native_fpr:.3f}")
+          static_benign_fpr = float(
+              native_benign_summary["external_benign_fpr"])
+          if static_benign_fpr > 0.05:
+              raise SystemExit(
+                  "PCAP-native static Kelly benign FPR above 5%: "
+                  f"{static_benign_fpr:.3f}")
           if hybrid_tpr < 0.875:
               raise SystemExit(
                   f"Hybrid external attack TPR below 87.5%: {hybrid_tpr:.3f}")
