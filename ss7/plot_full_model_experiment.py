@@ -303,6 +303,133 @@ def plot_lomfo(df, outdir, formats, manifest):
               "Leave-one-masking-family-out generalisation")
 
 
+def plot_mean_roc(df: pd.DataFrame, outdir: Path, formats: Sequence[str], manifest: list):
+    if df.empty or not {"model", "seed", "fpr", "tpr"}.issubset(df.columns):
+        return
+    grid = np.linspace(0.0, 1.0, 201)
+    fig, ax = plt.subplots(figsize=(8, 7))
+    for model in [m for m in MODEL_ORDER if m in set(df["model"])] + [
+        m for m in sorted(set(df["model"])) if m not in MODEL_ORDER
+    ]:
+        curves = []
+        for _, g in df[df["model"] == model].groupby("seed"):
+            g = g.sort_values("fpr").drop_duplicates("fpr")
+            if len(g) < 2:
+                continue
+            curves.append(np.interp(grid, g["fpr"], g["tpr"]))
+        if curves:
+            ax.plot(grid, np.mean(curves, axis=0), label=pretty_model(model))
+    ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1)
+    ax.set_xlabel("False-positive rate")
+    ax.set_ylabel("True-positive rate")
+    ax.set_title("Mean ROC curves across regenerated seeds")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=7, ncol=2)
+    safe_save(fig, outdir, "16_mean_roc_curves", formats, manifest,
+              "Mean ROC curves across regenerated seeds")
+
+
+def plot_mean_pr(df: pd.DataFrame, outdir: Path, formats: Sequence[str], manifest: list):
+    if df.empty or not {"model", "seed", "recall", "precision"}.issubset(df.columns):
+        return
+    grid = np.linspace(0.0, 1.0, 201)
+    fig, ax = plt.subplots(figsize=(8, 7))
+    for model in [m for m in MODEL_ORDER if m in set(df["model"])] + [
+        m for m in sorted(set(df["model"])) if m not in MODEL_ORDER
+    ]:
+        curves = []
+        for _, g in df[df["model"] == model].groupby("seed"):
+            g = g.sort_values("recall").drop_duplicates("recall")
+            if len(g) < 2:
+                continue
+            curves.append(np.interp(grid, g["recall"], g["precision"]))
+        if curves:
+            ax.plot(grid, np.mean(curves, axis=0), label=pretty_model(model))
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title("Mean precision-recall curves across regenerated seeds")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=7, ncol=2)
+    safe_save(fig, outdir, "17_mean_pr_curves", formats, manifest,
+              "Mean precision-recall curves across regenerated seeds")
+
+
+def categorical_heatmap(df: pd.DataFrame, row_key: str, col_key: str, value_key: str,
+                        title: str, outdir: Path, stem: str,
+                        formats: Sequence[str], manifest: list, scale: float = 1.0):
+    if df.empty or not {row_key, col_key, value_key}.issubset(df.columns):
+        return
+    p = df.pivot_table(index=row_key, columns=col_key, values=value_key, aggfunc="mean")
+    if row_key == "model":
+        order = [m for m in MODEL_ORDER if m in p.index] + [m for m in p.index if m not in MODEL_ORDER]
+        p = p.reindex(order)
+    if p.empty:
+        return
+    a = p.to_numpy(float) * scale
+    fig, ax = plt.subplots(figsize=(max(9, len(p.columns)*1.3+3), max(5, len(p.index)*0.45+2)))
+    im = ax.imshow(a, aspect="auto")
+    ax.set_xticks(np.arange(len(p.columns)), [str(x) for x in p.columns], rotation=30, ha="right")
+    ax.set_yticks(np.arange(len(p.index)), [pretty_model(x) if row_key=="model" else str(x) for x in p.index])
+    ax.set_title(title)
+    cb = fig.colorbar(im, ax=ax)
+    cb.ax.set_ylabel("%" if scale == 100.0 else value_key, rotation=270, labelpad=15)
+    for i in range(a.shape[0]):
+        for j in range(a.shape[1]):
+            if np.isfinite(a[i, j]):
+                ax.text(j, i, f"{a[i,j]:.1f}" if scale == 100 else f"{a[i,j]:.2f}",
+                        ha="center", va="center", fontsize=7)
+    safe_save(fig, outdir, stem, formats, manifest, title)
+
+
+def plot_hidden_rate_all_models(df: pd.DataFrame, outdir: Path, formats: Sequence[str], manifest: list):
+    if df.empty or not {"model", "group", "episode_recall"}.issubset(df.columns):
+        return
+    d = df.copy()
+    d["hidden_rate"] = pd.to_numeric(d["group"], errors="coerce")
+    d = d.dropna(subset=["hidden_rate"])
+    if d.empty:
+        return
+    fig, ax = plt.subplots(figsize=(9, 6.5))
+    for model in [m for m in MODEL_ORDER if m in set(d["model"])]:
+        g = d[d["model"] == model].groupby("hidden_rate")["episode_recall"].mean().sort_index()
+        if len(g):
+            ax.plot(g.index, g.values*100.0, marker="o", label=pretty_model(model))
+    ax.set_xlabel("Hidden activity rate")
+    ax.set_ylabel("Episode recall, %")
+    ax.set_title("Episode recall versus hidden activity rate — all models")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=7, ncol=2)
+    safe_save(fig, outdir, "20_hidden_rate_all_models", formats, manifest,
+              "Episode recall versus hidden activity rate for every model")
+
+
+def plot_score_quantiles(df: pd.DataFrame, outdir: Path, formats: Sequence[str], manifest: list):
+    if df.empty or not {"model", "label", "quantile", "score"}.issubset(df.columns):
+        return
+    for model in [m for m in MODEL_ORDER if m in set(df["model"])] + [
+        m for m in sorted(set(df["model"])) if m not in MODEL_ORDER
+    ]:
+        d = df[df["model"] == model]
+        fig, ax = plt.subplots(figsize=(8, 5.5))
+        made = False
+        for label, name in [(0, "Benign"), (1, "Compromise")]:
+            g = d[d["label"] == label].groupby("quantile")["score"].mean().sort_index()
+            if len(g):
+                ax.plot(g.index, g.values, label=name)
+                made = True
+        if not made:
+            plt.close(fig)
+            continue
+        ax.set_xlabel("Quantile")
+        ax.set_ylabel("Anomaly / attack score")
+        ax.set_title(f"Score distributions — {pretty_model(model)}")
+        ax.grid(alpha=0.25)
+        ax.legend()
+        stem = "21_score_distribution_" + re.sub(r"[^A-Za-z0-9_-]+", "_", str(model))
+        safe_save(fig, outdir, stem, formats, manifest,
+                  f"Benign vs compromise score quantiles for {pretty_model(model)}")
+
+
 def bootstrap_differences(models: pd.DataFrame, baseline: str = "rule_baseline",
                           n_boot: int = 5000, seed: int = 2026) -> pd.DataFrame:
     if "seed" not in models.columns:
@@ -384,6 +511,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     lomfo = read_many(root, "lomfo.csv")
     curve = read_many(root, "detectability_curve.csv")
     soph = read_many(root, "sophistication_sweep.csv")
+    roc = read_many(root, "roc_curve.csv")
+    pr = read_many(root, "pr_curve.csv")
+    normal_events = read_many(root, "normal_event_fpr.csv")
+    family_metrics = read_many(root, "recall_by_mask_family.csv")
+    hidden_metrics = read_many(root, "recall_by_hidden_rate.csv")
+    score_quantiles = read_many(root, "score_quantiles.csv")
 
     bar_with_error(models, "episode_recall", "Episode-level detection by model",
                    "Episode recall, %", outdir, "01_episode_recall", args.formats, manifest,
@@ -425,6 +558,21 @@ def main(argv: Iterable[str] | None = None) -> int:
     if not boot.empty:
         boot.to_csv(outdir / "bootstrap_vs_rule.csv", index=False)
         plot_forest(boot, outdir, args.formats, manifest)
+
+    plot_mean_roc(roc, outdir, args.formats, manifest)
+    plot_mean_pr(pr, outdir, args.formats, manifest)
+    categorical_heatmap(
+        normal_events, "model", "normal_event", "window_fpr",
+        "False-positive rate by benign operational event",
+        outdir, "18_normal_event_fpr_heatmap", args.formats, manifest, scale=100.0
+    )
+    categorical_heatmap(
+        family_metrics, "model", "group", "episode_recall",
+        "Episode recall by masking family",
+        outdir, "19_mask_family_recall_heatmap", args.formats, manifest, scale=100.0
+    )
+    plot_hidden_rate_all_models(hidden_metrics, outdir, args.formats, manifest)
+    plot_score_quantiles(score_quantiles, outdir, args.formats, manifest)
 
     # Operational alert volume is often easier to interpret than FPR.
     if "alerts_per_day_network" in models.columns:
