@@ -1671,7 +1671,32 @@ def main():
     artifacts_path = os.path.join(config.results_dir, "plot_artifacts.pkl")
     with open(artifacts_path, "wb") as f:
         pickle.dump(artifacts, f)
+
+    # Portable plotting payload.  JSON avoids pandas/numpy pickle ABI
+    # compatibility problems when figures are regenerated in another
+    # environment or after a dependency upgrade.
+    def _json_safe(value):
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, dict):
+            return {str(k): _json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_json_safe(v) for v in value]
+        if hasattr(value, "tolist") and not isinstance(value, (str, bytes)):
+            try:
+                return _json_safe(value.tolist())
+            except Exception:
+                pass
+        return value
+
+    artifacts_json_path = os.path.join(
+        config.results_dir, "plot_artifacts.json")
+    with open(artifacts_json_path, "w", encoding="utf-8") as f:
+        json.dump(_json_safe(artifacts), f, ensure_ascii=False)
     print(f"\n  Plot artifacts saved to {artifacts_path}")
+    print(f"  Portable plot artifacts saved to {artifacts_json_path}")
 
 
     print(f"\n  All results saved to {config.results_dir}/")
