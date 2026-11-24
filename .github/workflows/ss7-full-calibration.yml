@@ -1,0 +1,70 @@
+name: SS7 full hybrid calibration
+
+on:
+  push:
+    branches:
+      - validate-ss7-real-cdr
+    paths:
+      - "ss7/calibrate_full_model.py"
+      - "ss7/validate_real_cdr.py"
+      - "ss7/fix.py"
+      - ".github/workflows/ss7-full-calibration.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "ss7/calibrate_full_model.py"
+      - "ss7/validate_real_cdr.py"
+      - "ss7/fix.py"
+      - ".github/workflows/ss7-full-calibration.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  calibrate-ss7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install scientific dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn joblib
+
+      - name: Run full SS7 calibration
+        run: |
+          set -o pipefail
+          mkdir -p results/full_calibration
+          python -m ss7.calibrate_full_model \
+            --real-train-date 2013-11-01 \
+            --real-validation-date 2013-11-02 \
+            --real-test-date 2013-11-03 \
+            --max-bytes-per-day 67108864 \
+            --max-real-windows-per-day 120000 \
+            --overall-target-fpr 0.01 \
+            --seed 42 \
+            --secondary-seed 1337 \
+            --confirm-seed 2026 \
+            --synthetic-days 1.0 \
+            --output-dir results/full_calibration \
+            2>&1 | tee results/full_calibration/calibration.log
+
+      - name: Upload calibration artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss7-full-calibration
+          path: results/full_calibration/
+          if-no-files-found: warn
+          retention-days: 30
