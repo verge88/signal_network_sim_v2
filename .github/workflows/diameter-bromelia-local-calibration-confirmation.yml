@@ -1,0 +1,305 @@
+name: Diameter Bromelia benign-calibrated independent confirmation
+
+on:
+  push:
+    branches:
+      - improve/diameter-pcap-native-transfer
+    paths:
+      - "experiments/bromelia_final_driver.py"
+      - ".github/workflows/diameter-bromelia-local-calibration-confirmation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bromelia-confirmation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      BROMELIA_COMMIT: 5af44c25de159733133e4f09b90c1852d95d5120
+      ORANGE_COMMIT: 75b350c22cc744d5742fcb71777cd3c9b131c19c
+      DIAMETER_CALIBRATION_PROFILE: results_bromelia_orange/calibration_profile.json
+
+    steps:
+      - name: Checkout frozen detector
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update -o Acquire::Retries=3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark tcpdump netcat-openbsd
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn
+
+      - name: Compile detector and frozen Bromelia driver
+        run: |
+          python -m py_compile             experiments/diameter_pcap_native_detector.py             experiments/diameter_external_pcap_validation.py             experiments/diameter_calibrate_from_independent_pcaps.py             experiments/bromelia_final_driver.py
+
+      - name: Download Orange calibration corpus
+        run: |
+          set -euo pipefail
+          mkdir -p orange_bromelia_calibration
+          base="https://raw.githubusercontent.com/Orange-OpenSource/diafuzzer/${ORANGE_COMMIT}/captures"
+          curl -fL --retry 4 -o orange_bromelia_calibration/S6a.pcap "${base}/S6a.pcap"
+          curl -fL --retry 4 -o orange_bromelia_calibration/S6a_perso.pcap "${base}/S6a_perso.pcap"
+          curl -fL --retry 4 -o orange_bromelia_calibration/Cx.pcap "${base}/Cx.pcap"
+          sha256sum orange_bromelia_calibration/*.pcap | tee orange_bromelia_calibration/SHA256SUMS
+
+      - name: Calibrate simulator from Orange only
+        run: |
+          python experiments/diameter_calibrate_from_independent_pcaps.py             orange_bromelia_calibration/S6a.pcap             orange_bromelia_calibration/S6a_perso.pcap             orange_bromelia_calibration/Cx.pcap             --out-dir results_bromelia_orange             --source "Orange-OpenSource/diafuzzer"             --source-commit "${ORANGE_COMMIT}"             --prior-strength 40
+
+      - name: Train frozen PCAP-native model
+        run: |
+          python experiments/diameter_pcap_native_detector.py train             --calibration-pcaps               orange_bromelia_calibration/S6a.pcap               orange_bromelia_calibration/S6a_perso.pcap               orange_bromelia_calibration/Cx.pcap             --out-dir results_bromelia_model
+          test -s results_bromelia_model/pcap_native_bundle.pkl
+
+      - name: Checkout pinned independent Bromelia codec
+        run: |
+          git clone https://github.com/heimiricmr/bromelia.git external_bromelia
+          git -C external_bromelia checkout "${BROMELIA_COMMIT}"
+          cp experiments/bromelia_final_driver.py external_bromelia/frozen_validation_driver.py
+          (
+            cd external_bromelia
+            python -m py_compile frozen_validation_driver.py bromelia/base.py
+          )
+          {
+            echo "Implementation: heimiricmr/bromelia"
+            echo "Pinned commit: ${BROMELIA_COMMIT}"
+            echo "Role: fourth independent implementation"
+            echo "Transport: real TCP loopback captured by tcpdump"
+            echo "Codec: Bromelia DiameterRequest/DiameterAnswer/DiameterMessage"
+            echo "12 benign captures are threshold calibration only."
+            echo "8 benign + 16 attacks are disjoint final test."
+            echo "No Bromelia test label is used for model fitting."
+          } > bromelia_provenance.txt
+
+      - name: Start independent Bromelia wire server
+        run: |
+          (
+            cd external_bromelia
+            python frozen_validation_driver.py --mode server --host 127.0.0.1 --port 3868
+          ) > bromelia_server.log 2>&1 &
+          echo $! > /tmp/bromelia_server.pid
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 3868; then
+              echo "Bromelia server ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          cat bromelia_server.log
+          exit 1
+
+      - name: Capture frozen benign-only deployment calibration set
+        run: |
+          set -euo pipefail
+          mkdir -p bromelia_benign_calibration
+          manifest="bromelia_benign_calibration/manifest.csv"
+          echo "capture,expected_label,scenario" > "${manifest}"
+
+          capture_case() {
+            name="$1"; scenario="$2"; count="$3"; delay="$4"
+            out="$GITHUB_WORKSPACE/bromelia_benign_calibration/${name}"
+            sudo tcpdump -i lo -U -s 0 -w "${out}" 'tcp port 3868' >"/tmp/bromelia-cal-${name}.log" 2>&1 &
+            cap_pid=$!
+            sleep 0.35
+            (
+              cd external_bromelia
+              python frozen_validation_driver.py                 --mode client --host 127.0.0.1 --port 3868                 --scenario "${scenario}" --count "${count}" --delay-ms "${delay}"
+            )
+            sleep 0.25
+            sudo pkill -INT -x tcpdump || true
+            wait "${cap_pid}" || true
+            sudo chown "$USER":"$USER" "${out}"
+            test -s "${out}"
+            echo "${name},benign,${scenario}" >> "${manifest}"
+          }
+
+          capture_case cal_attach_1.pcap benign_attach 1 500
+          capture_case cal_attach_2.pcap benign_attach 2 850
+          capture_case cal_attach_3.pcap benign_attach 3 1100
+          capture_case cal_attach_5.pcap benign_attach 5 1400
+
+          capture_case cal_reauth_1.pcap benign_reauth 1 550
+          capture_case cal_reauth_3.pcap benign_reauth 3 900
+          capture_case cal_reauth_6.pcap benign_reauth 6 1250
+          capture_case cal_reauth_9.pcap benign_reauth 9 1500
+
+          capture_case cal_update_1.pcap benign_update 1 600
+          capture_case cal_update_3.pcap benign_update 3 950
+          capture_case cal_update_6.pcap benign_update 6 1300
+          capture_case cal_update_10.pcap benign_update 10 1600
+
+          sha256sum bromelia_benign_calibration/*.pcap | tee bromelia_benign_calibration/SHA256SUMS
+          cat "${manifest}"
+
+      - name: Fit benign-only deployment threshold
+        run: |
+          python experiments/diameter_pcap_native_detector.py calibrate             --model results_bromelia_model/pcap_native_bundle.pkl             --manifest bromelia_benign_calibration/manifest.csv             --pcap-dir bromelia_benign_calibration             --target-fpr 0.05             --out results_bromelia_model/deployment_calibration.json
+          test -s results_bromelia_model/deployment_calibration.json
+
+      - name: Verify calibration contains benign labels only
+        run: |
+          python - <<'PY'
+          import json
+          import pandas as pd
+          from pathlib import Path
+
+          m = pd.read_csv("bromelia_benign_calibration/manifest.csv")
+          assert len(m) == 12
+          assert set(m["expected_label"].astype(str)) == {"benign"}
+          d = json.loads(Path(
+              "results_bromelia_model/deployment_calibration.json"
+          ).read_text(encoding="utf-8"))
+          assert d["calibration_capture_count"] == 12
+          assert d["method"] == "deployment_benign_split_conformal_upper_quantile"
+          print(json.dumps(d, indent=2, ensure_ascii=False))
+          PY
+
+      - name: Capture disjoint frozen Bromelia test set
+        run: |
+          set -euo pipefail
+          mkdir -p bromelia_test_pcaps
+          manifest="bromelia_test_pcaps/manifest.csv"
+          echo "capture,expected_label,scenario" > "${manifest}"
+
+          capture_case() {
+            name="$1"; label="$2"; scenario="$3"; count="$4"; delay="$5"
+            out="$GITHUB_WORKSPACE/bromelia_test_pcaps/${name}"
+            sudo tcpdump -i lo -U -s 0 -w "${out}" 'tcp port 3868' >"/tmp/bromelia-test-${name}.log" 2>&1 &
+            cap_pid=$!
+            sleep 0.35
+            (
+              cd external_bromelia
+              python frozen_validation_driver.py                 --mode client --host 127.0.0.1 --port 3868                 --scenario "${scenario}" --count "${count}" --delay-ms "${delay}"
+            )
+            sleep 0.25
+            sudo pkill -INT -x tcpdump || true
+            wait "${cap_pid}" || true
+            sudo chown "$USER":"$USER" "${out}"
+            test -s "${out}"
+            echo "${name},${label},${scenario}" >> "${manifest}"
+          }
+
+          # Disjoint benign test controls.
+          capture_case test_attach_4.pcap benign benign_attach 4 700
+          capture_case test_attach_6.pcap benign benign_attach 6 1550
+          capture_case test_attach_8.pcap benign benign_attach 8 1250
+          capture_case test_reauth_2.pcap benign benign_reauth 2 800
+          capture_case test_reauth_5.pcap benign benign_reauth 5 1100
+          capture_case test_reauth_7.pcap benign benign_reauth 7 1400
+          capture_case test_update_2.pcap benign benign_update 2 850
+          capture_case test_update_5.pcap benign benign_update 5 1050
+
+          # Frozen attacks: 16 captures.
+          capture_case test_air_18.pcap attack air_flood 18 0
+          capture_case test_air_36.pcap attack air_flood 36 0
+          capture_case test_air_72.pcap attack air_flood 72 0
+          capture_case test_air_144.pcap attack air_flood 144 0
+
+          capture_case test_ulr_18.pcap attack ulr_flood 18 0
+          capture_case test_ulr_36.pcap attack ulr_flood 36 0
+          capture_case test_ulr_72.pcap attack ulr_flood 72 0
+          capture_case test_ulr_144.pcap attack ulr_flood 144 0
+
+          capture_case test_mixed_24.pcap attack mixed_flood 24 0
+          capture_case test_mixed_48.pcap attack mixed_flood 48 0
+          capture_case test_mixed_96.pcap attack mixed_flood 96 0
+          capture_case test_mixed_192.pcap attack mixed_flood 192 0
+
+          capture_case test_tracking_20.pcap attack tracking_burst 20 0
+          capture_case test_tracking_40.pcap attack tracking_burst 40 0
+          capture_case test_tracking_80.pcap attack tracking_burst 80 0
+          capture_case test_tracking_160.pcap attack tracking_burst 160 0
+
+          sha256sum bromelia_test_pcaps/*.pcap | tee bromelia_test_pcaps/SHA256SUMS
+          cat "${manifest}"
+
+      - name: Score disjoint Bromelia test with benign-only calibration
+        run: |
+          python experiments/diameter_pcap_native_detector.py score             --model results_bromelia_model/pcap_native_bundle.pkl             --calibration results_bromelia_model/deployment_calibration.json             --manifest bromelia_test_pcaps/manifest.csv             --pcap-dir bromelia_test_pcaps             --out-dir results_bromelia_test
+
+      - name: Apply predeclared fourth-source gate
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          s = json.loads(Path(
+              "results_bromelia_test/summary.json"
+          ).read_text(encoding="utf-8"))
+          s["source"] = "heimiricmr/bromelia"
+          s["source_commit"] = "5af44c25de159733133e4f09b90c1852d95d5120"
+          s["role"] = (
+              "fourth independent source; benign-only local threshold "
+              "calibration; disjoint external test; no post-test tuning"
+          )
+          Path("results_bromelia_test/final_summary.json").write_text(
+              json.dumps(s, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          print(json.dumps(s, ensure_ascii=False, indent=2))
+
+          if s["threshold_source"] != "deployment_benign_only":
+              raise SystemExit("Test did not use benign-only local calibration")
+          if float(s["external_attack_tpr"]) < 0.80:
+              raise SystemExit(
+                  f"Bromelia TPR below 80%: {s['external_attack_tpr']}")
+          if float(s["external_benign_fpr"]) > 0.125:
+              raise SystemExit(
+                  f"Bromelia benign FPR above 12.5%: {s['external_benign_fpr']}")
+          if float(s["external_balanced_accuracy"]) < 0.84:
+              raise SystemExit(
+                  "Bromelia balanced accuracy below 84%: "
+                  f"{s['external_balanced_accuracy']}")
+          PY
+
+      - name: Stop Bromelia server
+        if: always()
+        run: |
+          if [ -f /tmp/bromelia_server.pid ]; then
+            kill "$(cat /tmp/bromelia_server.pid)" || true
+          fi
+          tail -n 120 bromelia_server.log || true
+
+      - name: Publish Bromelia confirmation
+        if: always()
+        run: |
+          {
+            echo "## Bromelia benign-calibrated independent confirmation"
+            for f in               results_bromelia_model/training_summary.json               results_bromelia_model/deployment_calibration.json               results_bromelia_test/summary.json               results_bromelia_test/final_summary.json; do
+              if [ -f "$f" ]; then
+                echo
+                echo "### $f"
+                echo '~~~json'
+                cat "$f"
+                echo '~~~'
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Bromelia confirmation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diameter-bromelia-local-calibration-confirmation
+          path: |
+            results_bromelia_orange/
+            results_bromelia_model/
+            results_bromelia_test/
+            orange_bromelia_calibration/
+            bromelia_benign_calibration/
+            bromelia_test_pcaps/
+            bromelia_provenance.txt
+            bromelia_server.log
+          if-no-files-found: warn
+          compression-level: 6
