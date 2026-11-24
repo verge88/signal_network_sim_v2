@@ -24,6 +24,7 @@ full telemetry mode.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import pickle
@@ -983,7 +984,11 @@ def score_pcaps(
     bundle: dict,
     manifest: pd.DataFrame,
     pcap_dir: Path,
+    threshold: float | None = None,
 ) -> pd.DataFrame:
+    decision_threshold = (
+        float(bundle["threshold"]) if threshold is None else float(threshold)
+    )
     rows = []
     for rec in manifest.to_dict("records"):
         path = pcap_dir / str(rec["capture"])
@@ -994,7 +999,7 @@ def score_pcaps(
         out = {
             **rec,
             "pcap_native_score": score,
-            "pcap_native_pred_anomaly": int(score >= float(bundle["threshold"])),
+            "pcap_native_pred_anomaly": int(score >= decision_threshold),
             "decoded_pdus": int(feat["_decoded_pdus"]),
             "duration_s": float(feat["_duration_s"]),
         }
@@ -1004,7 +1009,11 @@ def score_pcaps(
     return pd.DataFrame(rows)
 
 
-def summarise_external(pred: pd.DataFrame, threshold: float) -> Dict[str, object]:
+def summarise_external(
+    pred: pd.DataFrame,
+    threshold: float,
+    threshold_source: str = "frozen_global",
+) -> Dict[str, object]:
     y = (pred["expected_label"].astype(str) == "attack").astype(int).to_numpy()
     p = pred["pcap_native_pred_anomaly"].astype(int).to_numpy()
     summary = {
@@ -1013,6 +1022,7 @@ def summarise_external(pred: pd.DataFrame, threshold: float) -> Dict[str, object
         "benign_capture_count": int((1 - y).sum()),
         "feature_count": len(PCAP_NATIVE_FEATURES),
         "threshold": float(threshold),
+        "threshold_source": str(threshold_source),
         "external_attack_tpr": float(
             recall_score(y, p, zero_division=0)) if y.sum() else None,
         "external_benign_fpr": float(
@@ -1055,6 +1065,102 @@ def train_cli(args) -> None:
             f"PCAP-native internal cross-seed FPR above 5%: {test['benign_fpr']:.3f}")
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _load_benign_calibration_manifest(path: Path) -> pd.DataFrame:
+    manifest = pd.read_csv(path)
+    required = {"capture", "expected_label"}
+    missing = required.difference(manifest.columns)
+    if missing:
+        raise SystemExit(
+            f"benign calibration manifest missing columns: {sorted(missing)}")
+    labels = manifest["expected_label"].astype(str).str.lower().str.strip()
+    bad = manifest.loc[labels != "benign", ["capture", "expected_label"]]
+    if not bad.empty:
+        raise SystemExit(
+            "Deployment calibration accepts benign captures only; "
+            f"non-benign rows found: {bad.to_dict('records')}")
+    if len(manifest) < 8:
+        raise SystemExit(
+            "At least 8 independent benign captures are required for "
+            "deployment-local calibration")
+    return manifest
+
+
+def calibrate_cli(args) -> None:
+    """Fit a deployment-local threshold from benign PCAP scores only.
+
+    The frozen classifier is never refit.  This calibration changes only the
+    operating threshold and rejects any manifest containing attack labels.
+    The order-statistic rule is the split-conformal upper quantile; with small
+    benign calibration sets it naturally reduces to max(score)+ULP.
+    """
+    with args.model.open("rb") as f:
+        bundle = pickle.load(f)
+    manifest = _load_benign_calibration_manifest(args.manifest)
+
+    scored = score_pcaps(
+        bundle, manifest, args.pcap_dir,
+        threshold=float("inf"),
+    )
+    scores = np.sort(scored["pcap_native_score"].to_numpy(dtype=float))
+    n = len(scores)
+    alpha = float(args.target_fpr)
+    if not (0.0 < alpha < 1.0):
+        raise SystemExit("--target-fpr must be strictly between 0 and 1")
+
+    # Split-conformal upper quantile index.  For n too small to resolve the
+    # requested alpha, use the maximum benign score.  nextafter prevents the
+    # maximum calibration example itself from being classified as anomalous
+    # under the detector's >= comparison.
+    k = int(np.ceil((n + 1) * (1.0 - alpha)))
+    idx = min(max(k - 1, 0), n - 1)
+    base_threshold = float(scores[idx])
+    threshold = float(np.nextafter(base_threshold, np.inf))
+
+    model_sha = _sha256_file(args.model)
+    calibration = {
+        "version": 1,
+        "method": "deployment_benign_split_conformal_upper_quantile",
+        "scope": (
+            "threshold-only deployment adaptation; frozen model weights; "
+            "benign captures only; no attack labels"
+        ),
+        "model_sha256": model_sha,
+        "feature_count": len(PCAP_NATIVE_FEATURES),
+        "target_fpr": alpha,
+        "calibration_capture_count": int(n),
+        "conformal_rank_1_based": int(k),
+        "selected_order_index_0_based": int(idx),
+        "threshold": threshold,
+        "global_frozen_threshold": float(bundle["threshold"]),
+        "score_min": float(scores[0]),
+        "score_median": float(np.median(scores)),
+        "score_max": float(scores[-1]),
+        "captures": [
+            {
+                "capture": str(row["capture"]),
+                "score": float(row["pcap_native_score"]),
+                "decoded_pdus": int(row["decoded_pdus"]),
+                "duration_s": float(row["duration_s"]),
+            }
+            for _, row in scored.iterrows()
+        ],
+    }
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(
+        json.dumps(calibration, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(json.dumps(calibration, ensure_ascii=False, indent=2))
+
+
 def score_cli(args) -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     with args.model.open("rb") as f:
@@ -1064,8 +1170,39 @@ def score_cli(args) -> None:
     missing = required.difference(manifest.columns)
     if missing:
         raise SystemExit(f"manifest missing columns: {sorted(missing)}")
-    pred = score_pcaps(bundle, manifest, args.pcap_dir)
-    summary = summarise_external(pred, float(bundle["threshold"]))
+
+    threshold = float(bundle["threshold"])
+    threshold_source = "frozen_global"
+    calibration_meta = None
+    if args.calibration is not None:
+        calibration_meta = json.loads(
+            args.calibration.read_text(encoding="utf-8"))
+        expected_sha = str(calibration_meta.get("model_sha256", ""))
+        actual_sha = _sha256_file(args.model)
+        if not expected_sha or expected_sha != actual_sha:
+            raise SystemExit(
+                "Deployment calibration was produced for a different model "
+                f"(expected {expected_sha}, actual {actual_sha})")
+        if calibration_meta.get("method") != (
+                "deployment_benign_split_conformal_upper_quantile"):
+            raise SystemExit("Unsupported deployment calibration method")
+        threshold = float(calibration_meta["threshold"])
+        threshold_source = "deployment_benign_only"
+
+    pred = score_pcaps(
+        bundle, manifest, args.pcap_dir, threshold=threshold)
+    summary = summarise_external(
+        pred, threshold, threshold_source=threshold_source)
+    if calibration_meta is not None:
+        summary["deployment_calibration"] = {
+            "method": calibration_meta["method"],
+            "target_fpr": calibration_meta["target_fpr"],
+            "calibration_capture_count": calibration_meta[
+                "calibration_capture_count"],
+            "score_max": calibration_meta["score_max"],
+            "global_frozen_threshold": calibration_meta[
+                "global_frozen_threshold"],
+        }
     pred.to_csv(args.out_dir / "predictions.csv", index=False)
     (args.out_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1084,10 +1221,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--out-dir", type=Path, default=Path("results_pcap_native_train"))
     tr.set_defaults(func=train_cli)
 
+    cal = sub.add_parser("calibrate")
+    cal.add_argument("--model", type=Path, required=True)
+    cal.add_argument("--manifest", type=Path, required=True)
+    cal.add_argument("--pcap-dir", type=Path, required=True)
+    cal.add_argument("--target-fpr", type=float, default=0.05)
+    cal.add_argument(
+        "--out", type=Path,
+        default=Path("deployment_benign_calibration.json"))
+    cal.set_defaults(func=calibrate_cli)
+
     sc = sub.add_parser("score")
     sc.add_argument("--model", type=Path, required=True)
     sc.add_argument("--manifest", type=Path, required=True)
     sc.add_argument("--pcap-dir", type=Path, required=True)
+    sc.add_argument(
+        "--calibration", type=Path, default=None,
+        help="Optional benign-only deployment calibration JSON")
     sc.add_argument(
         "--out-dir", type=Path, default=Path("results_pcap_native_external"))
     sc.set_defaults(func=score_cli)
