@@ -1,0 +1,70 @@
+name: SIP TICD physical and causal strong-alert fusion independent test
+on:
+  push:
+    branches: [improve/ticd-physical-causal-alert-fusion]
+    paths:
+      - 'sip/ticd_physical_causal_alert.py'
+      - 'experiments/evaluate_ticd_physical_causal_alert.py'
+      - '.github/workflows/sip-ticd-physical-causal-alert.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+      PYTHONHASHSEED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install and compile
+        run: |
+          set -euo pipefail
+          python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+          python -m compileall -q sip/ticd_physical_causal_alert.py experiments/evaluate_ticd_physical_causal_alert.py
+          python -m pip freeze > fusion_environment.txt
+      - name: Recover frozen high-loss alert reference and report
+        run: |
+          set -euo pipefail
+          mkdir -p prior
+          gh run download 45359975383 --repo "${{ github.repository }}" --name sip-ticd-high-loss-alert-model-and-holdout --dir prior
+          p="$(find prior -type f -name high_loss_alert_ticd.pkl -print -quit)"
+          test -n "$p"
+          echo "PRIOR_DIR=$(dirname "$p")" >> "$GITHUB_ENV"
+      - name: Fit normal history scales and test independent simulation seeds
+        run: python -m experiments.evaluate_ticd_physical_causal_alert --prior "$PRIOR_DIR" --out results_physical_causal_alert
+      - name: Verify frozen scope and paired test accounting
+        run: |
+          python - <<'PY'
+          import json
+          d=json.load(open('results_physical_causal_alert/physical_causal_alert_report.json'))
+          assert not d['real_field_validation'] and not d['heldout_used_for_selection']
+          assert d['label_invariance'] and d['batch_invariance'] and d['model_reload']
+          assert d['warning_reference_frozen'] and d['all_roles_strong_alert']
+          seeds=[s for k in ('train_seeds','validation_seeds','development_seeds','test_seeds') for xs in d[k].values() for s in xs]
+          assert len(seeds)==len(set(seeds))==88
+          for k,pair in d['heldout'].items():
+              for n,v in pair.items():
+                  assert v['confirmed_TP']+v['warning_only_TP']==v['covered_attack_rows']
+                  assert v['confirmed_FP']+v['warning_only_FP']<=v['normal']
+                  assert len(d['per_seed'][k][n])==3
+          print('FUSION_AUDIT_VERIFIED')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-ticd-physical-causal-alert-model-and-holdout
+          path: |
+            results_physical_causal_alert/
+            fusion_environment.txt
+          if-no-files-found: warn
+          retention-days: 30
