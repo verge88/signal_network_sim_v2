@@ -1,0 +1,810 @@
+#!/usr/bin/env python3
+"""PCAP-native Diameter detector with source-separated domain transfer.
+
+This module implements the portable branch of the two-mode detector:
+- the full 56-feature detector remains the preferred mode when CU/zone telemetry
+  is available;
+- this PCAP-native branch uses only features reconstructible from a wire
+  capture and is trained with domain randomisation across independent simulator
+  seeds.
+
+Source separation:
+  base fit       -> simulator seeds 42, 43
+  meta fit       -> simulator seed 44
+  threshold fit  -> simulator seed 45 + optional independent benign PCAPs
+  internal test  -> simulator seed 46
+  final external -> supplied separately; Kelly traces must never be passed to
+                    the train command.
+
+The script deliberately treats node_compromise as out of scope for the PCAP
+branch because its defining evidence is CU/report inconsistency that is absent
+from a standalone capture.  Node compromise remains the responsibility of the
+full telemetry mode.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import pickle
+import sys
+from pathlib import Path
+from typing import Dict, Iterable, List, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    average_precision_score,
+    balanced_accuracy_score,
+    f1_score,
+    recall_score,
+    roc_auc_score,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+EXPERIMENTS = ROOT / "experiments"
+if str(EXPERIMENTS) not in sys.path:
+    sys.path.insert(0, str(EXPERIMENTS))
+
+from diameter_external_pcap_validation import (  # noqa: E402
+    APP_GX,
+    APP_RX,
+    APP_S13,
+    APP_S6A,
+    GX_COMMANDS,
+    PORTABLE_FEATURES,
+    S6A_CODES,
+    S6A_COMMANDS,
+    _run_tshark,
+    build_training_frame,
+    pcap_to_portable_features,
+    train_portable_models,
+    apply_robust_feature_transform,
+)
+
+SUPPORTED_PORTABLE_ATTACKS = {
+    "location_tracking",
+    "sms_data_interception",
+    "signaling_dos",
+    "fraud_profile",
+}
+
+EXTRA_FEATURES = [
+    "pcap_log_total_pdus",
+    "pcap_log_duration_s",
+    "pcap_log_rate_hz",
+    "pcap_gx_fraction",
+    "pcap_rx_fraction",
+    "pcap_s13_fraction",
+    "pcap_other_fraction",
+    "pcap_iat_cv",
+    "pcap_bin_count_cv",
+    "pcap_bin_count_peak_ratio",
+    "pcap_bin_count_autocorr",
+    "pcap_bin_entropy_std",
+    "pcap_bin_s6a_fraction_std",
+    "pcap_air_ratio_std",
+    "pcap_ulr_ratio_std",
+    "pcap_active_command_fraction",
+]
+PCAP_NATIVE_FEATURES = PORTABLE_FEATURES + EXTRA_FEATURES
+
+PROFILE_FEATURES = PORTABLE_FEATURES + [
+    "pcap_gx_fraction",
+    "pcap_rx_fraction",
+    "pcap_s13_fraction",
+    "pcap_other_fraction",
+    "pcap_active_command_fraction",
+]
+VOLUME_FEATURES = [
+    "pcap_log_total_pdus",
+    "pcap_log_duration_s",
+    "pcap_log_rate_hz",
+    "pcap_iat_cv",
+    "pcap_bin_count_cv",
+    "pcap_bin_count_peak_ratio",
+    "pcap_bin_count_autocorr",
+]
+TEMPORAL_FEATURES = [
+    "pcap_iat_cv",
+    "pcap_bin_count_cv",
+    "pcap_bin_count_peak_ratio",
+    "pcap_bin_count_autocorr",
+    "pcap_bin_entropy_std",
+    "pcap_bin_s6a_fraction_std",
+    "pcap_air_ratio_std",
+    "pcap_ulr_ratio_std",
+]
+
+
+def _entropy(values: Iterable[float]) -> float:
+    x = np.asarray([float(v) for v in values if float(v) > 0], dtype=float)
+    if x.size == 0:
+        return 0.0
+    p = x / x.sum()
+    return float(-(p * np.log2(p)).sum())
+
+
+def _gini(values: Iterable[float]) -> float:
+    x = np.sort(np.asarray(list(values), dtype=float))
+    if x.size == 0 or x.sum() <= 0:
+        return 0.0
+    n = x.size
+    return float(
+        2 * np.sum(np.arange(1, n + 1) * x) / (n * x.sum())
+        - (n + 1) / n
+    )
+
+
+def _cv(values: Sequence[float]) -> float:
+    x = np.asarray(values, dtype=float)
+    if x.size == 0:
+        return 0.0
+    m = float(np.mean(x))
+    return float(np.std(x) / (abs(m) + 1e-9))
+
+
+def _autocorr(values: Sequence[float]) -> float:
+    x = np.asarray(values, dtype=float)
+    if x.size < 3 or np.std(x) <= 1e-9:
+        return 0.0
+    m = float(np.mean(x))
+    den = float(np.sum((x - m) ** 2))
+    if den <= 1e-12:
+        return 0.0
+    return float(np.sum((x[1:] - m) * (x[:-1] - m)) / den)
+
+
+def _safe_float(v, default: float = 0.0) -> float:
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _normalised_command_features(
+    total: float,
+    s6a_count: float,
+    gx_count: float,
+    rx_count: float,
+    s13_count: float,
+    other_count: float,
+    s6a_cmd_counts: Dict[str, float],
+    gx_cmd_counts: Dict[str, float],
+) -> Dict[str, float]:
+    total = max(float(total), 1.0)
+    s6a_total = max(float(sum(s6a_cmd_counts.values())), 0.0)
+    gx_total = max(float(sum(gx_cmd_counts.values())), 0.0)
+    s6a_vals = [float(s6a_cmd_counts.get(c, 0.0)) for c in S6A_COMMANDS]
+    gx_vals = [float(gx_cmd_counts.get(c, 0.0)) for c in GX_COMMANDS]
+    top2 = sum(sorted(s6a_vals, reverse=True)[:2])
+
+    # Include non-S6a/Gx application buckets in entropy so the same semantic
+    # definition is used for synthetic windows and real PCAPs.
+    entropy_counts = s6a_vals + gx_vals + [
+        float(rx_count), float(s13_count), float(other_count)
+    ]
+
+    out = {
+        "obs_entropy": _entropy(entropy_counts),
+        "obs_s6a_dominance_ratio": float(s6a_count) / total,
+        "obs_s6a_top2_ratio": top2 / s6a_total if s6a_total > 0 else 0.0,
+        "obs_s6a_gini": _gini(s6a_vals),
+    }
+    for c in S6A_COMMANDS:
+        out[f"obs_ratio_s6a_{c.lower()}"] = (
+            float(s6a_cmd_counts.get(c, 0.0)) / s6a_total
+            if s6a_total > 0 else 0.0
+        )
+    for c in GX_COMMANDS:
+        out[f"obs_ratio_gx_{c.lower()}"] = (
+            float(gx_cmd_counts.get(c, 0.0)) / gx_total
+            if gx_total > 0 else 0.0
+        )
+    return out
+
+
+def _aggregate_sim_window(win: pd.DataFrame, interval_s: float = 15.0):
+    attacks = set(str(x) for x in win["attack_type"].astype(str))
+    if "node_compromise" in attacks:
+        return None
+    non_none = attacks - {"none"}
+    if len(non_none) > 1:
+        return None
+    if non_none and not non_none.issubset(SUPPORTED_PORTABLE_ATTACKS):
+        return None
+
+    label = int(bool(non_none))
+    attack_type = next(iter(non_none)) if non_none else "none"
+
+    total_rows = pd.to_numeric(
+        win["obs_total_messages"], errors="coerce").fillna(0.0).to_numpy(float)
+    s6a_rows = pd.to_numeric(
+        win["obs_s6a_count"], errors="coerce").fillna(0.0).to_numpy(float)
+    gx_rows = pd.to_numeric(
+        win["obs_gx_count"], errors="coerce").fillna(0.0).to_numpy(float)
+    rx_rows = pd.to_numeric(
+        win["obs_rx_count"], errors="coerce").fillna(0.0).to_numpy(float)
+    s13_rows = pd.to_numeric(
+        win["obs_s13_count"], errors="coerce").fillna(0.0).to_numpy(float)
+    other_rows = pd.to_numeric(
+        win["obs_other_count"], errors="coerce").fillna(0.0).to_numpy(float)
+
+    total = float(total_rows.sum())
+    s6a = float(s6a_rows.sum())
+    gx = float(gx_rows.sum())
+    rx = float(rx_rows.sum())
+    s13 = float(s13_rows.sum())
+    other = float(other_rows.sum())
+
+    s6a_cmd_counts = {}
+    for c in S6A_COMMANDS:
+        ratios = pd.to_numeric(
+            win[f"obs_ratio_s6a_{c.lower()}"], errors="coerce"
+        ).fillna(0.0).to_numpy(float)
+        s6a_cmd_counts[c] = float(np.sum(ratios * s6a_rows))
+    gx_cmd_counts = {}
+    for c in GX_COMMANDS:
+        ratios = pd.to_numeric(
+            win[f"obs_ratio_gx_{c.lower()}"], errors="coerce"
+        ).fillna(0.0).to_numpy(float)
+        gx_cmd_counts[c] = float(np.sum(ratios * gx_rows))
+
+    out = _normalised_command_features(
+        total, s6a, gx, rx, s13, other, s6a_cmd_counts, gx_cmd_counts)
+
+    duration = max(interval_s * len(win), 1e-3)
+    rate = total / duration
+    mean_iat = duration / max(total, 1.0)
+
+    row_ent = pd.to_numeric(
+        win["obs_entropy"], errors="coerce").fillna(0.0).to_numpy(float)
+    row_s6a_frac = s6a_rows / np.maximum(total_rows, 1.0)
+    air_rows = pd.to_numeric(
+        win["obs_ratio_s6a_air"], errors="coerce").fillna(0.0).to_numpy(float)
+    ulr_rows = pd.to_numeric(
+        win["obs_ratio_s6a_ulr"], errors="coerce").fillna(0.0).to_numpy(float)
+
+    active = sum(v > 0.5 for v in s6a_cmd_counts.values()) + sum(
+        v > 0.5 for v in gx_cmd_counts.values())
+
+    out.update({
+        "pcap_log_total_pdus": float(np.log1p(max(total, 0.0))),
+        "pcap_log_duration_s": float(np.log1p(duration)),
+        "pcap_log_rate_hz": float(np.log1p(max(rate, 0.0))),
+        "pcap_gx_fraction": gx / max(total, 1.0),
+        "pcap_rx_fraction": rx / max(total, 1.0),
+        "pcap_s13_fraction": s13 / max(total, 1.0),
+        "pcap_other_fraction": other / max(total, 1.0),
+        # With aggregated 15 s bins we do not observe message-level IAT.
+        # Count variation is used only as a weak proxy and is aggressively
+        # domain-randomised below.
+        "pcap_iat_cv": _cv(total_rows),
+        "pcap_bin_count_cv": _cv(total_rows),
+        "pcap_bin_count_peak_ratio": (
+            float(np.max(total_rows) / (np.mean(total_rows) + 1e-9))
+            if len(total_rows) else 0.0
+        ),
+        "pcap_bin_count_autocorr": _autocorr(total_rows),
+        "pcap_bin_entropy_std": float(np.std(row_ent)),
+        "pcap_bin_s6a_fraction_std": float(np.std(row_s6a_frac)),
+        "pcap_air_ratio_std": float(np.std(air_rows)),
+        "pcap_ulr_ratio_std": float(np.std(ulr_rows)),
+        "pcap_active_command_fraction": float(active / (len(S6A_COMMANDS) + len(GX_COMMANDS))),
+        "is_anomaly": label,
+        "attack_type": attack_type,
+    })
+    return out
+
+
+def simulation_to_native_windows(
+    df: pd.DataFrame,
+    window_sizes: Sequence[int] = (2, 4, 8),
+) -> pd.DataFrame:
+    records: List[Dict[str, object]] = []
+    for _, node_df in df.groupby("node_id", sort=False):
+        node_df = node_df.sort_values("interval").reset_index(drop=True)
+        for width in window_sizes:
+            stride = max(width * 2, 1)
+            for start in range(0, max(0, len(node_df) - width + 1), stride):
+                win = node_df.iloc[start:start + width]
+                rec = _aggregate_sim_window(win)
+                if rec is not None:
+                    records.append(rec)
+    if not records:
+        raise RuntimeError("No PCAP-native simulator windows were generated")
+    return pd.DataFrame(records)
+
+
+def domain_randomise(
+    frame: pd.DataFrame,
+    seed: int,
+    variants: int = 4,
+) -> pd.DataFrame:
+    """Create domain variants without conditioning randomisation on labels."""
+    rng = np.random.default_rng(seed)
+    outs = []
+    s6a_cols = [f"obs_ratio_s6a_{c.lower()}" for c in S6A_COMMANDS]
+    gx_cols = [f"obs_ratio_gx_{c.lower()}" for c in GX_COMMANDS]
+
+    for variant in range(variants):
+        x = frame.copy()
+        # One domain-level scale per variant preserves relative attack/benign
+        # intensity while spanning tiny lab captures through network-scale load.
+        traffic_scale = float(np.exp(rng.uniform(np.log(0.002), np.log(2.0))))
+        time_scale = float(np.exp(rng.uniform(np.log(0.5), np.log(2.0))))
+
+        total = np.expm1(x["pcap_log_total_pdus"].to_numpy(float))
+        duration = np.expm1(x["pcap_log_duration_s"].to_numpy(float))
+        rate = np.expm1(x["pcap_log_rate_hz"].to_numpy(float))
+        x["pcap_log_total_pdus"] = np.log1p(np.maximum(0.0, total * traffic_scale))
+        x["pcap_log_duration_s"] = np.log1p(np.maximum(1e-3, duration * time_scale))
+        x["pcap_log_rate_hz"] = np.log1p(
+            np.maximum(0.0, rate * traffic_scale / time_scale))
+
+        # Small domain-level shifts in command mixtures emulate vendor and
+        # deployment differences while keeping attack structure intact.
+        for cols in (s6a_cols, gx_cols):
+            arr = x[cols].to_numpy(float)
+            bias = rng.normal(0.0, 0.025, size=(1, len(cols)))
+            arr = np.clip(arr + bias, 0.0, None)
+            den = arr.sum(axis=1, keepdims=True)
+            arr = np.divide(arr, den, out=np.zeros_like(arr), where=den > 0)
+            x.loc[:, cols] = arr
+
+        for col in [
+            "pcap_iat_cv", "pcap_bin_count_cv",
+            "pcap_bin_count_peak_ratio", "pcap_bin_entropy_std",
+            "pcap_bin_s6a_fraction_std", "pcap_air_ratio_std",
+            "pcap_ulr_ratio_std",
+        ]:
+            mult = float(np.exp(rng.normal(0.0, 0.30)))
+            x[col] = np.clip(x[col].to_numpy(float) * mult, 0.0, None)
+
+        x["domain_variant"] = variant
+        outs.append(x)
+    return pd.concat(outs, ignore_index=True)
+
+
+def _parse_pcap_rows(path: Path):
+    raw = _run_tshark(path)
+    rows = []
+    for rec in raw:
+        try:
+            ts = float(rec.get("time", ""))
+        except Exception:
+            continue
+        try:
+            code = int(str(rec.get("cmd", "")).split(",")[0], 0)
+        except Exception:
+            continue
+        try:
+            app = int(str(rec.get("app", "")).split(",")[0], 0) if rec.get("app") else 0
+        except Exception:
+            app = 0
+        try:
+            cc = int(str(rec.get("cc_type", "")).split(",")[0], 0) if rec.get("cc_type") else 0
+        except Exception:
+            cc = 0
+        rows.append((ts, app, code, cc))
+    if not rows:
+        raise RuntimeError(f"No Diameter PDUs decoded from {path}")
+    rows.sort(key=lambda x: x[0])
+    return rows
+
+
+def pcap_to_native_features(path: Path) -> Dict[str, float]:
+    base = pcap_to_portable_features(path)
+    rows = _parse_pcap_rows(path)
+    times = np.asarray([r[0] for r in rows], dtype=float)
+    duration = max(float(times[-1] - times[0]), 1e-3)
+    total = len(rows)
+
+    app_counts = {APP_S6A: 0, APP_GX: 0, APP_RX: 0, APP_S13: 0}
+    s6a_counts = {c: 0.0 for c in S6A_COMMANDS}
+    gx_counts = {c: 0.0 for c in GX_COMMANDS}
+    command_pairs = set()
+
+    for _, app, code, cc in rows:
+        if app in app_counts:
+            app_counts[app] += 1
+        command_pairs.add((app, code, cc if app == APP_GX and code == 272 else 0))
+        if app == APP_S6A and code in S6A_CODES:
+            s6a_counts[S6A_CODES[code]] += 1.0
+        if app == APP_GX:
+            if code == 258:
+                gx_counts["RAR"] += 1.0
+            elif code == 272:
+                gx_counts[{1: "CCR_I", 2: "CCR_U", 3: "CCR_T"}.get(cc, "CCR_I")] += 1.0
+
+    # Four equal time bins preserve burst information and work on short traces.
+    bin_counts = np.zeros(4, dtype=float)
+    bin_entropy = np.zeros(4, dtype=float)
+    bin_s6a_frac = np.zeros(4, dtype=float)
+    bin_air = np.zeros(4, dtype=float)
+    bin_ulr = np.zeros(4, dtype=float)
+
+    if duration <= 1e-3:
+        bin_ids = np.minimum(
+            (np.arange(total) * 4 // max(total, 1)).astype(int), 3)
+    else:
+        rel = (times - times[0]) / duration
+        bin_ids = np.minimum((rel * 4).astype(int), 3)
+
+    for b in range(4):
+        sub = [rows[i] for i in np.flatnonzero(bin_ids == b)]
+        if not sub:
+            continue
+        bin_counts[b] = len(sub)
+        pairs = {}
+        s6a_b = 0
+        air_b = 0
+        ulr_b = 0
+        for _, app, code, cc in sub:
+            key = (app, code, cc if app == APP_GX and code == 272 else 0)
+            pairs[key] = pairs.get(key, 0) + 1
+            if app == APP_S6A:
+                s6a_b += 1
+                if code == 318:
+                    air_b += 1
+                elif code == 316:
+                    ulr_b += 1
+        bin_entropy[b] = _entropy(pairs.values())
+        bin_s6a_frac[b] = s6a_b / len(sub)
+        if s6a_b:
+            bin_air[b] = air_b / s6a_b
+            bin_ulr[b] = ulr_b / s6a_b
+
+    iat = np.diff(times)
+    iat = iat[np.isfinite(iat) & (iat >= 0)]
+    iat_cv = _cv(iat) if len(iat) else 0.0
+
+    known = sum(app_counts.values())
+    other = max(0, total - known)
+    out = {k: float(base[k]) for k in PORTABLE_FEATURES}
+    out.update({
+        "pcap_log_total_pdus": float(np.log1p(total)),
+        "pcap_log_duration_s": float(np.log1p(duration)),
+        "pcap_log_rate_hz": float(np.log1p(total / duration)),
+        "pcap_gx_fraction": app_counts[APP_GX] / total,
+        "pcap_rx_fraction": app_counts[APP_RX] / total,
+        "pcap_s13_fraction": app_counts[APP_S13] / total,
+        "pcap_other_fraction": other / total,
+        "pcap_iat_cv": float(iat_cv),
+        "pcap_bin_count_cv": _cv(bin_counts),
+        "pcap_bin_count_peak_ratio": float(
+            np.max(bin_counts) / (np.mean(bin_counts) + 1e-9)),
+        "pcap_bin_count_autocorr": _autocorr(bin_counts),
+        "pcap_bin_entropy_std": float(np.std(bin_entropy)),
+        "pcap_bin_s6a_fraction_std": float(np.std(bin_s6a_frac)),
+        "pcap_air_ratio_std": float(np.std(bin_air)),
+        "pcap_ulr_ratio_std": float(np.std(bin_ulr)),
+        "pcap_active_command_fraction": float(
+            len(command_pairs) / (len(S6A_COMMANDS) + len(GX_COMMANDS) + 4)
+        ),
+        "_decoded_pdus": float(total),
+        "_duration_s": float(duration),
+    })
+    return out
+
+
+def _make_hgb(seed: int):
+    return HistGradientBoostingClassifier(
+        max_iter=180,
+        learning_rate=0.05,
+        max_leaf_nodes=31,
+        max_depth=8,
+        min_samples_leaf=20,
+        l2_regularization=1.0,
+        class_weight="balanced",
+        random_state=seed,
+    )
+
+
+def _branch_scores(bundle: dict, X: pd.DataFrame) -> np.ndarray:
+    scores = []
+    for name, cols in bundle["branch_features"].items():
+        model = bundle["branches"][name]
+        scores.append(model.predict_proba(X[cols])[:, 1])
+    return np.column_stack(scores)
+
+
+def _meta_score(bundle: dict, X: pd.DataFrame) -> np.ndarray:
+    return bundle["meta"].predict_proba(_branch_scores(bundle, X))[:, 1]
+
+
+def _metrics(y: np.ndarray, score: np.ndarray, threshold: float) -> Dict[str, float]:
+    pred = (score >= threshold).astype(int)
+    benign = y == 0
+    return {
+        "auc_roc": float(roc_auc_score(y, score)),
+        "auc_pr": float(average_precision_score(y, score)),
+        "f1": float(f1_score(y, pred, zero_division=0)),
+        "recall": float(recall_score(y, pred, zero_division=0)),
+        "benign_fpr": float(pred[benign].mean()) if benign.any() else float("nan"),
+        "balanced_accuracy": float(balanced_accuracy_score(y, pred)),
+    }
+
+
+def train_detector(
+    calibration_pcaps: Sequence[Path],
+    base_seeds: Sequence[int] = (42, 43),
+    meta_seed: int = 44,
+    threshold_seed: int = 45,
+    test_seed: int = 46,
+) -> Tuple[dict, dict]:
+    frames = {}
+    all_seeds = list(base_seeds) + [meta_seed, threshold_seed, test_seed]
+    for seed in all_seeds:
+        sim = build_training_frame(seed)
+        native = simulation_to_native_windows(sim)
+        native["source_seed"] = seed
+        frames[seed] = native
+        print(
+            f"seed={seed}: windows={len(native)}, "
+            f"positive={native['is_anomaly'].mean():.4f}")
+
+    train = pd.concat(
+        [domain_randomise(frames[s], 1000 + s, variants=4)
+         for s in base_seeds],
+        ignore_index=True,
+    )
+    meta_fit = domain_randomise(frames[meta_seed], 1000 + meta_seed, variants=2)
+    threshold_fit = domain_randomise(
+        frames[threshold_seed], 1000 + threshold_seed, variants=2)
+    test = domain_randomise(frames[test_seed], 1000 + test_seed, variants=1)
+
+    branch_features = {
+        "profile": PROFILE_FEATURES,
+        "volume": VOLUME_FEATURES,
+        "temporal": TEMPORAL_FEATURES,
+        "full_rf": PCAP_NATIVE_FEATURES,
+    }
+    branches = {
+        "profile": _make_hgb(101),
+        "volume": _make_hgb(102),
+        "temporal": _make_hgb(103),
+        "full_rf": RandomForestClassifier(
+            n_estimators=500,
+            class_weight="balanced_subsample",
+            max_depth=14,
+            min_samples_leaf=4,
+            min_samples_split=8,
+            max_features="sqrt",
+            bootstrap=True,
+            max_samples=0.85,
+            random_state=104,
+            n_jobs=-1,
+        ),
+    }
+
+    y_train = train["is_anomaly"].astype(int).to_numpy()
+    for name, model in branches.items():
+        model.fit(train[branch_features[name]], y_train)
+
+    temp_bundle = {
+        "branches": branches,
+        "branch_features": branch_features,
+    }
+    meta_X = _branch_scores(temp_bundle, meta_fit[PCAP_NATIVE_FEATURES])
+    y_meta = meta_fit["is_anomaly"].astype(int).to_numpy()
+    meta = LogisticRegression(
+        C=0.5,
+        class_weight="balanced",
+        max_iter=2000,
+        random_state=105,
+    ).fit(meta_X, y_meta)
+
+    bundle = {
+        "version": 1,
+        "features": PCAP_NATIVE_FEATURES,
+        "branch_features": branch_features,
+        "branches": branches,
+        "meta": meta,
+        "threshold": None,
+        "threshold_method": None,
+        "seed_roles": {
+            "base_fit": list(base_seeds),
+            "meta_fit": meta_seed,
+            "threshold_fit": threshold_seed,
+            "internal_test": test_seed,
+        },
+    }
+
+    calib_score = _meta_score(bundle, threshold_fit[PCAP_NATIVE_FEATURES])
+    y_calib = threshold_fit["is_anomaly"].astype(int).to_numpy()
+    synth_benign = calib_score[y_calib == 0]
+    synth_threshold = float(np.quantile(synth_benign, 0.98))
+
+    external_benign_scores = []
+    external_benign_rows = []
+    for p in calibration_pcaps:
+        feat = pcap_to_native_features(p)
+        X = pd.DataFrame([{k: feat[k] for k in PCAP_NATIVE_FEATURES}])
+        score = float(_meta_score(bundle, X)[0])
+        external_benign_scores.append(score)
+        external_benign_rows.append({
+            "capture": p.name,
+            "score": score,
+            "decoded_pdus": int(feat["_decoded_pdus"]),
+        })
+
+    # Orange/diafuzzer is calibration-only.  Taking the maximum benign score
+    # is conservative because the corpus is small; Kelly remains untouched.
+    external_floor = max(external_benign_scores) if external_benign_scores else 0.0
+    threshold = max(synth_threshold, float(external_floor))
+    bundle["threshold"] = threshold
+    bundle["threshold_method"] = (
+        "max(98th percentile synthetic benign calibration seed, "
+        "maximum independent Orange benign PCAP score)"
+    )
+
+    test_score = _meta_score(bundle, test[PCAP_NATIVE_FEATURES])
+    y_test = test["is_anomaly"].astype(int).to_numpy()
+    test_metrics = _metrics(y_test, test_score, threshold)
+
+    # Per-attack cross-seed internal recall.
+    pred_test = test_score >= threshold
+    per_attack = {}
+    for at in sorted(set(test["attack_type"].astype(str)) - {"none"}):
+        mask = test["attack_type"].astype(str).to_numpy() == at
+        per_attack[at] = {
+            "count": int(mask.sum()),
+            "recall": float(pred_test[mask].mean()) if mask.any() else 0.0,
+        }
+
+    metrics = {
+        "scope": (
+            "PCAP-native portable detector; node_compromise excluded because "
+            "standalone PCAP lacks CU/report inconsistency evidence"
+        ),
+        "feature_count": len(PCAP_NATIVE_FEATURES),
+        "features": PCAP_NATIVE_FEATURES,
+        "seed_roles": bundle["seed_roles"],
+        "domain_randomisation": {
+            "traffic_scale_range": [0.002, 2.0],
+            "time_scale_range": [0.5, 2.0],
+            "command_mix_sigma": 0.025,
+            "temporal_scale_log_sigma": 0.30,
+        },
+        "threshold": threshold,
+        "threshold_method": bundle["threshold_method"],
+        "synthetic_benign_threshold_98pct": synth_threshold,
+        "independent_calibration_pcaps": external_benign_rows,
+        "internal_cross_seed_test": test_metrics,
+        "internal_cross_seed_per_attack": per_attack,
+        "train_windows": int(len(train)),
+        "meta_fit_windows": int(len(meta_fit)),
+        "threshold_fit_windows": int(len(threshold_fit)),
+        "test_windows": int(len(test)),
+    }
+    return bundle, metrics
+
+
+def score_pcaps(
+    bundle: dict,
+    manifest: pd.DataFrame,
+    pcap_dir: Path,
+) -> pd.DataFrame:
+    rows = []
+    for rec in manifest.to_dict("records"):
+        path = pcap_dir / str(rec["capture"])
+        feat = pcap_to_native_features(path)
+        X = pd.DataFrame([{k: feat[k] for k in PCAP_NATIVE_FEATURES}])
+        branch = _branch_scores(bundle, X)[0]
+        score = float(bundle["meta"].predict_proba(branch.reshape(1, -1))[:, 1][0])
+        out = {
+            **rec,
+            "pcap_native_score": score,
+            "pcap_native_pred_anomaly": int(score >= float(bundle["threshold"])),
+            "decoded_pdus": int(feat["_decoded_pdus"]),
+            "duration_s": float(feat["_duration_s"]),
+        }
+        for name, value in zip(bundle["branch_features"].keys(), branch):
+            out[f"pcap_native_{name}_score"] = float(value)
+        rows.append(out)
+    return pd.DataFrame(rows)
+
+
+def summarise_external(pred: pd.DataFrame, threshold: float) -> Dict[str, object]:
+    y = (pred["expected_label"].astype(str) == "attack").astype(int).to_numpy()
+    p = pred["pcap_native_pred_anomaly"].astype(int).to_numpy()
+    summary = {
+        "capture_count": int(len(pred)),
+        "attack_capture_count": int(y.sum()),
+        "benign_capture_count": int((1 - y).sum()),
+        "feature_count": len(PCAP_NATIVE_FEATURES),
+        "threshold": float(threshold),
+        "external_attack_tpr": float(
+            recall_score(y, p, zero_division=0)) if y.sum() else None,
+        "external_benign_fpr": float(
+            p[y == 0].mean()) if np.any(y == 0) else None,
+        "external_f1": float(
+            f1_score(y, p, zero_division=0)) if len(np.unique(y)) > 1 else None,
+        "external_balanced_accuracy": float(
+            balanced_accuracy_score(y, p)) if len(np.unique(y)) > 1 else None,
+    }
+    per_scenario = {}
+    if "scenario" in pred.columns:
+        for scenario, grp in pred.groupby("scenario"):
+            gy = (grp["expected_label"].astype(str) == "attack").astype(int).to_numpy()
+            gp = grp["pcap_native_pred_anomaly"].astype(int).to_numpy()
+            per_scenario[str(scenario)] = {
+                "captures": int(len(grp)),
+                "expected_label": str(grp["expected_label"].iloc[0]),
+                "detection_rate": float(gp.mean()),
+                "decoded_pdus": int(grp["decoded_pdus"].sum()),
+            }
+    summary["per_scenario"] = per_scenario
+    return summary
+
+
+def train_cli(args) -> None:
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    bundle, metrics = train_detector(args.calibration_pcaps)
+    with (args.out_dir / "pcap_native_bundle.pkl").open("wb") as f:
+        pickle.dump(bundle, f)
+    (args.out_dir / "training_summary.json").write_text(
+        json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(metrics, ensure_ascii=False, indent=2))
+
+    test = metrics["internal_cross_seed_test"]
+    if test["recall"] < 0.70:
+        raise SystemExit(
+            f"PCAP-native internal cross-seed recall below 70%: {test['recall']:.3f}")
+    if test["benign_fpr"] > 0.05:
+        raise SystemExit(
+            f"PCAP-native internal cross-seed FPR above 5%: {test['benign_fpr']:.3f}")
+
+
+def score_cli(args) -> None:
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    with args.model.open("rb") as f:
+        bundle = pickle.load(f)
+    manifest = pd.read_csv(args.manifest)
+    required = {"capture", "expected_label"}
+    missing = required.difference(manifest.columns)
+    if missing:
+        raise SystemExit(f"manifest missing columns: {sorted(missing)}")
+    pred = score_pcaps(bundle, manifest, args.pcap_dir)
+    summary = summarise_external(pred, float(bundle["threshold"]))
+    pred.to_csv(args.out_dir / "predictions.csv", index=False)
+    (args.out_dir / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(pred.to_string(index=False))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    tr = sub.add_parser("train")
+    tr.add_argument(
+        "--calibration-pcaps", nargs="*", type=Path, default=[])
+    tr.add_argument(
+        "--out-dir", type=Path, default=Path("results_pcap_native_train"))
+    tr.set_defaults(func=train_cli)
+
+    sc = sub.add_parser("score")
+    sc.add_argument("--model", type=Path, required=True)
+    sc.add_argument("--manifest", type=Path, required=True)
+    sc.add_argument("--pcap-dir", type=Path, required=True)
+    sc.add_argument(
+        "--out-dir", type=Path, default=Path("results_pcap_native_external"))
+    sc.set_defaults(func=score_cli)
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
