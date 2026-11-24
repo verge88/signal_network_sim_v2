@@ -1,0 +1,40 @@
+name: Audit SIP TICD fusion error sources and paired seeds
+on:
+  push:
+    branches: [improve/ticd-physical-causal-alert-fusion]
+    paths:
+      - 'experiments/audit_ticd_fusion_error_sources.py'
+      - '.github/workflows/sip-ticd-fusion-error-audit.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+      - name: Retrieve successful frozen model and report
+        run: |
+          set -euo pipefail
+          gh run download 45366626708 --repo "${{ github.repository }}" --name sip-ticd-physical-causal-alert-model-and-holdout --dir prior
+          p="$(find prior -name physical_causal_alert_report.json -print -quit)"
+          test -n "$p"
+          echo "PRIOR_DIR=$(dirname "$p")" >> "$GITHUB_ENV"
+      - name: Diagnose existing test errors, never fit or adjust thresholds
+        run: python -m experiments.audit_ticd_fusion_error_sources --prior "$PRIOR_DIR" --out results_fusion_audit
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sip-ticd-fusion-error-audit
+          path: results_fusion_audit/
+          retention-days: 30
