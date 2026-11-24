@@ -1519,16 +1519,29 @@ def score_cli(args) -> None:
             raise SystemExit("Unsupported local calibration method")
 
         local_scores = []
+        global_scores = []
+        matched_profiles = []
+        matched_profile_scores = []
         local_preds = []
         for rec in manifest.to_dict("records"):
             feat = pcap_to_native_features(
                 args.pcap_dir / str(rec["capture"]))
             scored = score_with_local_calibration(bundle, local_meta, feat)
             local_scores.append(float(scored["local_score"]))
+            global_scores.append(float(scored.get(
+                "global_local_score", scored["local_score"])))
+            matched_profiles.append(str(scored.get(
+                "matched_benign_profile", "global")))
+            pvals = scored.get("profile_scores", {})
+            matched_profile_scores.append(
+                float(min(pvals.values())) if pvals else float("nan"))
             local_preds.append(int(scored["local_score"] > 1.0))
         pred["frozen_supervised_pred_anomaly"] = (
             pred["pcap_native_pred_anomaly"].astype(int))
         pred["local_oneclass_score"] = local_scores
+        pred["global_local_oneclass_score"] = global_scores
+        pred["matched_benign_profile"] = matched_profiles
+        pred["matched_benign_profile_score"] = matched_profile_scores
         pred["local_oneclass_pred_anomaly"] = local_preds
         # Detection decision in deployment-local mode is one-class.  The
         # frozen supervised score remains available as explanatory evidence
