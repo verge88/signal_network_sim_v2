@@ -79,6 +79,8 @@ EXTRA_FEATURES = [
     "pcap_log_total_pdus",
     "pcap_log_duration_s",
     "pcap_log_rate_hz",
+    "pcap_s6a_fraction",
+    "pcap_s6a_fraction",
     "pcap_gx_fraction",
     "pcap_rx_fraction",
     "pcap_s13_fraction",
@@ -198,16 +200,24 @@ def _normalised_command_features(
     gx_vals = [float(gx_cmd_counts.get(c, 0.0)) for c in GX_COMMANDS]
     top2 = sum(sorted(s6a_vals, reverse=True)[:2])
 
-    # Include non-S6a/Gx application buckets in entropy so the same semantic
-    # definition is used for synthetic windows and real PCAPs.
-    entropy_counts = s6a_vals + gx_vals + [
-        float(rx_count), float(s13_count), float(other_count)
+    # Match the simulator semantics exactly.  The legacy portable branch used
+    # command entropy and S6a application fraction under these names, which
+    # created a silent representation mismatch at domain transfer time.
+    interface_counts = [
+        float(s6a_count), float(gx_count), float(rx_count),
+        float(s13_count), float(other_count),
     ]
+    s6a_rest = max(s6a_total - max(s6a_vals, default=0.0), 1e-3)
+    s6a_top2_rest = max(s6a_total - top2, 1e-3)
 
     out = {
-        "obs_entropy": _entropy(entropy_counts),
-        "obs_s6a_dominance_ratio": float(s6a_count) / total,
-        "obs_s6a_top2_ratio": top2 / s6a_total if s6a_total > 0 else 0.0,
+        "obs_entropy": _entropy(interface_counts),
+        "obs_s6a_dominance_ratio": (
+            max(s6a_vals, default=0.0) / s6a_rest if s6a_total > 0 else 0.0
+        ),
+        "obs_s6a_top2_ratio": (
+            top2 / s6a_top2_rest if s6a_total > 0 else 0.0
+        ),
         "obs_s6a_gini": _gini(s6a_vals),
     }
     for c in S6A_COMMANDS:
@@ -291,6 +301,7 @@ def _aggregate_sim_window(win: pd.DataFrame, interval_s: float = 15.0):
         "pcap_log_total_pdus": float(np.log1p(max(total, 0.0))),
         "pcap_log_duration_s": float(np.log1p(duration)),
         "pcap_log_rate_hz": float(np.log1p(max(rate, 0.0))),
+        "pcap_s6a_fraction": s6a / max(total, 1.0),
         "pcap_gx_fraction": gx / max(total, 1.0),
         "pcap_rx_fraction": rx / max(total, 1.0),
         "pcap_s13_fraction": s13 / max(total, 1.0),
@@ -493,11 +504,26 @@ def pcap_to_native_features(path: Path) -> Dict[str, float]:
 
     known = sum(app_counts.values())
     other = max(0, total - known)
-    out = {k: float(base[k]) for k in PORTABLE_FEATURES}
+
+    # Recompute the legacy-named features with the exact simulator semantics.
+    # This is intentionally local to the new PCAP-native branch; the robust IF
+    # baseline keeps its frozen legacy transform for comparability.
+    semantic = _normalised_command_features(
+        total,
+        app_counts[APP_S6A],
+        app_counts[APP_GX],
+        app_counts[APP_RX],
+        app_counts[APP_S13],
+        other,
+        s6a_counts,
+        gx_counts,
+    )
+    out = {k: float(semantic[k]) for k in PORTABLE_FEATURES}
     out.update({
         "pcap_log_total_pdus": float(np.log1p(total)),
         "pcap_log_duration_s": float(np.log1p(duration)),
         "pcap_log_rate_hz": float(np.log1p(total / duration)),
+        "pcap_s6a_fraction": app_counts[APP_S6A] / total,
         "pcap_gx_fraction": app_counts[APP_GX] / total,
         "pcap_rx_fraction": app_counts[APP_RX] / total,
         "pcap_s13_fraction": app_counts[APP_S13] / total,
@@ -592,6 +618,7 @@ def protocol_archetype_frame(
             "pcap_log_total_pdus": float(np.log1p(total)),
             "pcap_log_duration_s": float(np.log1p(duration)),
             "pcap_log_rate_hz": float(np.log1p(rate)),
+            "pcap_s6a_fraction": 1.0,
             "pcap_gx_fraction": 0.0,
             "pcap_rx_fraction": 0.0,
             "pcap_s13_fraction": 0.0,
