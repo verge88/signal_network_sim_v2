@@ -41,6 +41,7 @@ class InvariantAblationTICD:
         if variant=="no_warning_scope":self.role.eligible_roles=None
         self.threshold=self.model.threshold
         self.warning_threshold=self.role.warning_threshold
+        self.degenerate_instant_reference=False
     def transform(self,df):
         v=self.variant
         if v in ("full","no_gateway_weight","no_warning_load","no_warning_scope","no_warning"):
@@ -51,8 +52,8 @@ class InvariantAblationTICD:
             mask=(signed>0) if v=="no_i1_deficit" else (signed<0)
             x.loc[mask,["obs_dialog_completion_ratio","obs_dangling_dialog_ratio"]]=.5
         if v in ("no_i1_instant","no_i1_all","no_all_invariants"):
-            # Set complement, preserving reported completion and independent
-            # precomputed mismatch. Avoid floating point cancellation by
+            # Set both report fractions to exact complementary values; retain the
+            # precomputed I2 mismatch. Avoid floating point cancellation by
             # setting both report fractions to exact binary halves.
             x["obs_dialog_completion_ratio"]=.5
             x["obs_dangling_dialog_ratio"]=.5
@@ -89,8 +90,26 @@ class InvariantAblationTICD:
         self.loss.fit(t)
         self.causal.fit(t)
         self.zonal.fit(t)
+        # These estimators assume a fresh object: discard inherited groups
+        # before refitting to avoid stale sparse-group references.
+        self.high.thresholds.clear()
+        self.high.group_counts.clear()
         self.high.fit(t)
         self.high.calibrate(val,alert_budget)
+        self.degenerate_instant_reference=False
+        if self.high.scale==0.:
+            # The all-invariant null has identically zero evidence, hence
+            # its empirical quantile is zero. A unit divisor represents the
+            # zero score exactly, without fabricating an anomaly signal.
+            # Fail closed on any unexpected degenerate non-null variant.
+            assert self.variant=="no_all_invariants", (self.variant,self.high.scale)
+            assert np.all(self.high.normalized(t)==0.)
+            assert all(np.all(self.high.normalized(x)==0.) for x in val.values())
+            self.high.scale=1.
+            self.degenerate_instant_reference=True
+        assert np.isfinite(self.high.scale) and self.high.scale>0.
+        self.model.prior.reference.groups_q.clear()
+        self.model.prior.reference.counts.clear()
         self.model.prior.reference.fit(t)
         self.model.calibrate(val,alert_budget)
         self.threshold=self.model.threshold
@@ -104,6 +123,11 @@ class InvariantAblationTICD:
             qs.append(float(np.quantile(masked,1-warning_budget,method="higher")))
         self.warning_threshold=max(qs)
         self.role.warning_threshold=self.warning_threshold
+        if self.variant=="no_all_invariants":
+            assert self.degenerate_instant_reference
+            assert self.threshold==self.warning_threshold==0.
+            assert not self.score(train).any()
+            assert not self.warning(train)[0].any()
         for x in validation.values():
             p=self.predict_masks(x)
             assert p["confirmed_alert"].mean()<=alert_budget+1e-12
@@ -121,7 +145,7 @@ class InvariantAblationTICD:
         return {"normal":y==0,"warning_only":y==1,"confirmed_alert":y==2,"any_signal":y>0}
     def manifest(self):
         return {"variant":self.variant,"refit":self.refit,"threshold":float(self.threshold),
-                "warning_threshold":float(self.warning_threshold),"physical_mode":self.physical.physical_mode,
+                "warning_threshold":float(self.warning_threshold),"degenerate_instant_reference":self.degenerate_instant_reference,"instant_scale":float(self.high.scale),"physical_mode":self.physical.physical_mode,
                 "gateway_weight":self.model.gateway_weight,"warning_mode":self.zonal.mode,
                 "warning_roles":self.role.eligible_roles,
                 "zone_D_active_in_full":self.physical.physical_mode=="physical_zone",
