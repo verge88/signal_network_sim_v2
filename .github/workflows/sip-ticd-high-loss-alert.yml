@@ -1,0 +1,72 @@
+name: SIP TICD strong alerts high-loss calibration and untouched test
+on:
+  push:
+    branches: [improve/ticd-high-loss-alert-calibration]
+    paths:
+      - 'sip/ticd_high_loss_alert.py'
+      - 'experiments/evaluate_ticd_high_loss_alert.py'
+      - '.github/workflows/sip-ticd-high-loss-alert.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+      PYTHONHASHSEED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install and compile
+        run: |
+          set -euo pipefail
+          python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+          python -m compileall -q sip/ticd_high_loss_alert.py experiments/evaluate_ticd_high_loss_alert.py
+          python -m pip freeze > high_loss_environment.txt
+      - name: Retrieve prior frozen role-scoped model
+        run: |
+          set -euo pipefail
+          mkdir -p prior
+          gh run download 45345567415 --repo "${{ github.repository }}" --name sip-ticd-role-scoped-warning-frozen-model-and-holdout --dir prior
+          p="$(find prior -type f -name role_scoped_ticd_model.pkl -print -quit)"
+          test -n "$p"
+          echo "PRIOR_DIR=$(dirname "$p")" >> "$GITHUB_ENV"
+      - name: Fit new normal references and evaluate on untouched simulation seeds
+        run: python -m experiments.evaluate_ticd_high_loss_alert --prior "$PRIOR_DIR" --out results_high_loss
+      - name: Verify confusion counts and unchanged warning reference
+        run: |
+          python - <<'PY'
+          import json
+          d=json.load(open('results_high_loss/high_loss_alert_report.json'))
+          assert not d['real_field_validation']
+          assert d['oracle_invariance'] and d['batch_invariance'] and d['model_reload']
+          assert d['warning_channel_frozen'] and d['all_roles_strong_alert']
+          assert not d['heldout_used_for_selection']
+          seeds=[s for k in ('train_seeds','validation_seeds','development_seeds','test_seeds') for xs in d[k].values() for s in xs]
+          assert len(seeds)==len(set(seeds))
+          for cohort, pair in d['heldout'].items():
+              for name, m in pair.items():
+                  assert m['confirmed_TP']+m['warning_only_TP']==m['covered_attack_rows']
+                  assert m['confirmed_FP']+m['warning_only_FP']<=m['normal']
+                  for key in ('confirmed_FP','confirmed_TP','warning_only_FP','warning_only_TP','normal','attack'):
+                      assert sum(x[key] for x in d['per_seed'][cohort][name])==m[key]
+          print('HIGHLOSS_AUDIT_VERIFIED')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-ticd-high-loss-alert-model-and-holdout
+          path: |
+            results_high_loss/
+            high_loss_environment.txt
+          if-no-files-found: warn
+          retention-days: 30
