@@ -54,15 +54,19 @@ class HighLossAlertTICD:
     def reference(self,df):
         if not self.fitted: raise RuntimeError("Not fitted")
         return np.array([self.thresholds.get(str(k),self.fallback) for k in self.groups(df)])
-    def normalized(self,df):
-        return self.prior.score_channels(df)["instant"]/self.reference(df)
+    def normalized(self,df,instant=None):
+        # Use the identical floating-point operation for calibration and inference.
+        # Comparing A > lambda*q can round differently at an exact quantile tie.
+        if instant is None:
+            instant=self.prior.score_channels(df)["instant"]
+        return np.asarray(instant,dtype=float)/self.reference(df)
     def calibrate(self,validation,budget):
         self.scale=max(float(np.quantile(self.normalized(df),1.-budget,method="higher"))
                        for df in validation.values())
         return self
     def predict_levels(self,df):
         channels=self.prior.score_channels(df)
-        a=channels["instant"]>self.scale*self.reference(df)
+        a=self.normalized(df,channels["instant"])>self.scale
         w=(channels["warning"]>self.prior.warning_threshold)&self.prior.eligible_mask(df)&(~a)
         levels=np.zeros(len(df),dtype=np.int8)
         levels[w]=1
