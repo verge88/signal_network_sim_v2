@@ -1164,12 +1164,16 @@ def fit_local_benign_calibration(
 
     rows = []
     meta_rows = []
+    guard_rate = []
+    guard_burst = []
     roles = []
     has_roles = "role" in manifest.columns
     for rec in manifest.to_dict("records"):
         path = pcap_dir / str(rec["capture"])
         feat = pcap_to_native_features(path)
         rows.append([float(feat[c]) for c in LOCAL_ADAPT_FEATURES])
+        guard_rate.append(float(feat["pcap_log_rate_hz"]))
+        guard_burst.append(float(feat["pcap_log_burst_mass"]))
 
         role = str(rec.get("role", "")).lower().strip()
         roles.append(role)
@@ -1189,6 +1193,8 @@ def fit_local_benign_calibration(
         })
 
     Xall = np.asarray(rows, dtype=float)
+    guard_rate = np.asarray(guard_rate, dtype=float)
+    guard_burst = np.asarray(guard_burst, dtype=float)
 
     if has_roles:
         allowed = {"reference", "calibration"}
@@ -1216,6 +1222,8 @@ def fit_local_benign_calibration(
         method = "deployment_benign_local_manifold_split_conformal"
         reference_count = int(len(Xref))
         conformal_count = int(len(Xconf))
+        guard_rate_source = guard_rate[cal_mask]
+        guard_burst_source = guard_burst[cal_mask]
     else:
         # Backwards-compatible leave-one-out mode for small development sets.
         # A production deployment should prefer explicit reference/calibration
@@ -1233,9 +1241,19 @@ def fit_local_benign_calibration(
         method = "deployment_benign_local_manifold_conformal"
         reference_count = int(len(Xref))
         conformal_count = int(len(Xref))
+        guard_rate_source = guard_rate
+        guard_burst_source = guard_burst
 
     nn_threshold = _conformal_upper(nn_scores, target_fpr)
     envelope_threshold = _conformal_upper(env_scores, target_fpr)
+
+    # Conservative benign-only upper envelopes for short high-rate bursts.
+    # These thresholds use no attack labels.  nextafter makes every benign
+    # calibration capture lie strictly below the guard under a >= decision.
+    rate_guard_threshold = float(np.nextafter(
+        np.max(guard_rate_source), np.inf))
+    burst_guard_threshold = float(np.nextafter(
+        np.max(guard_burst_source), np.inf))
 
     profiles = {}
     if has_roles and "scenario" in manifest.columns:
@@ -1288,6 +1306,12 @@ def fit_local_benign_calibration(
         "conformal_capture_count": conformal_count,
         "nn_threshold": float(nn_threshold),
         "envelope_threshold": float(envelope_threshold),
+        "rate_guard_threshold": rate_guard_threshold,
+        "burst_guard_threshold": burst_guard_threshold,
+        "guard_method": (
+            "benign-only max upper envelope on log message rate and "
+            "log burst mass; attack labels unused"
+        ),
         "calibration_nn_scores": nn_scores.tolist(),
         "calibration_envelope_scores": env_scores.tolist(),
         "profiles": profiles,
@@ -1320,13 +1344,38 @@ def score_with_local_calibration(
             float(profile["envelope_threshold"]),
         )
 
+    rate_threshold = float(calibration.get(
+        "rate_guard_threshold", float("inf")))
+    burst_threshold = float(calibration.get(
+        "burst_guard_threshold", float("inf")))
+    rate_score = (
+        float(feat["pcap_log_rate_hz"]) / max(rate_threshold, 1e-9)
+        if np.isfinite(rate_threshold) else 0.0
+    )
+    burst_score = (
+        float(feat["pcap_log_burst_mass"]) / max(burst_threshold, 1e-9)
+        if np.isfinite(burst_threshold) else 0.0
+    )
+    guard_score = float(max(rate_score, burst_score))
+
     if profile_scores:
         best_name, best = min(
             profile_scores.items(), key=lambda kv: kv[1]["local_score"])
+        # A benign profile may rescue a globally unusual but legitimate
+        # procedure, so shape anomaly requires disagreement with both the
+        # global and the closest benign profile.  High-rate/high-mass bursts
+        # remain independently detectable through the benign-only guard.
+        shape_score = float(min(
+            global_score["local_score"], best["local_score"]))
+        final_score = float(max(shape_score, guard_score))
         return {
             "nn_distance": float(best["nn_distance"]),
             "envelope_distance": float(best["envelope_distance"]),
-            "local_score": float(best["local_score"]),
+            "local_score": final_score,
+            "shape_score": shape_score,
+            "rate_guard_score": float(rate_score),
+            "burst_guard_score": float(burst_score),
+            "guard_score": guard_score,
             "matched_benign_profile": str(best_name),
             "global_local_score": float(global_score["local_score"]),
             "profile_scores": {
@@ -1334,10 +1383,18 @@ def score_with_local_calibration(
                 for k, v in profile_scores.items()
             },
         }
+
+    shape_score = float(global_score["local_score"])
+    final_score = float(max(shape_score, guard_score))
     return {
         **global_score,
+        "local_score": final_score,
+        "shape_score": shape_score,
+        "rate_guard_score": float(rate_score),
+        "burst_guard_score": float(burst_score),
+        "guard_score": guard_score,
         "matched_benign_profile": "global",
-        "global_local_score": float(global_score["local_score"]),
+        "global_local_score": shape_score,
         "profile_scores": {},
     }
 
@@ -1520,6 +1577,10 @@ def score_cli(args) -> None:
 
         local_scores = []
         global_scores = []
+        shape_scores = []
+        rate_guard_scores = []
+        burst_guard_scores = []
+        guard_scores = []
         matched_profiles = []
         matched_profile_scores = []
         local_preds = []
@@ -1530,6 +1591,14 @@ def score_cli(args) -> None:
             local_scores.append(float(scored["local_score"]))
             global_scores.append(float(scored.get(
                 "global_local_score", scored["local_score"])))
+            shape_scores.append(float(scored.get(
+                "shape_score", scored["local_score"])))
+            rate_guard_scores.append(float(scored.get(
+                "rate_guard_score", 0.0)))
+            burst_guard_scores.append(float(scored.get(
+                "burst_guard_score", 0.0)))
+            guard_scores.append(float(scored.get(
+                "guard_score", 0.0)))
             matched_profiles.append(str(scored.get(
                 "matched_benign_profile", "global")))
             pvals = scored.get("profile_scores", {})
@@ -1540,6 +1609,10 @@ def score_cli(args) -> None:
             pred["pcap_native_pred_anomaly"].astype(int))
         pred["local_oneclass_score"] = local_scores
         pred["global_local_oneclass_score"] = global_scores
+        pred["local_shape_score"] = shape_scores
+        pred["local_rate_guard_score"] = rate_guard_scores
+        pred["local_burst_guard_score"] = burst_guard_scores
+        pred["local_guard_score"] = guard_scores
         pred["matched_benign_profile"] = matched_profiles
         pred["matched_benign_profile_score"] = matched_profile_scores
         pred["local_oneclass_pred_anomaly"] = local_preds
@@ -1565,6 +1638,9 @@ def score_cli(args) -> None:
             "profile_names": sorted(local_meta.get("profiles", {}).keys()),
             "nn_threshold": local_meta["nn_threshold"],
             "envelope_threshold": local_meta["envelope_threshold"],
+            "rate_guard_threshold": local_meta.get("rate_guard_threshold"),
+            "burst_guard_threshold": local_meta.get("burst_guard_threshold"),
+            "guard_method": local_meta.get("guard_method"),
         }
     if calibration_meta is not None:
         summary["deployment_calibration"] = {
