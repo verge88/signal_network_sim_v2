@@ -811,9 +811,10 @@ def sophistication_sweep(cfg: TrainingConfig) -> pd.DataFrame:
     """Головная цифра — ADAPTIVE. Среднее по уровням не публикуется."""
     base = FEATURE_SETS[cfg.feature_set]
     out = []
-    for s in Sophistication:
+    for soph_idx, s in enumerate(Sophistication):
         sc = cfg.sim_config()
-        sc.seed = cfg.seed + 7000 + hash(s.value) % 1000
+        # Stable across Python processes; built-in hash() is intentionally salted.
+        sc.seed = cfg.seed + 7000 + 101 * soph_idx
         df, _, _ = build_dataset(sc, episodes_kw=dict(
             n_compromise=cfg.n_compromise,
             n_normal=cfg.n_normal,
