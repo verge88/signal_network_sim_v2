@@ -51,7 +51,7 @@ jobs:
           sudo apt-get update -o Acquire::Retries=3
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark tcpdump netcat-openbsd
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install numpy pandas scipy networkx scikit-learn
 
       - name: Compile PCAP-native code
         run: |
