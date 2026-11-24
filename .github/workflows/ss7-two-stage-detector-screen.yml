@@ -1,0 +1,53 @@
+name: SS7 two-stage detector screening
+
+on:
+  push:
+    branches:
+      - validate-ss7-real-cdr
+    paths:
+      - "ss7/validate_two_stage_detector.py"
+      - ".github/workflows/ss7-two-stage-detector-screen.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  screen-two-stage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn
+
+      - name: Run screening
+        run: |
+          set -o pipefail
+          mkdir -p results/ss7_two_stage_screen
+          python -m ss7.validate_two_stage_detector \
+            --development-seeds 42 1337 \
+            --calibration-seed 2026 \
+            --evaluation-seeds 7101 7102 7103 \
+            --development-days 0.75 \
+            --evaluation-days 0.75 \
+            --output-dir results/ss7_two_stage_screen \
+            2>&1 | tee results/ss7_two_stage_screen/screen.log
+
+      - name: Upload screening artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss7-two-stage-detector-screen
+          path: results/ss7_two_stage_screen/
+          if-no-files-found: warn
+          retention-days: 30
