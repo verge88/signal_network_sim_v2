@@ -22,6 +22,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.metrics import precision_recall_curve, roc_curve
 
 
 INTERVAL_SECONDS = 30.0
@@ -303,6 +304,84 @@ def plot_lomfo(df, outdir, formats, manifest):
               "Leave-one-masking-family-out generalisation")
 
 
+def read_score_exports(root: Path) -> pd.DataFrame:
+    rows = []
+    for path in sorted(root.rglob("scores_*.csv")):
+        try:
+            d = pd.read_csv(path)
+        except Exception:
+            continue
+        if d.empty or not {"model", "label", "score"}.issubset(d.columns):
+            continue
+        seed = extract_seed(path)
+        if seed is not None:
+            d["seed"] = seed
+        d["_source"] = str(path)
+        rows.append(d)
+    return pd.concat(rows, ignore_index=True, sort=False) if rows else pd.DataFrame()
+
+
+def plot_roc_curves(scores: pd.DataFrame, outdir: Path, formats: Sequence[str], manifest: list):
+    if scores.empty:
+        return
+    fig, ax = plt.subplots(figsize=(8.5, 7))
+    plotted = 0
+    for model in MODEL_ORDER + [m for m in sorted(scores["model"].astype(str).unique()) if m not in MODEL_ORDER]:
+        d = scores[scores["model"].astype(str) == model].copy()
+        d["label"] = pd.to_numeric(d["label"], errors="coerce")
+        d["score"] = pd.to_numeric(d["score"], errors="coerce")
+        d = d.replace([np.inf, -np.inf], np.nan).dropna(subset=["label", "score"])
+        if d.empty or d["label"].nunique() < 2:
+            continue
+        fpr, tpr, _ = roc_curve(d["label"].astype(int), d["score"].astype(float))
+        auc = float(np.trapz(tpr, fpr))
+        ax.plot(fpr, tpr, label=f"{pretty_model(model)} (AUC={auc:.3f})")
+        plotted += 1
+    if not plotted:
+        plt.close(fig)
+        return
+    ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1)
+    ax.set_xlabel("False positive rate")
+    ax.set_ylabel("True positive rate")
+    ax.set_title("Pooled ROC curves across regenerated test seeds")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8, ncol=2)
+    safe_save(fig, outdir, "16_roc_curves", formats, manifest,
+              "Pooled ROC curves across regenerated test seeds")
+
+
+def plot_pr_curves(scores: pd.DataFrame, outdir: Path, formats: Sequence[str], manifest: list):
+    if scores.empty:
+        return
+    fig, ax = plt.subplots(figsize=(8.5, 7))
+    plotted = 0
+    prevalence = pd.to_numeric(scores["label"], errors="coerce").mean()
+    for model in MODEL_ORDER + [m for m in sorted(scores["model"].astype(str).unique()) if m not in MODEL_ORDER]:
+        d = scores[scores["model"].astype(str) == model].copy()
+        d["label"] = pd.to_numeric(d["label"], errors="coerce")
+        d["score"] = pd.to_numeric(d["score"], errors="coerce")
+        d = d.replace([np.inf, -np.inf], np.nan).dropna(subset=["label", "score"])
+        if d.empty or d["label"].nunique() < 2:
+            continue
+        precision, recall, _ = precision_recall_curve(
+            d["label"].astype(int), d["score"].astype(float)
+        )
+        ax.plot(recall, precision, label=pretty_model(model))
+        plotted += 1
+    if not plotted:
+        plt.close(fig)
+        return
+    if np.isfinite(prevalence):
+        ax.axhline(float(prevalence), linestyle="--", linewidth=1, label="Test prevalence")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title("Pooled precision–recall curves across regenerated test seeds")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8, ncol=2)
+    safe_save(fig, outdir, "17_precision_recall_curves", formats, manifest,
+              "Pooled precision–recall curves across regenerated test seeds")
+
+
 def bootstrap_differences(models: pd.DataFrame, baseline: str = "rule_baseline",
                           n_boot: int = 5000, seed: int = 2026) -> pd.DataFrame:
     if "seed" not in models.columns:
@@ -379,6 +458,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     models.to_csv(outdir / "all_models_multiseed.csv", index=False)
     build_summary(models, outdir)
 
+    raw_scores = read_score_exports(root)
+    if not raw_scores.empty:
+        raw_scores.to_csv(outdir / "all_models_test_scores.csv", index=False)
+
     ab_fs = read_many(root, "ablation_feature_sets.csv")
     ab_t = read_many(root, "ablation_temporal.csv")
     lomfo = read_many(root, "lomfo.csv")
@@ -433,6 +516,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                        args.formats, manifest)
 
     # Low-prevalence precision is typically tiny, so use a logarithmic x-axis.
+    plot_roc_curves(raw_scores, outdir, args.formats, manifest)
+    plot_pr_curves(raw_scores, outdir, args.formats, manifest)
+
     if "precision_at_op_prevalence" in models.columns:
         g = numeric_mean_std(models, "precision_at_op_prevalence")
         g = g[np.isfinite(g["mean"]) & (g["mean"] > 0)]
