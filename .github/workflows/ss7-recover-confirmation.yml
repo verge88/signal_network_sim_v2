@@ -1,0 +1,95 @@
+name: SS7 recover confirmation and full plots
+on:
+  push:
+    branches: [ss7-confirmation-repair-20261124]
+    paths: [.github/workflows/ss7-recover-confirmation.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  recover-plots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install numpy pandas matplotlib scikit-learn
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ss7-all-models-seed-*
+          path: results/all_models_collected
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: 45374365894
+      - run: |
+          set -o pipefail
+          mkdir -p results/all_models_figures
+          python -m ss7.plot_full_model_experiment --input-root results/all_models_collected --output-dir results/all_models_figures --formats png pdf 2>&1 | tee results/all_models_figures/plotting.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recovered-full-model-figures
+          path: results/all_models_figures
+  recover-confirmation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OMP_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          python -m pip install -r requirements.txt numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - name: Validate numerical repair against the old finite formula
+        run: |
+          python - <<'PY'
+          import math
+          from ss7.fix import mm1k_loss
+          for k in (1,10,100,400,1000):
+              for r in (0.,.1,.9,.999,1.,1.001,1.1,2.,5.,6.,10.,12.,20.,100.):
+                  p=mm1k_loss(r,k)
+                  assert math.isfinite(p) and 0<=p<=1,(r,k,p)
+                  if r==0: expected=0.
+                  elif r==1: expected=1/(k+1)
+                  elif r<1: expected=(1-r)*r**k/(-math.expm1((k+1)*math.log(r)))
+                  else: expected=(1-1/r)/(-math.expm1(-(k+1)*math.log(r)))
+                  if r<=12:
+                      assert math.isclose(p,expected,rel_tol=1e-10,abs_tol=1e-12),(r,k,p,expected)
+          print("Queue checks passed; old overload approximation above 12 retained.")
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: frozen-ss7-models
+          path: results/dev
+          github-token: ${{ github.token }}
+          run-id: 45392607396
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: confirmation-seed-*
+          path: results/collected
+          github-token: ${{ github.token }}
+          run-id: 45392607396
+      - name: Reevaluate only the previously failed world, unchanged weights
+        run: |
+          set -o pipefail
+          mkdir -p results/recovered/seed_8203
+          python -u -m ss7.dissertation_confirmation test --seed 8203 --models results/dev/models.joblib --output results/recovered/seed_8203 2>&1 | tee results/recovered/seed_8203/test.log
+      - name: Aggregate all twelve preregistered worlds
+        run: |
+          test ! -f results/collected/confirmation-seed-8203/metrics.csv
+          cp -r results/recovered/seed_8203 results/collected/
+          python -m ss7.dissertation_confirmation aggregate --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recovered-ss7-confirmation
+          path: |
+            results/summary
+            results/recovered
+            results/collected
