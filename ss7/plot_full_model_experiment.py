@@ -22,7 +22,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.metrics import precision_recall_curve, roc_curve
+from sklearn.metrics import auc as curve_auc, precision_recall_curve, roc_curve
 
 
 INTERVAL_SECONDS = 30.0
@@ -334,7 +334,7 @@ def plot_roc_curves(scores: pd.DataFrame, outdir: Path, formats: Sequence[str], 
         if d.empty or d["label"].nunique() < 2:
             continue
         fpr, tpr, _ = roc_curve(d["label"].astype(int), d["score"].astype(float))
-        auc = float(np.trapz(tpr, fpr))
+        auc = float(curve_auc(fpr, tpr))
         ax.plot(fpr, tpr, label=f"{pretty_model(model)} (AUC={auc:.3f})")
         plotted += 1
     if not plotted:
