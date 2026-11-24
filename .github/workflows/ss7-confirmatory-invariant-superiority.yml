@@ -1,0 +1,87 @@
+name: SS7 confirmatory invariant superiority
+on:
+  push:
+    branches: [ss7-confirmatory-invariant-superiority]
+    paths: [.github/workflows/ss7-confirmatory-invariant-superiority.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-confirmatory-superiority-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        seed: [8801,8802,8803,8804,8805,8806,8807,8808,8809,8810,8811,8812,8813,8814,8815,8816,8817,8818,8819,8820,8821,8822,8823,8824]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/confirmatory_invariant_superiority.py
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - uses: actions/download-artifact@v4
+        with:
+          name: incident-local-models
+          path: results/local
+          github-token: ${{ github.token }}
+          run-id: 45440533210
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed_${{ matrix.seed }}
+          python -u -m ss7.confirmatory_invariant_superiority test --seed ${{ matrix.seed }} --local results/local/local_models.joblib --frozen results/frozen/models.joblib --output results/seed_${{ matrix.seed }} 2>&1 | tee results/seed_${{ matrix.seed }}/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: superiority-seed-${{ matrix.seed }}
+          path: results/seed_${{ matrix.seed }}
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - name: Check statistical implementation
+        run: |
+          python - <<'PY'
+          import numpy as np
+          from ss7.confirmatory_invariant_superiority import paired, SEEDS
+          n=len(SEEDS)
+          a=np.zeros(n);b=a.copy()
+          r=np.random.default_rng(42)
+          assert paired(a,b,r)["p_raw"]==1.
+          a[:2]=1.
+          assert paired(a,b,r)["p_raw"]==.5
+          a[:]=1.
+          p=paired(a,b,r)
+          assert p["delta"]==1. and 0<p["p_raw"]<.001
+          print("Paired statistical checks passed")
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: superiority-seed-*
+          path: results/collected
+      - run: python -m ss7.confirmatory_invariant_superiority aggregate --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-confirmatory-superiority-summary
+          path: results/summary
