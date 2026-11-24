@@ -718,7 +718,7 @@ def train_detector(
     calib_score = _meta_score(bundle, threshold_fit[PCAP_NATIVE_FEATURES])
     y_calib = threshold_fit["is_anomaly"].astype(int).to_numpy()
     synth_benign = calib_score[y_calib == 0]
-    synth_threshold = float(np.quantile(synth_benign, 0.98))
+    synth_threshold = float(np.quantile(synth_benign, 0.975))
 
     external_benign_scores = []
     external_benign_rows = []
@@ -739,7 +739,7 @@ def train_detector(
     threshold = max(synth_threshold, float(external_floor))
     bundle["threshold"] = threshold
     bundle["threshold_method"] = (
-        "max(98th percentile synthetic benign calibration seed, "
+        "max(97.5th percentile synthetic benign calibration seed, "
         "maximum independent Orange benign PCAP score)"
     )
 
@@ -780,7 +780,7 @@ def train_detector(
         },
         "threshold": threshold,
         "threshold_method": bundle["threshold_method"],
-        "synthetic_benign_threshold_98pct": synth_threshold,
+        "synthetic_benign_threshold_97_5pct": synth_threshold,
         "independent_calibration_pcaps": external_benign_rows,
         "internal_cross_seed_test": test_metrics,
         "internal_cross_seed_per_attack": per_attack,
