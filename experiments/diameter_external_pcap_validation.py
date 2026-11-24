@@ -464,7 +464,9 @@ def _run_tshark(path: Path) -> List[Dict[str, str]]:
         safe_path = Path(td) / path.name
         shutil.copy2(path, safe_path)
         cmd = [
-            "tshark", "-r", str(safe_path), "-Y", "diameter", "-T", "fields",
+            "tshark", "-r", str(safe_path),
+            "-d", "tcp.port==3868,diameter",
+            "-Y", "diameter", "-T", "fields",
             "-E", "occurrence=f",
             "-e", "frame.time_epoch", "-e", "diameter.cmd.code",
             "-e", "diameter.applicationId", "-e", "diameter.CC-Request-Type",

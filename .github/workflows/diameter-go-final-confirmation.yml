@@ -1,0 +1,228 @@
+name: Diameter independent go-diameter final confirmation
+
+on:
+  push:
+    branches:
+      - improve/diameter-pcap-native-transfer
+    paths:
+      - "experiments/go_diameter_final_driver.go"
+      - ".github/workflows/diameter-go-final-confirmation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  final-go-diameter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GO_DIAMETER_COMMIT: d2ed166075fe09ace48bca4057b467f657ff2200
+      ORANGE_COMMIT: 75b350c22cc744d5742fcb71777cd3c9b131c19c
+      DIAMETER_CALIBRATION_PROFILE: results_go_final_calibration/calibration_profile.json
+
+    steps:
+      - name: Checkout detector repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+
+      - name: Install dependencies
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update -o Acquire::Retries=3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark tcpdump netcat-openbsd
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn
+
+      - name: Download Orange calibration source
+        run: |
+          set -euo pipefail
+          mkdir -p orange_go_final_calibration
+          base="https://raw.githubusercontent.com/Orange-OpenSource/diafuzzer/${ORANGE_COMMIT}/captures"
+          curl -fL --retry 4 -o orange_go_final_calibration/S6a.pcap "${base}/S6a.pcap"
+          curl -fL --retry 4 -o orange_go_final_calibration/S6a_perso.pcap "${base}/S6a_perso.pcap"
+          curl -fL --retry 4 -o orange_go_final_calibration/Cx.pcap "${base}/Cx.pcap"
+
+      - name: Calibrate simulator
+        run: |
+          python experiments/diameter_calibrate_from_independent_pcaps.py             orange_go_final_calibration/S6a.pcap             orange_go_final_calibration/S6a_perso.pcap             orange_go_final_calibration/Cx.pcap             --out-dir results_go_final_calibration             --source "Orange-OpenSource/diafuzzer"             --source-commit "${ORANGE_COMMIT}"             --prior-strength 40
+
+      - name: Train frozen PCAP-native auxiliary model
+        run: |
+          python experiments/diameter_pcap_native_detector.py train             --calibration-pcaps               orange_go_final_calibration/S6a.pcap               orange_go_final_calibration/S6a_perso.pcap               orange_go_final_calibration/Cx.pcap             --out-dir results_go_final_native_model
+
+      - name: Checkout independent go-diameter stack
+        run: |
+          git clone https://github.com/fiorix/go-diameter.git external_go_diameter
+          git -C external_go_diameter checkout "${GO_DIAMETER_COMMIT}"
+          mkdir -p external_go_diameter/cmd/final-validation
+          cp experiments/go_diameter_final_driver.go external_go_diameter/cmd/final-validation/main.go
+          cd external_go_diameter
+          go mod download
+          go build ./cmd/final-validation
+          {
+            echo "Implementation: fiorix/go-diameter"
+            echo "Pinned commit: ${GO_DIAMETER_COMMIT}"
+            echo "Role: final independent external confirmation"
+            echo "This implementation was not used in model fitting or threshold selection."
+          } > "$GITHUB_WORKSPACE/go_final_provenance.txt"
+
+      - name: Start go-diameter S6a server
+        run: |
+          (
+            cd external_go_diameter
+            go run ./cmd/final-validation -mode server -addr 127.0.0.1:3868
+          ) > go_final_server.log 2>&1 &
+          echo $! > /tmp/go_final_server.pid
+          for i in {1..60}; do
+            if nc -z 127.0.0.1 3868; then exit 0; fi
+            sleep 1
+          done
+          cat go_final_server.log
+          exit 1
+
+      - name: Capture frozen independent scenarios
+        run: |
+          set -euo pipefail
+          mkdir -p go_final_pcaps
+          manifest="go_final_pcaps/manifest.csv"
+          echo "capture,expected_label,scenario" > "${manifest}"
+
+          capture_case() {
+            name="$1"; label="$2"; scenario="$3"; count="$4"; delay="$5"
+            out="$GITHUB_WORKSPACE/go_final_pcaps/${name}"
+            sudo tcpdump -i lo -U -s 0 -w "${out}" 'tcp port 3868' >/tmp/go-final-tcpdump.log 2>&1 &
+            cap_pid=$!
+            sleep 0.7
+            (
+              cd external_go_diameter
+              go run ./cmd/final-validation                 -mode client -addr 127.0.0.1:3868                 -scenario "${scenario}" -count "${count}" -delay-ms "${delay}"
+            )
+            sleep 0.35
+            sudo pkill -INT -x tcpdump || true
+            wait "${cap_pid}" || true
+            sudo chown "$USER":"$USER" "${out}"
+            test -s "${out}"
+            echo "${name},${label},${scenario}" >> "${manifest}"
+          }
+
+          # Scenario parameters are frozen before any scoring on this stack.
+          capture_case benign_attach_2.pcap benign benign_attach 2 700
+          capture_case benign_attach_4.pcap benign benign_attach 4 1000
+          capture_case benign_reauth_4.pcap benign benign_reauth 4 800
+          capture_case benign_update_4.pcap benign benign_update 4 900
+
+          capture_case attack_air_24.pcap attack air_flood 24 0
+          capture_case attack_air_96.pcap attack air_flood 96 0
+          capture_case attack_ulr_24.pcap attack ulr_flood 24 0
+          capture_case attack_ulr_96.pcap attack ulr_flood 96 0
+          capture_case attack_mixed_32.pcap attack mixed_flood 32 0
+          capture_case attack_mixed_96.pcap attack mixed_flood 96 0
+          capture_case attack_tracking_30.pcap attack tracking_burst 30 0
+          capture_case attack_tracking_90.pcap attack tracking_burst 90 0
+
+          sha256sum go_final_pcaps/*.pcap | tee go_final_pcaps/SHA256SUMS
+          cat go_final_pcaps/manifest.csv
+
+      - name: Score frozen PCAP-native auxiliary model
+        run: |
+          python experiments/diameter_pcap_native_detector.py score             --model results_go_final_native_model/pcap_native_bundle.pkl             --manifest go_final_pcaps/manifest.csv             --pcap-dir go_final_pcaps             --out-dir results_go_final_native
+
+      - name: Score robust IF primary portable detector
+        run: |
+          PYTHONPATH=experiments:. python experiments/diameter_external_attack_validation.py             --manifest go_final_pcaps/manifest.csv             --pcap-dir go_final_pcaps             --out-dir results_go_final_robust
+
+      - name: Final independent acceptance summary
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import pandas as pd
+          from sklearn.metrics import balanced_accuracy_score, f1_score, recall_score
+
+          native = json.loads(Path(
+              "results_go_final_native/summary.json").read_text())
+          robust = json.loads(Path(
+              "results_go_final_robust/summary.json").read_text())
+
+          summary = {
+              "source": "fiorix/go-diameter",
+              "source_commit": "d2ed166075fe09ace48bca4057b467f657ff2200",
+              "role": "final independent external confirmation; no post-test tuning permitted",
+              "primary_portable_detector": "robust Isolation Forest",
+              "auxiliary_supervised_model": "34-feature PCAP-native source-separated ensemble",
+              "robust_if_attack_tpr": robust["iso_robust_external_attack_tpr"],
+              "robust_if_benign_fpr": robust["iso_robust_external_benign_fpr"],
+              "robust_if_f1": robust["iso_robust_external_f1"],
+              "robust_if_balanced_accuracy": robust["iso_robust_external_balanced_accuracy"],
+              "native_attack_tpr": native["external_attack_tpr"],
+              "native_benign_fpr": native["external_benign_fpr"],
+              "native_f1": native["external_f1"],
+              "native_balanced_accuracy": native["external_balanced_accuracy"],
+          }
+          Path("results_go_final_summary").mkdir(exist_ok=True)
+          Path("results_go_final_summary/summary.json").write_text(
+              json.dumps(summary, indent=2, ensure_ascii=False),
+              encoding="utf-8")
+          print(json.dumps(summary, indent=2, ensure_ascii=False))
+
+          # Frozen final acceptance applies only to the primary detector.
+          # The auxiliary supervised score is reported without post-test tuning.
+          if float(summary["robust_if_attack_tpr"]) < 0.875:
+              raise SystemExit(
+                  "Final robust IF TPR below 87.5%: "
+                  f"{summary['robust_if_attack_tpr']}")
+          if float(summary["robust_if_benign_fpr"]) > 0.05:
+              raise SystemExit(
+                  "Final robust IF benign FPR above 5%: "
+                  f"{summary['robust_if_benign_fpr']}")
+          PY
+
+      - name: Publish final confirmation
+        if: always()
+        run: |
+          {
+            echo "## Independent go-diameter final confirmation"
+            for f in               results_go_final_summary/summary.json               results_go_final_native/summary.json               results_go_final_robust/summary.json; do
+              if [ -f "$f" ]; then
+                echo
+                echo "### $f"
+                echo '~~~json'
+                cat "$f"
+                echo '~~~'
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop go-diameter server
+        if: always()
+        run: |
+          if [ -f /tmp/go_final_server.pid ]; then
+            kill "$(cat /tmp/go_final_server.pid)" || true
+          fi
+          tail -n 120 go_final_server.log || true
+
+      - name: Upload final confirmation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diameter-go-final-confirmation
+          path: |
+            results_go_final_calibration/
+            results_go_final_native_model/
+            results_go_final_native/
+            results_go_final_robust/
+            results_go_final_summary/
+            go_final_pcaps/
+            go_final_provenance.txt
+            go_final_server.log
+          if-no-files-found: warn

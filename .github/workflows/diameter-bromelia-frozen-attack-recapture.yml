@@ -1,0 +1,244 @@
+name: Diameter Bromelia frozen artifact attack recapture
+
+on:
+  push:
+    branches:
+      - improve/diameter-pcap-native-transfer
+    paths:
+      - ".github/workflows/diameter-bromelia-frozen-attack-recapture.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  frozen-bromelia-rescore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    env:
+      BROMELIA_COMMIT: 5af44c25de159733133e4f09b90c1852d95d5120
+      SOURCE_RUN: "45435041027"
+      SOURCE_ARTIFACT: "14940648207"
+
+    steps:
+      - name: Checkout parser and frozen driver
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install runtime dependencies
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update -o Acquire::Retries=3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark tcpdump netcat-openbsd
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn pyyaml
+
+      - name: Download exact frozen Bromelia artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: diameter-bromelia-local-calibration-confirmation
+          path: frozen
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 45435041027
+
+      - name: Verify frozen model calibration and benign tests
+        run: |
+          test -s frozen/results_bromelia_model/pcap_native_bundle.pkl
+          test -s frozen/results_bromelia_model/deployment_calibration.json
+          test -s frozen/bromelia_test_pcaps/manifest.csv
+          test -s frozen/bromelia_test_pcaps/SHA256SUMS
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import pandas as pd
+
+          d = json.loads(Path(
+              "frozen/results_bromelia_model/deployment_calibration.json"
+          ).read_text(encoding="utf-8"))
+          assert d["calibration_capture_count"] == 12
+          assert d["method"] == "deployment_benign_split_conformal_upper_quantile"
+          print("Frozen local threshold:", d["threshold"])
+          print("Frozen model sha256:", d["model_sha256"])
+
+          m = pd.read_csv("frozen/bromelia_test_pcaps/manifest.csv")
+          assert (m["expected_label"] == "benign").sum() == 8
+          assert (m["expected_label"] == "attack").sum() == 16
+
+          for name in m.loc[m["expected_label"] == "benign", "capture"]:
+              p = Path("frozen/bromelia_test_pcaps") / name
+              assert p.stat().st_size > 24, (name, p.stat().st_size)
+
+          empty_attacks = []
+          for name in m.loc[m["expected_label"] == "attack", "capture"]:
+              p = Path("frozen/bromelia_test_pcaps") / name
+              if p.stat().st_size == 24:
+                  empty_attacks.append(name)
+          assert len(empty_attacks) == 16, empty_attacks
+          print("Confirmed first attempt had 16 header-only attack PCAPs.")
+          PY
+
+          cp frozen/bromelia_test_pcaps/SHA256SUMS frozen/original_test_SHA256SUMS.txt
+
+      - name: Checkout same pinned Bromelia implementation
+        run: |
+          git clone https://github.com/heimiricmr/bromelia.git external_bromelia
+          git -C external_bromelia checkout "${BROMELIA_COMMIT}"
+          cp experiments/bromelia_final_driver.py external_bromelia/frozen_validation_driver.py
+          (
+            cd external_bromelia
+            python -m py_compile frozen_validation_driver.py bromelia/base.py
+          )
+
+      - name: Start same frozen Bromelia wire server
+        run: |
+          (
+            cd external_bromelia
+            python frozen_validation_driver.py --mode server --host 127.0.0.1 --port 3868
+          ) > bromelia_repair_server.log 2>&1 &
+          echo $! > /tmp/bromelia_repair_server.pid
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 3868; then
+              echo "Bromelia server ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          cat bromelia_repair_server.log
+          exit 1
+
+      - name: Recapture only the 16 empty frozen attack cases
+        run: |
+          set -euo pipefail
+          dir="$GITHUB_WORKSPACE/frozen/bromelia_test_pcaps"
+
+          capture_attack() {
+            name="$1"; scenario="$2"; count="$3"
+            out="${dir}/${name}"
+            rm -f "${out}"
+            sudo tcpdump -i lo -U -s 0 -w "${out}" 'tcp port 3868' >"/tmp/bromelia-repair-${name}.log" 2>&1 &
+            cap_pid=$!
+
+            # The first attempt used 0.35 s and all fast attack sessions
+            # completed before tcpdump was ready.  This is a capture-harness
+            # fix only; scenario/count/model/threshold are unchanged.
+            sleep 1.50
+
+            (
+              cd external_bromelia
+              python frozen_validation_driver.py                 --mode client --host 127.0.0.1 --port 3868                 --scenario "${scenario}" --count "${count}" --delay-ms 0
+            )
+
+            sleep 0.50
+            sudo kill -INT "${cap_pid}" || true
+            wait "${cap_pid}" || true
+            sudo chown "$USER":"$USER" "${out}"
+            test -s "${out}"
+
+            size=$(stat -c%s "${out}")
+            if [ "${size}" -le 24 ]; then
+              echo "Recaptured PCAP is still header-only: ${name} size=${size}"
+              exit 1
+            fi
+          }
+
+          capture_attack test_air_18.pcap air_flood 18
+          capture_attack test_air_36.pcap air_flood 36
+          capture_attack test_air_72.pcap air_flood 72
+          capture_attack test_air_144.pcap air_flood 144
+
+          capture_attack test_ulr_18.pcap ulr_flood 18
+          capture_attack test_ulr_36.pcap ulr_flood 36
+          capture_attack test_ulr_72.pcap ulr_flood 72
+          capture_attack test_ulr_144.pcap ulr_flood 144
+
+          capture_attack test_mixed_24.pcap mixed_flood 24
+          capture_attack test_mixed_48.pcap mixed_flood 48
+          capture_attack test_mixed_96.pcap mixed_flood 96
+          capture_attack test_mixed_192.pcap mixed_flood 192
+
+          capture_attack test_tracking_20.pcap tracking_burst 20
+          capture_attack test_tracking_40.pcap tracking_burst 40
+          capture_attack test_tracking_80.pcap tracking_burst 80
+          capture_attack test_tracking_160.pcap tracking_burst 160
+
+          sha256sum "${dir}"/*.pcap | tee frozen/repaired_test_SHA256SUMS.txt
+
+      - name: Score frozen model and frozen benign calibration
+        run: |
+          python experiments/diameter_pcap_native_detector.py score             --model frozen/results_bromelia_model/pcap_native_bundle.pkl             --calibration frozen/results_bromelia_model/deployment_calibration.json             --manifest frozen/bromelia_test_pcaps/manifest.csv             --pcap-dir frozen/bromelia_test_pcaps             --out-dir results_bromelia_frozen_repair
+
+      - name: Apply original predeclared fourth-source gate
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          s = json.loads(Path(
+              "results_bromelia_frozen_repair/summary.json"
+          ).read_text(encoding="utf-8"))
+          s.update({
+              "source": "heimiricmr/bromelia",
+              "source_commit": "5af44c25de159733133e4f09b90c1852d95d5120",
+              "source_run": 45435041027,
+              "source_artifact": 14940648207,
+              "repair": (
+                  "same frozen model/calibration/manifest/8 benign test PCAPs; "
+                  "only 16 header-only attack PCAPs recaptured after tcpdump "
+                  "readiness delay; scenarios/counts/gate unchanged"
+              ),
+              "role": (
+                  "fourth independent source; benign-only local threshold "
+                  "calibration; disjoint external test; no post-test tuning"
+              ),
+          })
+          Path(
+              "results_bromelia_frozen_repair/final_summary.json"
+          ).write_text(
+              json.dumps(s, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          print(json.dumps(s, ensure_ascii=False, indent=2))
+
+          if s["threshold_source"] != "deployment_benign_only":
+              raise SystemExit("Test did not use benign-only local calibration")
+          if float(s["external_attack_tpr"]) < 0.80:
+              raise SystemExit(
+                  f"Bromelia TPR below 80%: {s['external_attack_tpr']}")
+          if float(s["external_benign_fpr"]) > 0.125:
+              raise SystemExit(
+                  f"Bromelia benign FPR above 12.5%: {s['external_benign_fpr']}")
+          if float(s["external_balanced_accuracy"]) < 0.84:
+              raise SystemExit(
+                  "Bromelia balanced accuracy below 84%: "
+                  f"{s['external_balanced_accuracy']}")
+          PY
+
+      - name: Stop repair server
+        if: always()
+        run: |
+          if [ -f /tmp/bromelia_repair_server.pid ]; then
+            kill "$(cat /tmp/bromelia_repair_server.pid)" || true
+          fi
+          tail -n 120 bromelia_repair_server.log || true
+
+      - name: Upload frozen repaired confirmation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diameter-bromelia-frozen-repaired-confirmation
+          path: |
+            results_bromelia_frozen_repair/
+            frozen/results_bromelia_model/deployment_calibration.json
+            frozen/bromelia_test_pcaps/
+            frozen/original_test_SHA256SUMS.txt
+            frozen/repaired_test_SHA256SUMS.txt
+            bromelia_repair_server.log
+          if-no-files-found: warn

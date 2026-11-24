@@ -1,0 +1,278 @@
+name: Diameter Bromelia frozen post-development confirmation
+
+on:
+  push:
+    branches:
+      - improve/diameter-pcap-native-transfer
+    paths:
+      - ".github/workflows/diameter-bromelia-frozen-confirmation-v2.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  frozen-confirmation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      FROZEN_DETECTOR_SHA: 7457aa441cae1476c8b7990c05f68f615d99c2bd
+      CALIBRATION_RUN_ID: "45444537497"
+      MODEL_RUN_ID: "45435041027"
+      BROMELIA_COMMIT: 5af44c25de159733133e4f09b90c1852d95d5120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify detector code is frozen
+        run: |
+          git diff --exit-code "${FROZEN_DETECTOR_SHA}" HEAD --             experiments/diameter_pcap_native_detector.py             experiments/bromelia_final_driver.py
+          echo "Detector implementation unchanged from ${FROZEN_DETECTOR_SHA}"
+
+      - name: Wait for frozen expanded benign calibration
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for i in {1..90}; do
+            status=$(gh api               "repos/${GITHUB_REPOSITORY}/actions/runs/${CALIBRATION_RUN_ID}"               --jq '.status')
+            conclusion=$(gh api               "repos/${GITHUB_REPOSITORY}/actions/runs/${CALIBRATION_RUN_ID}"               --jq '.conclusion // ""')
+            echo "calibration run: status=${status} conclusion=${conclusion}"
+            if [ "${status}" = "completed" ]; then
+              test "${conclusion}" = "success"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for frozen calibration run"
+          exit 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update -o Acquire::Retries=3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark tcpdump netcat-openbsd
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn pyyaml
+
+      - name: Download frozen model
+        uses: actions/download-artifact@v4
+        with:
+          name: diameter-bromelia-local-calibration-confirmation
+          path: original
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.MODEL_RUN_ID }}
+
+      - name: Download frozen expanded benign calibration
+        uses: actions/download-artifact@v4
+        with:
+          name: diameter-bromelia-expanded-local-oneclass-development
+          path: calibration
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.CALIBRATION_RUN_ID }}
+
+      - name: Validate frozen inputs
+        run: |
+          test -s original/results_bromelia_model/pcap_native_bundle.pkl
+          test -s calibration/results_bromelia_split_local.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          c = json.loads(Path(
+              "calibration/results_bromelia_split_local.json").read_text())
+          print(json.dumps({
+              "method": c["method"],
+              "reference_capture_count": c["reference_capture_count"],
+              "conformal_capture_count": c["conformal_capture_count"],
+              "target_fpr": c["target_fpr"],
+              "rate_guard_threshold": c.get("rate_guard_threshold"),
+              "burst_guard_threshold": c.get("burst_guard_threshold"),
+              "channels": sorted(c.get("channels", {}).keys()),
+          }, indent=2))
+          assert c["reference_capture_count"] == 24
+          assert c["conformal_capture_count"] == 40
+          PY
+
+      - name: Checkout pinned independent Bromelia implementation
+        run: |
+          git clone https://github.com/heimiricmr/bromelia.git external_bromelia
+          git -C external_bromelia checkout "${BROMELIA_COMMIT}"
+          cp experiments/bromelia_final_driver.py external_bromelia/frozen_confirmation_driver.py
+          (
+            cd external_bromelia
+            python -m py_compile frozen_confirmation_driver.py bromelia/base.py
+          )
+
+      - name: Start Bromelia wire server
+        run: |
+          (
+            cd external_bromelia
+            python frozen_confirmation_driver.py               --mode server --host 127.0.0.1 --port 3868
+          ) > bromelia_confirmation_server.log 2>&1 &
+          echo $! > /tmp/bromelia_confirmation_server.pid
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 3868; then exit 0; fi
+            sleep 1
+          done
+          cat bromelia_confirmation_server.log
+          exit 1
+
+      - name: Capture post-freeze confirmation set
+        run: |
+          set -euo pipefail
+          mkdir -p bromelia_confirmation_pcaps
+          manifest="bromelia_confirmation_pcaps/manifest.csv"
+          echo "capture,expected_label,scenario" > "${manifest}"
+
+          capture_case() {
+            name="$1"; label="$2"; scenario="$3"; count="$4"; delay="$5"
+            out="$GITHUB_WORKSPACE/bromelia_confirmation_pcaps/${name}"
+            sudo tcpdump -i lo -U -s 0 -B 4096 -w "${out}"               'tcp port 3868' >"/tmp/${name}.log" 2>&1 &
+            cap_pid=$!
+            for i in {1..60}; do
+              if grep -q "listening on lo" "/tmp/${name}.log"; then break; fi
+              sleep 0.05
+            done
+            grep -q "listening on lo" "/tmp/${name}.log"
+            sleep 0.75
+            (
+              cd external_bromelia
+              python frozen_confirmation_driver.py                 --mode client --host 127.0.0.1 --port 3868                 --scenario "${scenario}" --count "${count}" --delay-ms "${delay}"
+            )
+            sleep 0.50
+            sudo kill -INT "${cap_pid}" || true
+            wait "${cap_pid}" || true
+            sudo chown "$USER":"$USER" "${out}"
+            test $(stat -c%s "${out}") -gt 24
+            echo "${name},${label},${scenario}" >> "${manifest}"
+          }
+
+          # Fifteen benign confirmations: values intentionally differ from the
+          # reference/calibration grids used during development.
+          capture_case confirm_attach_2.pcap benign benign_attach 2 210
+          capture_case confirm_attach_4.pcap benign benign_attach 4 330
+          capture_case confirm_attach_6.pcap benign benign_attach 6 450
+          capture_case confirm_attach_8.pcap benign benign_attach 8 570
+          capture_case confirm_attach_10.pcap benign benign_attach 10 690
+          capture_case confirm_reauth_3.pcap benign benign_reauth 3 250
+          capture_case confirm_reauth_5.pcap benign benign_reauth 5 370
+          capture_case confirm_reauth_7.pcap benign benign_reauth 7 490
+          capture_case confirm_reauth_9.pcap benign benign_reauth 9 610
+          capture_case confirm_reauth_11.pcap benign benign_reauth 11 730
+          capture_case confirm_update_2.pcap benign benign_update 2 290
+          capture_case confirm_update_5.pcap benign benign_update 5 410
+          capture_case confirm_update_8.pcap benign benign_update 8 530
+          capture_case confirm_update_11.pcap benign benign_update 11 650
+          capture_case confirm_update_14.pcap benign benign_update 14 770
+
+          # Twenty-four attack confirmations: six unseen intensities per family.
+          for n in 15 27 55 111 223 447; do
+            capture_case "confirm_air_${n}.pcap" attack air_flood "${n}" 0
+            capture_case "confirm_ulr_${n}.pcap" attack ulr_flood "${n}" 0
+          done
+          for n in 21 39 75 151 303 607; do
+            capture_case "confirm_mixed_${n}.pcap" attack mixed_flood "${n}" 0
+          done
+          for n in 17 33 65 129 257 513; do
+            capture_case "confirm_tracking_${n}.pcap" attack tracking_burst "${n}" 0
+          done
+
+          {
+            echo "Independent implementation: heimiricmr/bromelia"
+            echo "Pinned commit: ${BROMELIA_COMMIT}"
+            echo "Detector frozen at: ${FROZEN_DETECTOR_SHA}"
+            echo "Calibration artifact run: ${CALIBRATION_RUN_ID}"
+            echo "This confirmation set was generated only after detector and calibration were frozen."
+            echo "No confirmation score or label is used for fitting or threshold selection."
+          } > bromelia_confirmation_pcaps/PROVENANCE.txt
+          sha256sum bromelia_confirmation_pcaps/*.pcap             | tee bromelia_confirmation_pcaps/SHA256SUMS
+
+      - name: Score frozen confirmation once
+        run: |
+          python experiments/diameter_pcap_native_detector.py score             --model original/results_bromelia_model/pcap_native_bundle.pkl             --local-calibration calibration/results_bromelia_split_local.json             --manifest bromelia_confirmation_pcaps/manifest.csv             --pcap-dir bromelia_confirmation_pcaps             --out-dir results_bromelia_frozen_confirmation
+
+      - name: Enforce predeclared confirmation criteria
+        run: |
+          python - <<'PY'
+          import json, math
+          from pathlib import Path
+          s = json.loads(Path(
+              "results_bromelia_frozen_confirmation/summary.json").read_text())
+          tpr = float(s["external_attack_tpr"])
+          fpr = float(s["external_benign_fpr"])
+
+          def wilson(k, n, z=1.959963984540054):
+              if n == 0:
+                  return [None, None]
+              p = k / n
+              d = 1 + z*z/n
+              c = (p + z*z/(2*n)) / d
+              h = z * math.sqrt(p*(1-p)/n + z*z/(4*n*n)) / d
+              return [max(0.0, c-h), min(1.0, c+h)]
+
+          n_attack = int(s["attack_capture_count"])
+          n_benign = int(s["benign_capture_count"])
+          tp = round(tpr * n_attack)
+          fp = round(fpr * n_benign)
+          out = {
+              "role": "post-freeze independent-implementation confirmation",
+              "detector_sha": "7457aa441cae1476c8b7990c05f68f615d99c2bd",
+              "attack_tpr": tpr,
+              "attack_tpr_wilson95": wilson(tp, n_attack),
+              "benign_fpr": fpr,
+              "benign_fpr_wilson95": wilson(fp, n_benign),
+              "f1": s["external_f1"],
+              "balanced_accuracy": s["external_balanced_accuracy"],
+              "per_scenario": s["per_scenario"],
+              "predeclared_acceptance": {
+                  "attack_tpr_min": 0.80,
+                  "benign_fpr_max": 0.125,
+                  "per_attack_family_detection_min": 0.60,
+              },
+          }
+          Path("bromelia_frozen_confirmation_summary.json").write_text(
+              json.dumps(out, indent=2), encoding="utf-8")
+          print(json.dumps(out, indent=2))
+
+          if tpr < 0.80:
+              raise SystemExit(f"Confirmation TPR below 80%: {tpr:.3f}")
+          if fpr > 0.125:
+              raise SystemExit(f"Confirmation benign FPR above 12.5%: {fpr:.3f}")
+          for name, item in s["per_scenario"].items():
+              if item["expected_label"] == "attack" and                       float(item["detection_rate"]) < 0.60:
+                  raise SystemExit(
+                      f"Attack family {name} below 60%: "
+                      f"{item['detection_rate']}")
+          PY
+
+      - name: Stop Bromelia server
+        if: always()
+        run: |
+          if [ -f /tmp/bromelia_confirmation_server.pid ]; then
+            kill "$(cat /tmp/bromelia_confirmation_server.pid)" || true
+          fi
+          tail -n 100 bromelia_confirmation_server.log || true
+
+      - name: Upload frozen confirmation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diameter-bromelia-frozen-confirmation-v2
+          path: |
+            bromelia_confirmation_pcaps/
+            results_bromelia_frozen_confirmation/
+            bromelia_frozen_confirmation_summary.json
+            bromelia_confirmation_server.log
+          if-no-files-found: warn
+          compression-level: 6

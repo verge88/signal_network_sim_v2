@@ -7,6 +7,7 @@ on:
       - calibrate/diameter-independent-data
       - regularize/diameter-overfit-guard
       - improve/diameter-node-compromise-recall
+      - improve/diameter-pcap-native-transfer
     paths:
       - "diameter/**"
       - "experiments/diameter_calibrate_from_independent_pcaps.py"
@@ -14,6 +15,7 @@ on:
       - "experiments/diameter_external_pcap_validation.py"
       - "experiments/diameter_external_attack_validation.py"
       - "experiments/diameter_external_attack_driver.dart"
+      - "experiments/diameter_pcap_native_detector.py"
       - ".github/workflows/diameter-calibrated-full-experiment.yml"
   workflow_dispatch:
 
@@ -64,7 +66,7 @@ jobs:
 
       - name: Compile calibration and experiment code
         run: |
-          python -m py_compile             diameter/diameter_sim_v1.py             diameter/diameter_training_v1.py             diameter/diameter_generate_plots.py             experiments/diameter_calibrate_from_independent_pcaps.py             experiments/diameter_verify_calibrated_dataset.py             experiments/diameter_external_pcap_validation.py             experiments/diameter_external_attack_validation.py
+          python -m py_compile             diameter/diameter_sim_v1.py             diameter/diameter_training_v1.py             diameter/diameter_generate_plots.py             experiments/diameter_calibrate_from_independent_pcaps.py             experiments/diameter_verify_calibrated_dataset.py             experiments/diameter_external_pcap_validation.py             experiments/diameter_external_attack_validation.py             experiments/diameter_pcap_native_detector.py
 
       - name: Download independent calibration corpus from Orange diafuzzer
         run: |
@@ -85,6 +87,18 @@ jobs:
       - name: Calibrate simulator on independent PCAP evidence
         run: |
           python experiments/diameter_calibrate_from_independent_pcaps.py             "${CALIBRATION_DIR}/orange_S6a.pcap"             "${CALIBRATION_DIR}/orange_S6a_perso.pcap"             "${CALIBRATION_DIR}/orange_Cx.pcap"             --out-dir "${CALIBRATION_OUT}"             --source "Orange-OpenSource/diafuzzer"             --source-commit "${ORANGE_COMMIT}"             --prior-strength 40
+
+      - name: Train source-separated PCAP-native portable detector
+        run: |
+          rm -rf results_pcap_native_train
+          python experiments/diameter_pcap_native_detector.py train \
+            --calibration-pcaps \
+              "${CALIBRATION_DIR}/orange_S6a.pcap" \
+              "${CALIBRATION_DIR}/orange_S6a_perso.pcap" \
+              "${CALIBRATION_DIR}/orange_Cx.pcap" \
+            --out-dir results_pcap_native_train
+          test -s results_pcap_native_train/pcap_native_bundle.pkl
+          test -s results_pcap_native_train/training_summary.json
 
       - name: Generate 24-hour calibrated Diameter dataset
         run: |
@@ -173,6 +187,22 @@ jobs:
             echo "Role: untouched holdout; not used to fit calibration profile"
           } > holdout_benign_pcaps/PROVENANCE.txt
 
+      - name: Score PCAP-native detector on untouched Kelly benign holdout
+        run: |
+          mkdir -p results_pcap_native_benign
+          cat > holdout_benign_pcaps/manifest.csv <<'CSV'
+          capture,expected_label,scenario
+          s6a.pcap,benign,kelly_s6a
+          gy.pcap,benign,kelly_gy
+          rx.pcap,benign,kelly_rx
+          gy_mscc.pcap,benign,kelly_gy_mscc
+          CSV
+          python experiments/diameter_pcap_native_detector.py score \
+            --model results_pcap_native_train/pcap_native_bundle.pkl \
+            --manifest holdout_benign_pcaps/manifest.csv \
+            --pcap-dir holdout_benign_pcaps \
+            --out-dir results_pcap_native_benign
+
       - name: Revalidate calibrated portable branch on untouched benign holdout
         run: |
           python experiments/diameter_external_pcap_validation.py             holdout_benign_pcaps/s6a.pcap             holdout_benign_pcaps/gy.pcap             holdout_benign_pcaps/rx.pcap             holdout_benign_pcaps/gy_mscc.pcap             --out-dir results_calibrated_external_benign
@@ -255,6 +285,66 @@ jobs:
         run: |
           python experiments/diameter_external_attack_validation.py             --manifest holdout_attack_pcaps/manifest.csv             --pcap-dir holdout_attack_pcaps             --out-dir results_calibrated_external_attacks
 
+      - name: Score PCAP-native detector on untouched Kelly attack holdout
+        run: |
+          rm -rf results_pcap_native_attacks
+          python experiments/diameter_pcap_native_detector.py score \
+            --model results_pcap_native_train/pcap_native_bundle.pkl \
+            --manifest holdout_attack_pcaps/manifest.csv \
+            --pcap-dir holdout_attack_pcaps \
+            --out-dir results_pcap_native_attacks
+
+      - name: Check PCAP-native transfer improvement
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          benign = json.loads(
+              Path("results_pcap_native_benign/summary.json").read_text())
+          attacks = json.loads(
+              Path("results_pcap_native_attacks/summary.json").read_text())
+          legacy = json.loads(
+              Path("results_calibrated_external_attacks/summary.json").read_text())
+
+          new_tpr = float(attacks["external_attack_tpr"])
+          new_fpr = float(benign["external_benign_fpr"])
+          old_rf_tpr = float(legacy["rf_external_attack_tpr"])
+          old_rf_fpr = float(legacy["rf_external_benign_fpr"])
+
+          comparison = {
+              "old_portable_rf": {
+                  "attack_tpr": old_rf_tpr,
+                  "benign_fpr": old_rf_fpr,
+              },
+              "pcap_native": {
+                  "attack_tpr": new_tpr,
+                  "benign_fpr": new_fpr,
+                  "external_f1": attacks["external_f1"],
+                  "balanced_accuracy": attacks["external_balanced_accuracy"],
+              },
+              "holdout_role": (
+                  "Kelly traces are score-only final holdout; no Kelly score, "
+                  "label, count or timing is used for fitting or threshold selection"
+              ),
+          }
+          Path("pcap_native_transfer_comparison.json").write_text(
+              json.dumps(comparison, indent=2), encoding="utf-8")
+          print(json.dumps(comparison, indent=2))
+
+          if new_tpr <= old_rf_tpr:
+              raise SystemExit(
+                  f"PCAP-native TPR did not improve over legacy RF: {new_tpr:.3f}")
+          # Eight attack captures give 12.5 percentage-point resolution.
+          if new_tpr < 0.75:
+              raise SystemExit(
+                  f"PCAP-native external attack TPR below 75%: {new_tpr:.3f}")
+          # Four benign holdouts give 25 percentage-point resolution.
+          if new_fpr > 0.25:
+              raise SystemExit(
+                  f"PCAP-native external benign FPR above 25%: {new_fpr:.3f}")
+          PY
+
       - name: Generate publication plots from saved experiment artifacts
         run: |
           python diameter/diameter_generate_plots.py \
@@ -291,6 +381,10 @@ jobs:
           load_json("results_diameter_calibration/calibrated_dataset_verification.json", "dataset_verification")
           load_json("results_calibrated_external_benign/summary.json", "external_benign")
           load_json("results_calibrated_external_attacks/summary.json", "external_attacks")
+          load_json("results_pcap_native_train/training_summary.json", "pcap_native_training")
+          load_json("results_pcap_native_benign/summary.json", "pcap_native_benign")
+          load_json("results_pcap_native_attacks/summary.json", "pcap_native_attacks")
+          load_json("pcap_native_transfer_comparison.json", "pcap_native_transfer_comparison")
 
           p = Path("results_diameter_v1/full_comparison_diameter.csv")
           if p.exists():
@@ -328,6 +422,18 @@ jobs:
               cat results_calibrated_external_benign/summary.json
               echo '~~~'
             fi
+            if [ -f results_pcap_native_attacks/summary.json ]; then
+              echo "### PCAP-native portable detector"
+              echo '~~~json'
+              cat results_pcap_native_attacks/summary.json
+              echo '~~~'
+            fi
+            if [ -f pcap_native_transfer_comparison.json ]; then
+              echo "### PCAP-native transfer comparison"
+              echo '~~~json'
+              cat pcap_native_transfer_comparison.json
+              echo '~~~'
+            fi
             if [ -f results_calibrated_external_attacks/summary.json ]; then
               echo "### Independent attack holdout"
               echo '~~~json'
@@ -348,6 +454,10 @@ jobs:
             results_diameter_v1/
             results_calibrated_external_benign/
             results_calibrated_external_attacks/
+            results_pcap_native_train/
+            results_pcap_native_benign/
+            results_pcap_native_attacks/
+            pcap_native_transfer_comparison.json
             independent_calibration_pcaps/
             holdout_benign_pcaps/
             holdout_attack_pcaps/
