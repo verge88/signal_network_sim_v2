@@ -493,6 +493,101 @@ def pcap_to_native_features(path: Path) -> Dict[str, float]:
     return out
 
 
+def protocol_archetype_frame(
+    seed: int,
+    n_benign: int = 1200,
+    n_attack: int = 1200,
+) -> pd.DataFrame:
+    """Generate protocol-valid PCAP archetypes independent of Kelly holdout.
+
+    Benign examples include ordinary attach, re-authentication, location update
+    and detach procedures.  Attack examples reuse valid Diameter commands but
+    at broadly randomised flood/burst volumes and rates.  Exact Kelly counts,
+    timings and scores are never used.
+    """
+    rng = np.random.default_rng(seed)
+    records = []
+
+    benign_profiles = [
+        ("benign_attach", {"AIR": 0.50, "ULR": 0.50}),
+        ("benign_reauth", {"AIR": 1.00}),
+        ("benign_location_update", {"ULR": 0.75, "AIR": 0.15, "NOR": 0.10}),
+        ("benign_detach", {"PUR": 0.45, "CLR": 0.35, "NOR": 0.20}),
+    ]
+    attack_profiles = [
+        ("air_flood", {"AIR": 1.00}),
+        ("ulr_flood", {"ULR": 1.00}),
+        ("mixed_flood", {"AIR": 0.50, "ULR": 0.50}),
+        ("tracking_burst", {"AIR": 0.45, "ULR": 0.35, "IDR": 0.20}),
+    ]
+
+    def sample(profile_name: str, mix: Dict[str, float], attack: bool):
+        if attack:
+            total = float(np.exp(rng.uniform(np.log(30.0), np.log(2500.0))))
+            duration = float(np.exp(rng.uniform(np.log(0.05), np.log(12.0))))
+        else:
+            total = float(np.exp(rng.uniform(np.log(4.0), np.log(36.0))))
+            duration = float(np.exp(rng.uniform(np.log(0.4), np.log(35.0))))
+
+        # Add broad overlap so the classifier cannot reduce the task to one
+        # hard count cutoff.
+        if rng.random() < 0.15:
+            if attack:
+                total *= rng.uniform(0.35, 0.75)
+                duration *= rng.uniform(1.5, 4.0)
+            else:
+                total *= rng.uniform(1.5, 3.0)
+                duration *= rng.uniform(0.3, 0.8)
+
+        mix_vec = np.array([mix.get(c, 0.0) for c in S6A_COMMANDS], dtype=float)
+        concentration = 80.0 if not attack else 55.0
+        alpha = np.maximum(mix_vec * concentration, 0.02)
+        noisy = rng.dirichlet(alpha)
+        s6a_cmd = {
+            c: float(noisy[i] * total) for i, c in enumerate(S6A_COMMANDS)
+        }
+        gx_cmd = {c: 0.0 for c in GX_COMMANDS}
+        out = _normalised_command_features(
+            total, total, 0.0, 0.0, 0.0, 0.0, s6a_cmd, gx_cmd)
+
+        rate = total / max(duration, 1e-3)
+        count_cv = float(rng.uniform(0.10, 0.95 if attack else 0.75))
+        peak = float(rng.uniform(1.05, 3.0 if attack else 2.2))
+        out.update({
+            "pcap_log_total_pdus": float(np.log1p(total)),
+            "pcap_log_duration_s": float(np.log1p(duration)),
+            "pcap_log_rate_hz": float(np.log1p(rate)),
+            "pcap_gx_fraction": 0.0,
+            "pcap_rx_fraction": 0.0,
+            "pcap_s13_fraction": 0.0,
+            "pcap_other_fraction": 0.0,
+            "pcap_iat_cv": float(rng.uniform(0.15, 1.4)),
+            "pcap_bin_count_cv": count_cv,
+            "pcap_bin_count_peak_ratio": peak,
+            "pcap_bin_count_autocorr": float(rng.uniform(-0.35, 0.75)),
+            "pcap_bin_entropy_std": float(rng.uniform(0.0, 0.25)),
+            "pcap_bin_s6a_fraction_std": float(rng.uniform(0.0, 0.08)),
+            "pcap_air_ratio_std": float(rng.uniform(0.0, 0.18)),
+            "pcap_ulr_ratio_std": float(rng.uniform(0.0, 0.18)),
+            "pcap_active_command_fraction": float(
+                np.sum(noisy > 0.02) /
+                (len(S6A_COMMANDS) + len(GX_COMMANDS) + 4)
+            ),
+            "is_anomaly": int(attack),
+            "attack_type": profile_name if attack else "none",
+            "protocol_archetype": profile_name,
+        })
+        return out
+
+    for i in range(n_benign):
+        name, mix = benign_profiles[i % len(benign_profiles)]
+        records.append(sample(name, mix, False))
+    for i in range(n_attack):
+        name, mix = attack_profiles[i % len(attack_profiles)]
+        records.append(sample(name, mix, True))
+    return pd.DataFrame(records)
+
+
 def _make_hgb(seed: int):
     return HistGradientBoostingClassifier(
         max_iter=180,
@@ -543,11 +638,15 @@ def train_detector(
     for seed in all_seeds:
         sim = build_training_frame(seed)
         native = simulation_to_native_windows(sim)
+        archetypes = protocol_archetype_frame(
+            5000 + seed, n_benign=1200, n_attack=1200)
+        native = pd.concat([native, archetypes], ignore_index=True)
         native["source_seed"] = seed
         frames[seed] = native
         print(
             f"seed={seed}: windows={len(native)}, "
-            f"positive={native['is_anomaly'].mean():.4f}")
+            f"positive={native['is_anomaly'].mean():.4f}, "
+            f"protocol_archetypes={len(archetypes)}")
 
     train = pd.concat(
         [domain_randomise(frames[s], 1000 + s, variants=4)
@@ -671,6 +770,13 @@ def train_detector(
             "time_scale_range": [0.5, 2.0],
             "command_mix_sigma": 0.025,
             "temporal_scale_log_sigma": 0.30,
+            "protocol_benign_archetypes": [
+                "attach", "re-authentication", "location update", "detach"
+            ],
+            "protocol_attack_archetypes": [
+                "AIR flood", "ULR flood", "mixed flood", "tracking burst"
+            ],
+            "holdout_specific_parameters_used": false,
         },
         "threshold": threshold,
         "threshold_method": bundle["threshold_method"],
