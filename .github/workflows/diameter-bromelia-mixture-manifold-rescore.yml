@@ -1,0 +1,143 @@
+name: Diameter Bromelia mixture-manifold development rescore
+
+on:
+  push:
+    branches:
+      - improve/diameter-pcap-native-transfer
+    paths:
+      - "experiments/diameter_pcap_native_detector.py"
+      - ".github/workflows/diameter-bromelia-mixture-manifold-rescore.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  rescore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout detector
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update -o Acquire::Retries=3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn pyyaml
+
+      - name: Download frozen model
+        uses: actions/download-artifact@v4
+        with:
+          name: diameter-bromelia-local-calibration-confirmation
+          path: original
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 45435041027
+
+      - name: Download exact 64-benign development capture artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: diameter-bromelia-expanded-local-oneclass-development
+          path: expanded
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 45439726515
+
+      - name: Download repaired fixed development test PCAPs
+        uses: actions/download-artifact@v4
+        with:
+          name: diameter-bromelia-frozen-repaired-confirmation
+          path: repaired
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 45438122161
+
+      - name: Verify source separation
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          b = pd.read_csv("expanded/bromelia_expanded_benign/manifest.csv")
+          t = pd.read_csv("repaired/frozen/bromelia_test_pcaps/manifest.csv")
+          assert len(b) == 64
+          assert set(b["expected_label"]) == {"benign"}
+          assert (b["role"] == "reference").sum() == 24
+          assert (b["role"] == "calibration").sum() == 40
+          assert (t["expected_label"] == "benign").sum() == 8
+          assert (t["expected_label"] == "attack").sum() == 16
+          assert not set(b["capture"]) & set(t["capture"])
+          print("Source-separated benign fit/calibration and fixed test confirmed")
+          PY
+
+      - name: Fit mixture-manifold from benign data only
+        run: |
+          python experiments/diameter_pcap_native_detector.py calibrate-local \
+            --model original/results_bromelia_model/pcap_native_bundle.pkl \
+            --manifest expanded/bromelia_expanded_benign/manifest.csv \
+            --pcap-dir expanded/bromelia_expanded_benign \
+            --target-fpr 0.05 \
+            --out results_bromelia_mixture_local.json
+
+      - name: Score fixed Bromelia development test
+        run: |
+          python experiments/diameter_pcap_native_detector.py score \
+            --model original/results_bromelia_model/pcap_native_bundle.pkl \
+            --local-calibration results_bromelia_mixture_local.json \
+            --manifest repaired/frozen/bromelia_test_pcaps/manifest.csv \
+            --pcap-dir repaired/frozen/bromelia_test_pcaps \
+            --out-dir results_bromelia_mixture_dev
+
+      - name: Apply development acceptance gate
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          s = json.loads(Path(
+              "results_bromelia_mixture_dev/summary.json").read_text())
+          c = json.loads(Path(
+              "results_bromelia_mixture_local.json").read_text())
+          out = {
+              "role": (
+                  "development-domain only; Bromelia labels were already "
+                  "inspected before this algorithm was frozen"
+              ),
+              "method": c["method"],
+              "profile_names": sorted(c.get("profiles", {}).keys()),
+              "reference_capture_count": c["reference_capture_count"],
+              "conformal_capture_count": c["conformal_capture_count"],
+              "attack_tpr": s["external_attack_tpr"],
+              "benign_fpr": s["external_benign_fpr"],
+              "f1": s["external_f1"],
+              "balanced_accuracy": s["external_balanced_accuracy"],
+              "per_scenario": s["per_scenario"],
+          }
+          Path("bromelia_mixture_dev_summary.json").write_text(
+              json.dumps(out, indent=2), encoding="utf-8")
+          print(json.dumps(out, indent=2))
+          if float(s["external_attack_tpr"]) < 0.80:
+              raise SystemExit(
+                  f"Development TPR below 80%: {s['external_attack_tpr']}")
+          if float(s["external_benign_fpr"]) > 0.125:
+              raise SystemExit(
+                  f"Development benign FPR above 12.5%: {s['external_benign_fpr']}")
+          PY
+
+      - name: Upload mixture development result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diameter-bromelia-mixture-manifold-development
+          path: |
+            results_bromelia_mixture_local.json
+            results_bromelia_mixture_dev/
+            bromelia_mixture_dev_summary.json
+          if-no-files-found: warn
