@@ -1429,13 +1429,33 @@ def score_with_local_calibration(
             float(channel["envelope_threshold"]),
         )
 
+    rate_threshold = float(calibration.get(
+        "rate_guard_threshold", float("inf")))
+    burst_threshold = float(calibration.get(
+        "burst_guard_threshold", float("inf")))
+    rate_guard_score = (
+        float(feat["pcap_log_rate_hz"]) / max(rate_threshold, 1e-9)
+        if np.isfinite(rate_threshold) else 0.0
+    )
+    burst_guard_score = (
+        float(feat["pcap_log_burst_mass"]) / max(burst_threshold, 1e-9)
+        if np.isfinite(burst_threshold) else 0.0
+    )
+    guard_score = float(max(rate_guard_score, burst_guard_score))
+
     if channel_scores:
         best_channel, strongest = max(
             channel_scores.items(), key=lambda kv: kv[1]["local_score"])
+        shape_score = float(strongest["local_score"])
+        final_score = float(max(shape_score, guard_score))
         return {
             "nn_distance": float(strongest["nn_distance"]),
             "envelope_distance": float(strongest["envelope_distance"]),
-            "local_score": float(strongest["local_score"]),
+            "local_score": final_score,
+            "shape_score": shape_score,
+            "rate_guard_score": float(rate_guard_score),
+            "burst_guard_score": float(burst_guard_score),
+            "guard_score": guard_score,
             "matched_benign_profile": (
                 min(profile_scores.items(),
                     key=lambda kv: kv[1]["local_score"])[0]
@@ -1450,16 +1470,29 @@ def score_with_local_calibration(
                 str(k): float(v["local_score"])
                 for k, v in channel_scores.items()
             },
-            "trigger_channel": str(best_channel),
+            "trigger_channel": (
+                "rate_burst_guard" if guard_score > shape_score
+                else str(best_channel)
+            ),
         }
 
     if profile_scores:
         best_name, best = min(
             profile_scores.items(), key=lambda kv: kv[1]["local_score"])
+        # Profile matching can rescue a benign procedure that is globally
+        # unusual, while the independent benign-only burst guard retains
+        # sensitivity to short high-rate attacks.
+        shape_score = float(min(
+            global_score["local_score"], best["local_score"]))
+        final_score = float(max(shape_score, guard_score))
         return {
             "nn_distance": float(best["nn_distance"]),
             "envelope_distance": float(best["envelope_distance"]),
-            "local_score": float(best["local_score"]),
+            "local_score": final_score,
+            "shape_score": shape_score,
+            "rate_guard_score": float(rate_guard_score),
+            "burst_guard_score": float(burst_guard_score),
+            "guard_score": guard_score,
             "matched_benign_profile": str(best_name),
             "global_local_score": float(global_score["local_score"]),
             "profile_scores": {
@@ -1467,15 +1500,28 @@ def score_with_local_calibration(
                 for k, v in profile_scores.items()
             },
             "channel_scores": {},
-            "trigger_channel": "profile_fallback",
+            "trigger_channel": (
+                "rate_burst_guard" if guard_score > shape_score
+                else "profile_fallback"
+            ),
         }
+
+    shape_score = float(global_score["local_score"])
+    final_score = float(max(shape_score, guard_score))
     return {
         **global_score,
+        "local_score": final_score,
+        "shape_score": shape_score,
+        "rate_guard_score": float(rate_guard_score),
+        "burst_guard_score": float(burst_guard_score),
+        "guard_score": guard_score,
         "matched_benign_profile": "global",
-        "global_local_score": float(global_score["local_score"]),
+        "global_local_score": shape_score,
         "profile_scores": {},
         "channel_scores": {},
-        "trigger_channel": "global",
+        "trigger_channel": (
+            "rate_burst_guard" if guard_score > shape_score else "global"
+        ),
     }
 
 def calibrate_local_cli(args) -> None:
