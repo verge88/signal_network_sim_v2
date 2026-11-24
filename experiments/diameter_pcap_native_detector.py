@@ -27,7 +27,10 @@ import argparse
 import json
 import math
 import pickle
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -414,6 +417,81 @@ def domain_randomise(
     return pd.concat(outs, ignore_index=True)
 
 
+def _parse_raw_diameter_from_tcp(path: Path):
+    """Fallback RFC 6733 header parser over TCP payload.
+
+    Some Wireshark builds refuse to label deliberately minimal 20-byte
+    third-party Diameter messages as Diameter even with decode-as.  The
+    transport bytes are still valid RFC 6733 frames.  This fallback asks
+    tshark only for TCP payload/reassembly metadata and parses the fixed
+    Diameter header directly.  It changes neither model inputs nor thresholds.
+    """
+    with tempfile.TemporaryDirectory(prefix="diameter-raw-", dir="/tmp") as td:
+        safe_path = Path(td) / path.name
+        shutil.copy2(path, safe_path)
+        cmd = [
+            "tshark", "-r", str(safe_path),
+            "-Y", "tcp.port == 3868 && tcp.payload",
+            "-T", "fields", "-E", "occurrence=f",
+            "-e", "frame.time_epoch",
+            "-e", "tcp.stream",
+            "-e", "ip.src", "-e", "tcp.srcport",
+            "-e", "ip.dst", "-e", "tcp.dstport",
+            "-e", "tcp.payload",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc.check_returncode()
+
+    buffers: Dict[Tuple[str, str, str, str, str], bytearray] = {}
+    rows = []
+    for line in proc.stdout.splitlines():
+        parts = line.split("\t")
+        parts += [""] * (7 - len(parts))
+        ts_s, stream, src, sport, dst, dport, payload_hex = (
+            p.strip() for p in parts[:7])
+        if not payload_hex:
+            continue
+        try:
+            ts = float(ts_s)
+            chunk = bytes.fromhex(payload_hex.replace(":", ""))
+        except Exception:
+            continue
+        key = (stream, src, sport, dst, dport)
+        buf = buffers.setdefault(key, bytearray())
+        buf.extend(chunk)
+
+        while len(buf) >= 20:
+            # Diameter Version must be 1.  If a retransmission/odd byte gets
+            # ahead of a frame, resynchronise conservatively on the next 0x01.
+            if buf[0] != 1:
+                try:
+                    nxt = buf.index(1, 1)
+                    del buf[:nxt]
+                except ValueError:
+                    buf.clear()
+                    break
+                if len(buf) < 20:
+                    break
+
+            length = int.from_bytes(buf[1:4], "big")
+            if length < 20 or length > 1_048_576:
+                del buf[0]
+                continue
+            if len(buf) < length:
+                break
+
+            frame = bytes(buf[:length])
+            del buf[:length]
+            code = int.from_bytes(frame[5:8], "big")
+            app = int.from_bytes(frame[8:12], "big")
+            # CC-Request-Type is an AVP and is absent from the frozen
+            # aiodiameter harness.  Keep zero for fallback-only Gx decoding.
+            rows.append((ts, app, code, 0))
+
+    rows.sort(key=lambda x: x[0])
+    return rows
+
+
 def _parse_pcap_rows(path: Path):
     raw = _run_tshark(path)
     rows = []
@@ -435,6 +513,9 @@ def _parse_pcap_rows(path: Path):
         except Exception:
             cc = 0
         rows.append((ts, app, code, cc))
+
+    if not rows:
+        rows = _parse_raw_diameter_from_tcp(path)
     if not rows:
         raise RuntimeError(f"No Diameter PDUs decoded from {path}")
     rows.sort(key=lambda x: x[0])
