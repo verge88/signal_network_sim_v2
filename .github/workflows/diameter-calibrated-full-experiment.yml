@@ -172,7 +172,7 @@ jobs:
           print(f"\nModel rows: {len(df)}; specialized ensemble rows: {len(ens)}")
           PY
 
-      - name: Download untouched Kelly benign holdout traces
+      - name: Download Kelly benign development-regression traces
         run: |
           set -euo pipefail
           mkdir -p holdout_benign_pcaps
@@ -184,10 +184,10 @@ jobs:
           {
             echo "Holdout source: KellyKinyama/diameter-protocol"
             echo "Pinned commit: ${KELLY_COMMIT}"
-            echo "Role: untouched holdout; not used to fit calibration profile"
+            echo "Role: development-domain regression set after prior inspection; not used for fitting or final transfer claims"
           } > holdout_benign_pcaps/PROVENANCE.txt
 
-      - name: Score PCAP-native detector on untouched Kelly benign holdout
+      - name: Score PCAP-native detector on Kelly benign development-regression set
         run: |
           mkdir -p results_pcap_native_benign
           cat > holdout_benign_pcaps/manifest.csv <<'CSV'
@@ -203,7 +203,7 @@ jobs:
             --pcap-dir holdout_benign_pcaps \
             --out-dir results_pcap_native_benign
 
-      - name: Revalidate calibrated portable branch on untouched benign holdout
+      - name: Revalidate calibrated portable branch on Kelly benign development-regression set
         run: |
           python experiments/diameter_external_pcap_validation.py             holdout_benign_pcaps/s6a.pcap             holdout_benign_pcaps/gy.pcap             holdout_benign_pcaps/rx.pcap             holdout_benign_pcaps/gy_mscc.pcap             --out-dir results_calibrated_external_benign
 
@@ -230,7 +230,7 @@ jobs:
           cat external_hss.log
           exit 1
 
-      - name: Capture independent benign controls and reproduced attacks
+      - name: Capture Kelly development-regression benign controls and reproduced attacks
         env:
           S6A_HOST: 127.0.0.1
           S6A_PORT: "3868"
@@ -285,7 +285,7 @@ jobs:
         run: |
           python experiments/diameter_external_attack_validation.py             --manifest holdout_attack_pcaps/manifest.csv             --pcap-dir holdout_attack_pcaps             --out-dir results_calibrated_external_attacks
 
-      - name: Score PCAP-native detector on untouched Kelly attack holdout
+      - name: Score PCAP-native detector on Kelly attack development-regression set
         run: |
           rm -rf results_pcap_native_attacks
           python experiments/diameter_pcap_native_detector.py score \
@@ -324,8 +324,8 @@ jobs:
                   "balanced_accuracy": attacks["external_balanced_accuracy"],
               },
               "holdout_role": (
-                  "Kelly traces are score-only final holdout; no Kelly score, "
-                  "label, count or timing is used for fitting or threshold selection"
+                  "Kelly traces are a development-domain regression set after prior inspection; no Kelly score or "
+                  "label is used for fitting or threshold selection; final transfer claims rely on post-freeze Bromelia and jDiameter confirmations"
               ),
           }
           Path("pcap_native_transfer_comparison.json").write_text(
