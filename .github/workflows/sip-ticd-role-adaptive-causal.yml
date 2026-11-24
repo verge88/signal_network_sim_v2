@@ -1,0 +1,72 @@
+name: SIP TICD role-adaptive causal strong alerts independent test
+on:
+  push:
+    branches: [improve/ticd-role-adaptive-causal-alert]
+    paths:
+      - 'sip/ticd_role_adaptive_causal_alert.py'
+      - 'experiments/evaluate_ticd_role_adaptive_causal.py'
+      - '.github/workflows/sip-ticd-role-adaptive-causal.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+      PYTHONHASHSEED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install and compile
+        run: |
+          set -euo pipefail
+          python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+          python -m compileall -q sip/ticd_role_adaptive_causal_alert.py experiments/evaluate_ticd_role_adaptive_causal.py
+          python -m pip freeze > role_adaptive_causal_environment.txt
+      - name: Recover frozen physical causal fusion and source report
+        run: |
+          set -euo pipefail
+          gh run download 45366626708 --repo "${{ github.repository }}" --name sip-ticd-physical-causal-alert-model-and-holdout --dir prior
+          p="$(find prior -type f -name physical_causal_alert_ticd.pkl -print -quit)"
+          test -n "$p"
+          echo "PRIOR_DIR=$(dirname "$p")" >> "$GITHUB_ENV"
+      - name: Compare role adaptation on fresh normal development and test seeds
+        run: python -m experiments.evaluate_ticd_role_adaptive_causal --prior "$PRIOR_DIR" --out results_role_adaptive_causal
+      - name: Verify split integrity and confusion accounting
+        run: |
+          python - <<'PY'
+          import json
+          d=json.load(open('results_role_adaptive_causal/role_adaptive_causal_report.json'))
+          assert not d['real_field_validation'] and not d['heldout_used_for_selection']
+          assert d['all_roles_instant_alert'] and d['history_not_disabled'] and d['warning_reference_frozen']
+          assert d['label_invariance'] and d['batch_invariance'] and d['model_reload']
+          seeds=[s for k in ('normal_validation_seeds','development_seeds','test_seeds') for xs in d[k].values() for s in xs]
+          assert len(seeds)==len(set(seeds))==105
+          for k,pair in d['heldout'].items():
+              for n,v in pair.items():
+                  assert v['confirmed_TP']+v['warning_only_TP']==v['covered_attack_rows']
+                  assert v['confirmed_FP']+v['warning_only_FP']<=v['normal']
+                  assert len(d['per_seed'][k][n])==4
+                  roles=d['roles'][k][n].values()
+                  assert sum(x['alert_FP'] for x in roles)==v['confirmed_FP']
+                  assert sum(x['alert_TP'] for x in roles)==v['confirmed_TP']
+          print('ROLE_CAUSAL_AUDIT_VERIFIED')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-ticd-role-adaptive-causal-model-and-holdout
+          path: |
+            results_role_adaptive_causal/
+            role_adaptive_causal_environment.txt
+          if-no-files-found: warn
+          retention-days: 30
