@@ -1,0 +1,57 @@
+name: Diameter Bromelia robust IF development benchmark
+
+on:
+  push:
+    branches:
+      - improve/diameter-pcap-native-transfer
+    paths:
+      - ".github/workflows/diameter-bromelia-robust-if-dev.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update -o Acquire::Retries=3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn
+      - name: Download repaired Bromelia development PCAPs
+        uses: actions/download-artifact@v4
+        with:
+          name: diameter-bromelia-frozen-repaired-confirmation
+          path: repaired
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 45438122161
+      - name: Run unchanged robust IF baseline
+        run: |
+          PYTHONPATH=experiments:. python experiments/diameter_external_attack_validation.py \
+            --manifest repaired/frozen/bromelia_test_pcaps/manifest.csv \
+            --pcap-dir repaired/frozen/bromelia_test_pcaps \
+            --out-dir results_bromelia_robust_if_dev
+      - name: Publish
+        if: always()
+        run: |
+          if [ -f results_bromelia_robust_if_dev/summary.json ]; then
+            cat results_bromelia_robust_if_dev/summary.json
+          fi
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diameter-bromelia-robust-if-development
+          path: results_bromelia_robust_if_dev/
+          if-no-files-found: warn
