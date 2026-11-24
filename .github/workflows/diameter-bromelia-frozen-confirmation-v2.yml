@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      FROZEN_DETECTOR_SHA: 463482bffe0eace1e3d5b3629afe116232267715
-      CALIBRATION_RUN_ID: "45443128571"
+      FROZEN_DETECTOR_SHA: 7457aa441cae1476c8b7990c05f68f615d99c2bd
+      CALIBRATION_RUN_ID: "45444537497"
       MODEL_RUN_ID: "45435041027"
       BROMELIA_COMMIT: 5af44c25de159733133e4f09b90c1852d95d5120
 
@@ -227,7 +227,7 @@ jobs:
           fp = round(fpr * n_benign)
           out = {
               "role": "post-freeze independent-implementation confirmation",
-              "detector_sha": "463482bffe0eace1e3d5b3629afe116232267715",
+              "detector_sha": "7457aa441cae1476c8b7990c05f68f615d99c2bd",
               "attack_tpr": tpr,
               "attack_tpr_wilson95": wilson(tp, n_attack),
               "benign_fpr": fpr,
