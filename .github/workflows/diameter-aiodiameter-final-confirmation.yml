@@ -1,0 +1,244 @@
+name: Diameter independent aiodiameter final confirmation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  final-aiodiameter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      AIODIAMETER_COMMIT: 947d7d8852e1ab107b3ae2796a678641286bf4ae
+      ORANGE_COMMIT: 75b350c22cc744d5742fcb71777cd3c9b131c19c
+      DIAMETER_CALIBRATION_PROFILE: results_aiodiameter_calibration/calibration_profile.json
+
+    steps:
+      - name: Checkout detector repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update -o Acquire::Retries=3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark tcpdump netcat-openbsd
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy networkx scikit-learn
+
+      - name: Compile frozen detector and wire driver
+        run: |
+          python -m py_compile             experiments/diameter_pcap_native_detector.py             experiments/diameter_external_pcap_validation.py             experiments/diameter_calibrate_from_independent_pcaps.py             experiments/aiodiameter_final_driver.py
+
+      - name: Download Orange calibration source
+        run: |
+          set -euo pipefail
+          mkdir -p orange_aiodiameter_calibration
+          base="https://raw.githubusercontent.com/Orange-OpenSource/diafuzzer/${ORANGE_COMMIT}/captures"
+          curl -fL --retry 4 -o orange_aiodiameter_calibration/S6a.pcap "${base}/S6a.pcap"
+          curl -fL --retry 4 -o orange_aiodiameter_calibration/S6a_perso.pcap "${base}/S6a_perso.pcap"
+          curl -fL --retry 4 -o orange_aiodiameter_calibration/Cx.pcap "${base}/Cx.pcap"
+          sha256sum orange_aiodiameter_calibration/*.pcap | tee orange_aiodiameter_calibration/SHA256SUMS
+
+      - name: Calibrate simulator
+        run: |
+          python experiments/diameter_calibrate_from_independent_pcaps.py             orange_aiodiameter_calibration/S6a.pcap             orange_aiodiameter_calibration/S6a_perso.pcap             orange_aiodiameter_calibration/Cx.pcap             --out-dir results_aiodiameter_calibration             --source "Orange-OpenSource/diafuzzer"             --source-commit "${ORANGE_COMMIT}"             --prior-strength 40
+
+      - name: Train frozen PCAP-native detector
+        run: |
+          python experiments/diameter_pcap_native_detector.py train             --calibration-pcaps               orange_aiodiameter_calibration/S6a.pcap               orange_aiodiameter_calibration/S6a_perso.pcap               orange_aiodiameter_calibration/Cx.pcap             --out-dir results_aiodiameter_native_model
+          test -s results_aiodiameter_native_model/pcap_native_bundle.pkl
+          test -s results_aiodiameter_native_model/training_summary.json
+
+      - name: Checkout pinned independent aiodiameter codec
+        run: |
+          git clone https://github.com/alikhalilli/aiodiameter.git external_aiodiameter
+          git -C external_aiodiameter checkout "${AIODIAMETER_COMMIT}"
+          cp experiments/aiodiameter_final_driver.py external_aiodiameter/final_validation_driver.py
+          (
+            cd external_aiodiameter
+            python -m py_compile final_validation_driver.py message.py diameterheader.py
+          )
+          {
+            echo "Implementation: alikhalilli/aiodiameter"
+            echo "Pinned commit: ${AIODIAMETER_COMMIT}"
+            echo "Role: final independent external wire confirmation"
+            echo "Transport: real TCP loopback captured with tcpdump"
+            echo "Codec: third-party aiodiameter Message encode/decode"
+            echo "No capture from this source was used for model fitting or threshold selection."
+            echo "Scenario counts and gates were frozen before the first scoring run."
+          } > aiodiameter_final_provenance.txt
+
+      - name: Start independent aiodiameter wire server
+        run: |
+          (
+            cd external_aiodiameter
+            python final_validation_driver.py --mode server --host 127.0.0.1 --port 3868
+          ) > aiodiameter_final_server.log 2>&1 &
+          echo $! > /tmp/aiodiameter_final_server.pid
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 3868; then
+              echo "aiodiameter server ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          cat aiodiameter_final_server.log
+          exit 1
+
+      - name: Capture frozen independent scenarios
+        run: |
+          set -euo pipefail
+          mkdir -p aiodiameter_final_pcaps
+          manifest="aiodiameter_final_pcaps/manifest.csv"
+          echo "capture,expected_label,scenario" > "${manifest}"
+
+          capture_case() {
+            name="$1"; label="$2"; scenario="$3"; count="$4"; delay="$5"
+            out="$GITHUB_WORKSPACE/aiodiameter_final_pcaps/${name}"
+            sudo tcpdump -i lo -U -s 0 -w "${out}" 'tcp port 3868' >"/tmp/aiodiameter-${name}.log" 2>&1 &
+            cap_pid=$!
+            sleep 0.50
+            (
+              cd external_aiodiameter
+              python final_validation_driver.py                 --mode client --host 127.0.0.1 --port 3868                 --scenario "${scenario}" --count "${count}" --delay-ms "${delay}"
+            )
+            sleep 0.30
+            sudo pkill -INT -x tcpdump || true
+            wait "${cap_pid}" || true
+            sudo chown "$USER":"$USER" "${out}"
+            test -s "${out}"
+            echo "${name},${label},${scenario}" >> "${manifest}"
+          }
+
+          # Frozen benign controls: 8 independent captures.
+          capture_case benign_attach_1.pcap benign benign_attach 1 650
+          capture_case benign_attach_2.pcap benign benign_attach 2 900
+          capture_case benign_attach_4.pcap benign benign_attach 4 1200
+          capture_case benign_reauth_2.pcap benign benign_reauth 2 700
+          capture_case benign_reauth_5.pcap benign benign_reauth 5 1050
+          capture_case benign_update_2.pcap benign benign_update 2 750
+          capture_case benign_update_4.pcap benign benign_update 4 1000
+          capture_case benign_update_7.pcap benign benign_update 7 1300
+
+          # Frozen attacks: four strengths per scenario = 16 attack captures.
+          capture_case attack_air_16.pcap attack air_flood 16 0
+          capture_case attack_air_32.pcap attack air_flood 32 0
+          capture_case attack_air_64.pcap attack air_flood 64 0
+          capture_case attack_air_128.pcap attack air_flood 128 0
+
+          capture_case attack_ulr_16.pcap attack ulr_flood 16 0
+          capture_case attack_ulr_32.pcap attack ulr_flood 32 0
+          capture_case attack_ulr_64.pcap attack ulr_flood 64 0
+          capture_case attack_ulr_128.pcap attack ulr_flood 128 0
+
+          capture_case attack_mixed_20.pcap attack mixed_flood 20 0
+          capture_case attack_mixed_40.pcap attack mixed_flood 40 0
+          capture_case attack_mixed_80.pcap attack mixed_flood 80 0
+          capture_case attack_mixed_160.pcap attack mixed_flood 160 0
+
+          capture_case attack_tracking_18.pcap attack tracking_burst 18 0
+          capture_case attack_tracking_36.pcap attack tracking_burst 36 0
+          capture_case attack_tracking_72.pcap attack tracking_burst 72 0
+          capture_case attack_tracking_144.pcap attack tracking_burst 144 0
+
+          sha256sum aiodiameter_final_pcaps/*.pcap | tee aiodiameter_final_pcaps/SHA256SUMS
+          cat "${manifest}"
+
+      - name: Decode frozen capture inventory before scoring
+        run: |
+          for pcap in aiodiameter_final_pcaps/*.pcap; do
+            echo "=== ${pcap} ==="
+            capinfos -c -u "${pcap}" || true
+            td=$(mktemp -d)
+            cp "${pcap}" "${td}/input.pcap"
+            tshark -r "${td}/input.pcap" -Y diameter -T fields               -e diameter.cmd.code -e diameter.applicationId | sort | uniq -c
+            rm -rf "${td}"
+          done
+
+      - name: Score frozen aiodiameter confirmation set
+        run: |
+          python experiments/diameter_pcap_native_detector.py score             --model results_aiodiameter_native_model/pcap_native_bundle.pkl             --manifest aiodiameter_final_pcaps/manifest.csv             --pcap-dir aiodiameter_final_pcaps             --out-dir results_aiodiameter_final
+
+      - name: Final no-post-test-tuning acceptance
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          summary = json.loads(Path(
+              "results_aiodiameter_final/summary.json"
+          ).read_text(encoding="utf-8"))
+          summary["source"] = "alikhalilli/aiodiameter"
+          summary["source_commit"] = "947d7d8852e1ab107b3ae2796a678641286bf4ae"
+          summary["role"] = (
+              "first and final independent supervised-transfer confirmation; "
+              "no post-test tuning permitted"
+          )
+          Path("results_aiodiameter_final/final_confirmation_summary.json").write_text(
+              json.dumps(summary, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+          # Frozen before first scoring:
+          # 16 attacks -> TPR >= 0.80 means at least 13/16 detected.
+          # 8 benign controls -> require 0/8 false positives.
+          if float(summary["external_attack_tpr"]) < 0.80:
+              raise SystemExit(
+                  f"Final PCAP-native TPR below 80%: {summary['external_attack_tpr']}")
+          if float(summary["external_benign_fpr"]) > 0.0:
+              raise SystemExit(
+                  f"Final PCAP-native benign FPR not zero: {summary['external_benign_fpr']}")
+          if float(summary["external_balanced_accuracy"]) < 0.90:
+              raise SystemExit(
+                  "Final PCAP-native balanced accuracy below 90%: "
+                  f"{summary['external_balanced_accuracy']}")
+          PY
+
+      - name: Stop independent server
+        if: always()
+        run: |
+          if [ -f /tmp/aiodiameter_final_server.pid ]; then
+            kill "$(cat /tmp/aiodiameter_final_server.pid)" || true
+          fi
+          tail -n 120 aiodiameter_final_server.log || true
+
+      - name: Publish final confirmation
+        if: always()
+        run: |
+          {
+            echo "## Independent aiodiameter final confirmation"
+            for f in               results_aiodiameter_native_model/training_summary.json               results_aiodiameter_final/summary.json               results_aiodiameter_final/final_confirmation_summary.json; do
+              if [ -f "$f" ]; then
+                echo
+                echo "### $f"
+                echo '~~~json'
+                cat "$f"
+                echo '~~~'
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload final confirmation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diameter-aiodiameter-final-confirmation
+          path: |
+            results_aiodiameter_calibration/
+            results_aiodiameter_native_model/
+            results_aiodiameter_final/
+            orange_aiodiameter_calibration/
+            aiodiameter_final_pcaps/
+            aiodiameter_final_provenance.txt
+            aiodiameter_final_server.log
+          if-no-files-found: warn
+          compression-level: 6
