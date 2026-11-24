@@ -175,18 +175,33 @@ jobs:
           capture_case() {
             name="$1"; label="$2"; scenario="$3"; count="$4"; delay="$5"
             out="$GITHUB_WORKSPACE/bromelia_test_pcaps/${name}"
-            sudo tcpdump -i lo -U -s 0 -w "${out}" 'tcp port 3868' >"/tmp/bromelia-test-${name}.log" 2>&1 &
+            sudo tcpdump -i lo -U -s 0 -B 4096 -w "${out}" 'tcp port 3868' >"/tmp/bromelia-test-${name}.log" 2>&1 &
             cap_pid=$!
-            sleep 0.35
+            # Flood scenarios complete very quickly.  Wait until tcpdump has
+            # fully attached to loopback before starting the frozen client.
+            for i in {1..50}; do
+              if grep -q "listening on lo" "/tmp/bromelia-test-${name}.log"; then
+                break
+              fi
+              sleep 0.05
+            done
+            grep -q "listening on lo" "/tmp/bromelia-test-${name}.log"
+            sleep 0.50
             (
               cd external_bromelia
               python frozen_validation_driver.py                 --mode client --host 127.0.0.1 --port 3868                 --scenario "${scenario}" --count "${count}" --delay-ms "${delay}"
             )
-            sleep 0.25
+            sleep 0.75
             sudo pkill -INT -x tcpdump || true
             wait "${cap_pid}" || true
             sudo chown "$USER":"$USER" "${out}"
             test -s "${out}"
+            bytes=$(stat -c%s "${out}")
+            if [ "${bytes}" -le 24 ]; then
+              echo "Invalid empty PCAP: ${out} (${bytes} bytes)"
+              cat "/tmp/bromelia-test-${name}.log" || true
+              exit 1
+            fi
             echo "${name},${label},${scenario}" >> "${manifest}"
           }
 
@@ -222,6 +237,14 @@ jobs:
           capture_case test_tracking_160.pcap attack tracking_burst 160 0
 
           sha256sum bromelia_test_pcaps/*.pcap | tee bromelia_test_pcaps/SHA256SUMS
+          python - <<'PY'
+          from pathlib import Path
+          pcaps = sorted(Path("bromelia_test_pcaps").glob("*.pcap"))
+          bad = [(p.name, p.stat().st_size) for p in pcaps if p.stat().st_size <= 24]
+          if bad:
+              raise SystemExit(f"Empty/invalid Bromelia test PCAPs: {bad}")
+          print(f"Validated {len(pcaps)} non-empty Bromelia test PCAPs")
+          PY
           cat "${manifest}"
 
       - name: Score disjoint Bromelia test with benign-only calibration
