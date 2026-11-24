@@ -1,4 +1,5 @@
 name: Diameter calibrated full ML experiment
+# Full 56-feature regression; PCAP-local adaptation is evaluated separately.
 
 on:
   push:
