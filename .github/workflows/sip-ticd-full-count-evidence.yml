@@ -1,0 +1,72 @@
+name: SIP TICD full-invariant count-aware evidence
+on:
+  push:
+    branches: [study/ticd-full-count-evidence]
+    paths:
+      - 'sip/sip_sim_v4_claude.py'
+      - 'sip/ticd_full_count_evidence.py'
+      - 'experiments/evaluate_ticd_full_count_evidence.py'
+      - '.github/workflows/sip-ticd-full-count-evidence.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+      PYTHONHASHSEED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install and compile
+        run: |
+          set -euo pipefail
+          python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+          python -m compileall -q sip/sip_sim_v4_claude.py sip/ticd_full_count_evidence.py experiments/evaluate_ticd_full_count_evidence.py
+          python -m pip freeze > full_count_environment.txt
+      - name: Recover full frozen TICD
+        run: |
+          set -euo pipefail
+          gh run download 45377337545 --repo "${{ github.repository }}" --name sip-ticd-role-adaptive-causal-model-and-holdout --dir prior
+          p="$(find prior -type f -name role_adaptive_causal_ticd.pkl -print -quit)"
+          test -n "$p"
+          echo "PRIOR_DIR=$(dirname "$p")" >> "$GITHUB_ENV"
+      - name: Fit and evaluate all full-invariant configurations
+        run: python -m experiments.evaluate_ticd_full_count_evidence --prior "$PRIOR_DIR" --out results_full_count
+      - name: Verify independent tests and preserved architecture
+        run: |
+          python - <<'PY'
+          import json
+          d=json.load(open('results_full_count/full_count_report.json'))
+          assert not d['test_used_for_selection'] and not d['real_field_validation']
+          assert all(d[k] for k in ('all_original_invariants_preserved','counter_consistency','prefix_causality','observational_equivalence_verified','label_and_batch_invariance','reload_verified'))
+          assert len(d['candidates'])==12 and all(v['all_original_invariants_preserved'] for v in d['candidates'].values())
+          seeds=[s for k in ('training_seeds','validation_seeds','development_seeds','test_seeds') for xs in d[k].values() for s in xs]
+          assert len(seeds)==len(set(seeds))==236
+          assert len(d['heldout'])==25 and len(d['summary'])==5
+          for k,mods in d['heldout'].items():
+              assert len(mods)==5
+              for n,v in mods.items():
+                  assert v['rows']==19800
+                  assert [r['seed'] for r in d['per_seed'][k][n]]==d['test_seeds'][k]
+                  assert v['complete_rows']+v['partial_rows']+v['unobservable_rows']==v['rows']
+          print('COUNT_AUDIT_VERIFIED')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-ticd-full-count-evidence
+          path: |
+            results_full_count/
+            full_count_environment.txt
+          if-no-files-found: warn
+          retention-days: 30
