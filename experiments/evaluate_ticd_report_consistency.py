@@ -17,7 +17,7 @@ from ticd_report_consistency import ReportConsistencyTICD, RATIOS, extra_evidenc
 
 COLUMNS = list(dict.fromkeys([*RAW, *RATIOS, "obs_method_dominance_ratio",
                              "audit_observed_count", "audit_mismatch_count"]))
-MODELS = ("block", "block_report", "full", "normalized")
+MODELS = ("block", "block_report", "full", "normalized", "coherent", "rounded_2dp")
 REPLICATES = 10
 
 
@@ -35,19 +35,38 @@ def evaluate(package, shard, out):
     model = ReportConsistencyTICD(ref, prior["models"]["frozen_block"])
     rows = []
     for i, kind in enumerate(KINDS):
-        seed = 610001 + i * 100 + shard
+        seed = 620001 + i * 100 + shard
         raw, _, _, commissioning = group([seed], prior["calibration"], kind, ref.core.causal)
         obs = raw[COLUMNS]
         commissioning = commissioning[list(RAW)]
         base = model.baseline(obs, commissioning)
         evidence = extra_evidence(obs)
         norm = extra_evidence(obs, normalize=True)
+        # Independent representation controls on exactly the same underlying run.
+        rounded = obs.copy()
+        rounded[RATIOS] = rounded[RATIOS].round(2)
+        coarse = extra_evidence(rounded, ratio_resolution=.01)
+        coherent = obs.copy()
+        shares = coherent[RATIOS].clip(lower=0)
+        shares = shares.div(shares.sum(axis=1).replace(0, 1), axis=0)
+        coherent[RATIOS] = shares
+        high = shares.max(axis=1)
+        coherent["obs_method_dominance_ratio"] = high / (shares.sum(axis=1) - high).clip(lower=.001)
+        consistent = extra_evidence(coherent)
+        assert not consistent.report.any()
         levels = {"block": base, "block_report": np.where(evidence.report, 2, base),
                   "full": np.where(evidence.any(axis=1), 2, base),
-                  "normalized": np.where(norm.any(axis=1), 2, base)}
+                  "normalized": np.where(norm.any(axis=1), 2, base),
+                  "coherent": np.where(consistent.any(axis=1), 2, base),
+                  "rounded_2dp": np.where(coarse.any(axis=1), 2, base)}
         blind = ~obs.primary_observer_valid & obs.audit_observed_count.eq(0)
         assert not np.any(levels["full"][blind] > 0)
         if i == 0:
+            if shard == 0:
+                path = out / "report_consistency_ticd.pkl"
+                path.write_bytes(pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL))
+                restored = pickle.loads(path.read_bytes())
+                np.testing.assert_array_equal(restored.predict_levels(obs, commissioning), levels["full"])
             cut = obs.interval.lt(150)
             np.testing.assert_array_equal(model.predict_levels(obs.loc[cut], commissioning),
                                           levels["full"][cut])

@@ -10,8 +10,10 @@ RATIOS = ["obs_ratio_" + name for name in METHODS]
 KEYS = ["simulation_seed", "node_id", "interval"]
 
 
-def report_votes(frame, normalize=False):
+def report_votes(frame, normalize=False, ratio_resolution=.001):
     """Compare fields from a single delivered CU report with an exhaustive method taxonomy."""
+    if not np.isfinite(ratio_resolution) or not 0 <= ratio_resolution <= 1:
+        raise ValueError("ratio_resolution must be a finite fraction in [0, 1]")
     share = frame[RATIOS].to_numpy(dtype=float, copy=True)
     if normalize:
         share = np.maximum(share, 0)
@@ -23,15 +25,16 @@ def report_votes(frame, normalize=False):
     dominance = frame.obs_method_dominance_ratio.to_numpy()
     # Cross multiplication avoids amplifying rounding at small denominators.
     disagreement = np.abs(dominance * remainder - largest)
-    # Allow 0.001 reporting precision, plus slack for measurement noise.
-    bad_total = np.abs(total - 1) > .012
-    bad_dominance = disagreement > .07 * remainder + .005 * (1 + np.abs(dominance))
+    # The sum of nine independently rounded fractions has a known error bound.
+    rounding = .5 * len(RATIOS) * ratio_resolution + 1e-12
+    bad_total = np.abs(total - 1) > max(.012, rounding)
+    bad_dominance = disagreement > .07 * remainder + max(.005, rounding) * (1 + np.abs(dominance))
     valid = frame.primary_observer_valid & frame.cu_delivered.astype(bool)
     finite = np.isfinite(share).all(axis=1) & np.isfinite(dominance)
     return (bad_total | bad_dominance) & valid.to_numpy() & finite
 
 
-def extra_evidence(raw, normalize=False):
+def extra_evidence(raw, normalize=False, ratio_resolution=.001):
     """Expect one row per node and interval. Reset memory after gaps or observer loss."""
     x = raw.sort_values(KEYS)
     if not x.index.is_unique or x.duplicated(KEYS).any():
@@ -46,7 +49,7 @@ def extra_evidence(raw, normalize=False):
         return values.groupby(keys, sort=False).transform(
             lambda s: s.rolling(width, min_periods=1).sum())
 
-    votes = rolling(report_votes(x, normalize), groups + [segment], 6)
+    votes = rolling(report_votes(x, normalize, ratio_resolution), groups + [segment], 6)
     report = x.primary_observer_valid & votes.ge(2)
     # This audit is a separate synthetic observer. Never infer exposure from a missing sample.
     n = x.audit_observed_count
@@ -60,7 +63,8 @@ def extra_evidence(raw, normalize=False):
 
 
 class ReportConsistencyTICD:
-    def __init__(self, reference, block_model):
+    def __init__(self, reference, block_model, ratio_resolution=.001):
+        self.ratio_resolution = ratio_resolution
         self.reference = reference
         self.block_model = block_model
 
@@ -75,5 +79,5 @@ class ReportConsistencyTICD:
 
     def predict_levels(self, raw, commissioning):
         base = self.baseline(raw, commissioning)
-        confirm = extra_evidence(raw).any(axis=1)
+        confirm = extra_evidence(raw, ratio_resolution=self.ratio_resolution).any(axis=1)
         return np.where(confirm, 2, base).astype(np.int8)

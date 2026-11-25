@@ -45,6 +45,20 @@ jobs:
           name: report-part-${{ matrix.shard }}
           path: results/part-*.json
           if-no-files-found: error
+      - name: Package verified detector
+        if: matrix.shard == 0
+        run: |
+          python -m pip freeze > results/requirements-frozen.txt
+          git rev-parse HEAD > results/source-commit.txt
+      - uses: actions/upload-artifact@v4
+        if: matrix.shard == 0
+        with:
+          name: sip-ticd-report-consistency-model
+          path: |
+            results/report_consistency_ticd.pkl
+            results/requirements-frozen.txt
+            results/source-commit.txt
+          if-no-files-found: error
   summarize:
     needs: evaluate
     runs-on: ubuntu-latest
