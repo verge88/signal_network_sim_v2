@@ -70,9 +70,9 @@ def long_scale(e,valid):
     return float(np.sqrt(np.clip(total,.25,16.)))
 
 def block_features(x,commission,reference):
-    assert reference.mode=="adaptive_fast"
+    assert reference.mode in ("adaptive_fast","reconciled_raw","reconciled_cal")
     ref=reference.reference
-    c=measured_frame(commission,reference.mode,True)
+    c=reference.frame(commission,True)
     cz,ce,cd,cgood,cw=inputs(ref,c)
     z,e,d,good,w=inputs(ref,x)
     profiles={}

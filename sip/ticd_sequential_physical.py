@@ -25,7 +25,7 @@ def signed(ref, x):
 def sequence_features(x, commission, reference):
     assert reference.mode!="oracle"
     ref=reference.reference
-    c=measured_frame(commission,reference.mode,True)
+    c=reference.frame(commission,True)
     cz,cn,ce,cw,cgood,cp=signed(ref,c)
     z,n,e,w,good,p=signed(ref,x)
     # Per-installation, per-node benign offset with shrinkage toward the

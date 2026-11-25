@@ -16,7 +16,8 @@ from ticd_independent_loss import IndependentLossReference,LossFusionTICD,WINDOW
 from ticd_observability_factorial import prepare_policy_history,PolicyEvidence
 
 from ticd_loss_state_filter import estimate,SETTINGS
-MODES=("oracle","cu","active","passive","hybrid",*SETTINGS)
+from ticd_sensor_reconciliation import MODES as RECONCILED,estimate_reconciled
+MODES=("oracle","cu","active","passive","hybrid",*SETTINGS,*RECONCILED)
 # Exact allowed primitive observations. No simulator loss, calculated delay,
 # ground truth, precomputed loss-dependent statistics or attack labels here.
 RAW=("simulation_seed","node_id","node_type","interval","zone_id","primary_observer_valid",
@@ -28,7 +29,7 @@ RAW=("simulation_seed","node_id","node_type","interval","zone_id","primary_obser
      "passive_sent","passive_received")
 LABELS=("is_anomaly","attack_type","attacker_sophistication","eval_active_deficit")
 
-def measured_frame(df,mode,commission=False):
+def measured_frame(df,mode,commission=False,variance_calibrator=None):
     assert mode in MODES
     cols=list(RAW)
     if not commission:cols+=["audit_observed_count","audit_mismatch_count"]
@@ -77,6 +78,10 @@ def measured_frame(df,mode,commission=False):
         p=np.where(av,pa,pc);v=np.where(av,va,vc);available=av
     elif mode=="passive":
         p=np.where(pv,pp,pc);v=np.where(pv,vp,vc);available=pv
+    elif mode in RECONCILED:
+        p,v,available,wa,wp,held=estimate_reconciled(x,pc,vc)
+        if variance_calibrator is not None:v=variance_calibrator.apply(x,v)
+        x["state_active_gain"]=wa;x["state_passive_gain"]=wp;x["state_missing_age"]=held
     elif mode in SETTINGS:
         p,v,available,wa,wp,held=estimate(x,pc,vc,mode)
         x["state_active_gain"]=wa;x["state_passive_gain"]=wp;x["state_missing_age"]=held
@@ -179,10 +184,12 @@ class FullMeasuredReference:
         assert self.core.zonal.mode=="load"
         self.core.physical.base_model=InactiveContext()
         self.audit=PolicyEvidence()
+    def frame(self,df,commission=False):
+        return measured_frame(df,self.mode,commission,getattr(self,"variance_calibrator",None))
     def fit(self,train,commission,val):
-        t=labels(measured_frame(train,self.mode),train)
-        c=labels(measured_frame(commission,self.mode,True),commission)
-        v={k:labels(measured_frame(x,self.mode),x) for k,x in val.items()}
+        t=labels(self.frame(train),train)
+        c=labels(self.frame(commission,True),commission)
+        v={k:labels(self.frame(x),x) for k,x in val.items()}
         # Load-warning mode does not use zone_causal_median; placeholders
         # are replaced with the newly refitted causal model after fitting.
         self.core.fit_normal(t,v)
@@ -198,9 +205,9 @@ class FullMeasuredReference:
         self.reference=MeasuredPhysicalReference(personal).fit(t)
         return self
     def prepare(self,df,commission):
-        x=measured_frame(df,self.mode)
+        x=self.frame(df)
         x=prepare_zonal_warning_context(x,self.core.causal)
-        c=measured_frame(commission,self.mode,True)
+        c=self.frame(commission,True)
         return self.reference.prepare(x,c)
     def manifest(self):
         return {"mode":self.mode,"full_refit":True,"oracle_only":self.mode=="oracle",
