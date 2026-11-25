@@ -42,6 +42,7 @@ MAIN_MODELS = [
     "Random Forest",
     "Gradient Boosting",
     "Cascade",
+    "Cascade + report recurrence",
     "Meta-Ensemble",
 ]
 
@@ -53,6 +54,7 @@ ROC_MODELS = [
     "Random Forest",
     "Gradient Boosting",
     "Cascade",
+    "Cascade + report recurrence",
     "Meta-Ensemble",
 ]
 
@@ -599,11 +601,48 @@ def build_manifest(out_dir: Path, generated: Iterable[str],
     )
 
 
+def plot_recurrence_benchmark(summary: dict, out_dir: Path) -> List[str]:
+    trials = summary["tests"]
+    x = np.arange(len(trials))
+    baseline = "Cascade"
+    candidate = "Cascade + report recurrence"
+    validation = summary["validation"][candidate]
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    for ax, key, title, target in (
+        (axes[0], "compromise_recall", "Полнота обнаружения компрометации",
+         validation["target_compromise_recall"]),
+        (axes[1], "benign_fpr", "Доля ложных тревог",
+         validation["total_fpr_budget"]),
+    ):
+        for model, shift, label, color, hatch in (
+            (baseline, -0.17, "Исходный каскад", "0.80", "//"),
+            (candidate, 0.17, "Каскад с повторяемостью отчётов", "0.35", ""),
+        ):
+            rates = [100 * trial["models"][model][key] for trial in trials]
+            bars = ax.bar(x + shift, rates, 0.34, label=label,
+                          facecolor=color, edgecolor="black", hatch=hatch)
+            ax.bar_label(bars, labels=[f"{rate:.2f}%" for rate in rates], padding=3)
+        ax.axhline(100 * target, color="black", linestyle=":", linewidth=1.3)
+        ax.set_xticks(x, [trial["simulation"] for trial in trials])
+        ax.set_title(title)
+        ax.set_ylabel("%")
+    axes[0].set_ylim(0, 110)
+    max_fpr = max(trial["models"][model]["benign_fpr"]
+                  for trial in trials for model in (baseline, candidate))
+    axes[1].set_ylim(0, 125 * max(max_fpr, validation["total_fpr_budget"]))
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=2)
+    fig.tight_layout(rect=(0, 0, 1, .88))
+    return save_figure(fig, out_dir, "16_report_recurrence_benchmark")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--results-dir", type=Path,
                    default=Path("results_diameter_v1"))
     p.add_argument("--out-dir", type=Path, default=None)
+    p.add_argument("--recurrence-benchmark", type=Path,
+                   help="Generate the cascade comparison from a benchmark JSON")
     p.add_argument("--external-benign", type=Path,
                    default=Path("results_calibrated_external_benign/summary.json"))
     p.add_argument("--external-attacks", type=Path,
@@ -622,6 +661,11 @@ def main() -> None:
     results_dir = args.results_dir
     out_dir = args.out_dir or (results_dir / "publication_plots")
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.recurrence_benchmark:
+        summary = load_json(args.recurrence_benchmark)
+        generated = plot_recurrence_benchmark(summary, out_dir)
+        build_manifest(out_dir, generated, [args.recurrence_benchmark])
+        return
 
     csv_path = results_dir / "full_comparison_diameter.csv"
     json_artifacts_path = results_dir / "plot_artifacts.json"

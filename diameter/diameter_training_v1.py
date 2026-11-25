@@ -22,6 +22,17 @@ Plus ablation studies for MS-features and temporal features.
 import argparse
 from pathlib import Path
 
+if __package__:
+    from .diameter_report_recurrence import (
+        MODEL_NAME as RECURRENCE_MODEL, REQUIRED_COLUMNS as RECURRENCE_COLUMNS,
+        report_recurrence, validate_compromise_state,
+    )
+else:
+    from diameter_report_recurrence import (
+        MODEL_NAME as RECURRENCE_MODEL, REQUIRED_COLUMNS as RECURRENCE_COLUMNS,
+        report_recurrence, validate_compromise_state,
+    )
+
 import numpy as np
 import pandas as pd
 import os
@@ -330,6 +341,8 @@ class DataPipeline:
         if any(c.startswith("gt_") for c in self.feature_cols):
             raise ValueError("Ground-truth columns found in feature set")
         for name, df in zip(("train", "validation", "stack", "test"), partitions):
+            if "is_compromised" in df:
+                validate_compromise_state(df)
             if set(df[self.LABEL_COL].unique()) != {0, 1}:
                 raise ValueError(f"{name} needs both benign and anomalous records")
             print(f"{name}: {len(df)} rows; anomaly rate {df[self.LABEL_COL].mean():.4f}")
@@ -1555,6 +1568,23 @@ def main(config=None):
         "Cascade", casc_pt, y_test, attack_types_test, threshold=1.0)
     casc_result["compromise_threshold_info"] = compromise_threshold_info
     results_list.append(casc_result)
+
+    # An alternative second stage scores persistence of repeated fresh
+    # report profiles. Stage 1 and the validation budget match the baseline.
+    if all(RECURRENCE_COLUMNS <= set(frame.columns) for frame in (val_df, test_df)):
+        recurrence_v = report_recurrence(val_df)
+        rec_t1, rec_t2, _, rec_validation = select_compromise_aware_thresholds(
+            casc1_pv, recurrence_v, y_val, y_val_comp,
+            general_fpr_budget=config.compromise_general_fpr_budget,
+            total_fpr_budget=config.compromise_total_fpr_budget,
+            target_recall=config.compromise_target_recall,
+        )
+        recurrence_t = combine_cascade_scores(
+            casc1_pt, report_recurrence(test_df), rec_t1, rec_t2)
+        recurrence_result = evaluate_model(
+            RECURRENCE_MODEL, recurrence_t, y_test, attack_types_test, threshold=1.0)
+        recurrence_result["compromise_threshold_info"] = rec_validation
+        results_list.append(recurrence_result)
 
     # ── 10. Specialized Ensemble ──
     print("\n[10] Specialized Ensemble...")

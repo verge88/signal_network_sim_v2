@@ -1,0 +1,72 @@
+name: Diameter report recurrence validation
+
+on:
+  push:
+    branches: [improve/diameter-report-recurrence]
+    paths:
+      - "diameter/**"
+      - "tests/test_diameter_report_recurrence.py"
+      - ".github/workflows/diameter-report-recurrence.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: diameter-report-recurrence-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  report-recurrence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OMP_NUM_THREADS: "4"
+      OPENBLAS_NUM_THREADS: "4"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install CPU dependencies and check lifecycle and causality
+        run: |
+          python -m pip install numpy pandas scipy networkx scikit-learn matplotlib
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m py_compile diameter/diameter_{sim_v1,training_v1,report_recurrence,compromise_benchmark,generate_plots}.py
+          python -m unittest discover -s tests -p test_diameter_report_recurrence.py -v
+      - name: Retrieve frozen simulator calibration
+        uses: actions/download-artifact@v4
+        with:
+          name: diameter-calibrated-full-experiment
+          path: archived
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 45449352344
+      - name: Generate corrected independent simulations
+        env:
+          DIAMETER_CALIBRATION_PROFILE: archived/results_diameter_calibration/calibration_profile.json
+        run: |
+          test -s "$DIAMETER_CALIBRATION_PROFILE"
+          for seed in 42 43 46 47; do
+            python diameter/diameter_sim_v1.py --seed "$seed" --out "fixed-${seed}.csv.gz"
+          done
+      - name: Compare cascade models under the same validation budget
+        run: |
+          python diameter/diameter_compromise_benchmark.py \
+            --train fixed-42.csv.gz --validation fixed-43.csv.gz \
+            --test fixed-46.csv.gz fixed-47.csv.gz \
+            --out results_recurrence/report_recurrence_summary.json
+      - name: Build PNG and SVG with the Diameter figure generator
+        run: |
+          python diameter/diameter_generate_plots.py \
+            --recurrence-benchmark results_recurrence/report_recurrence_summary.json \
+            --out-dir results_recurrence/figures
+          test -s results_recurrence/figures/16_report_recurrence_benchmark.png
+          test -s results_recurrence/figures/16_report_recurrence_benchmark.svg
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diameter-report-recurrence-results
+          path: results_recurrence/
+          if-no-files-found: warn

@@ -1258,15 +1258,21 @@ class DiameterSimulator:
                 attack_type = AttackType.NONE
                 event_type = NormalEventType.NONE
 
-                for a in active_attacks:
-                    if nid in a.target_nodes:
-                        override.update(
-                            self.injector.get_attack_overrides(a))
-                        attack_type = a.attack_type
-                        if attack_type == AttackType.NODE_COMPROMISE:
-                            if not node.is_compromised:
-                                node.is_compromised = True
-                                node.compromised_since = t
+                node_attacks = [attack for attack in active_attacks
+                                if nid in attack.target_nodes]
+                compromised = any(a.attack_type == AttackType.NODE_COMPROMISE
+                                  for a in node_attacks)
+                if compromised and not node.is_compromised:
+                    node.compromised_since = t
+                if not compromised:
+                    node.compromised_since = None
+                node.is_compromised = compromised
+
+                for attack in node_attacks:
+                    override.update(self.injector.get_attack_overrides(attack))
+                    attack_type = attack.attack_type
+                if compromised:
+                    attack_type = AttackType.NODE_COMPROMISE
 
                 for e in active_events:
                     if nid in e.target_nodes:
