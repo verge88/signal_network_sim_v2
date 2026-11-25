@@ -1,0 +1,66 @@
+name: Diameter cascade loopback testbed
+
+on:
+  push:
+    branches: [experiment/diameter-cascade-testbed]
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  OMP_NUM_THREADS: "4"
+  OPENBLAS_NUM_THREADS: "4"
+  MKL_NUM_THREADS: "4"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  capture-and-evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.18"
+      - name: Install the capture and frozen model environment
+        run: |
+          python -m pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 matplotlib==3.11.2 networkx==3.6.1 scapy==2.7.0
+          python -m pip install 'torch==2.15.0+cpu' --index-url https://download.pytorch.org/whl/cpu
+          if ! command -v tcpdump >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y tcpdump
+          fi
+          sudo setcap cap_net_raw,cap_net_admin=eip "$(command -v tcpdump)"
+      - uses: actions/download-artifact@v4
+        with:
+          name: diameter-frozen-cascade
+          path: frozen
+          run-id: 45616781309
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Capture ten independent workload sessions and their CU polls
+        run: |
+          python diameter/diameter_cascade_testbed.py --model-info frozen/model.json --out capture
+      - name: Evaluate both frozen cascades on the same observations
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          for case in healthy frozen_joint frozen_s6a; do
+            python diameter/diameter_external_cascade.py evaluate --model frozen/cascade.joblib \
+              --manifest "capture/$case-manifest.json" --out "results/$case.json"
+          done
+          python diameter/diameter_cascade_testbed_report.py capture results
+          cp frozen/model.json results/model.json
+          python -m pip freeze > results/versions.txt
+          cat results/summary.md | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diameter-cascade-testbed-data
+          path: capture/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diameter-cascade-testbed-results
+          path: results/
+          if-no-files-found: error
