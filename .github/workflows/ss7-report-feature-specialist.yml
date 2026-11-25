@@ -39,7 +39,9 @@ jobs:
           topo=S(linksets={k:None,l:None})
           f=directional(reps,topo)
           assert np.isclose(f[1]["dir_out_res"],-4/18)
-          assert np.isclose(f[2]["dir_in_res"],4/18)
+          assert np.isclose(f[2]["dir_in_res"],4/28)
+          assert np.isclose(f[2]["dir_in_deficit"],0.)
+          assert np.isclose(f[2]["dir_in_abs"],4/28)
           assert np.isclose(f[1]["peer_other_mean"],0)
           assert f[1]["peer_excess"]>0
           assert all(set(x)==set(DIRECTION+PEER) for x in f.values())
