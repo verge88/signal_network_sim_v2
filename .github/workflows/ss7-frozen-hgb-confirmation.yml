@@ -1,0 +1,108 @@
+name: SS7 frozen HGB independent confirmation 32 worlds
+on:
+  push:
+    branches: [ss7-weak-signal-confirmation]
+    paths: [.github/workflows/ss7-frozen-hgb-confirmation.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-frozen-hgb-confirmation-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        seed: [9801,9802,9803,9804,9805,9806,9807,9808,9809,9810,9811,9812,9813,9814,9815,9816,9817,9818,9819,9820,9821,9822,9823,9824,9825,9826,9827,9828,9829,9830,9831,9832]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-specialist-trained
+          path: results/specialist
+          github-token: ${{ github.token }}
+          run-id: 45640796971
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-meta-trained
+          path: results/meta
+          github-token: ${{ github.token }}
+          run-id: 45659800298
+      - uses: actions/download-artifact@v4
+        with:
+          name: incident-local-models
+          path: results/local
+          github-token: ${{ github.token }}
+          run-id: 45440533210
+      - run: python -m py_compile ss7/weak_signal_confirmation.py
+      - name: Check observed endpoint coverage and missing reports
+        run: |
+          python - <<'PY'
+          from types import SimpleNamespace as S
+          import numpy as np
+          from ss7.weak_signal_confirmation import PartialRoute,RouteProxy,ROUTE,R,TRAIN,DEV,CONF
+          def route(a,b):
+              return S(paths=[(a,2,b)] if (a,b) in ((1,3),(1,4)) else [(a,b)],shares=[1.])
+          topo=S(nodes={n:None for n in (1,2,3,4)},route=route)
+          def rep(dest,transit):
+              return S(state=S(dest=dest,transited=transit))
+          reps={1:rep({3:8,4:5},0),2:rep({},9),3:rep({1:10},0)}
+          old=RouteProxy(topo).features(reps)
+          assert all(np.isnan(v) for x in old.values() for v in x.values())
+          x=PartialRoute(topo).features(reps)
+          assert np.isclose(x[2]["partial_expected_log"],np.log1p(9))
+          assert x[2]["partial_transit_res"]==0.
+          assert np.isclose(x[2]["partial_path_coverage"],.5)
+          assert np.isclose(x[2]["partial_pair_coverage"],.5)
+          assert np.isnan(x[1]["partial_transit_res"])
+          assert set(x[2])==set(R)
+          assert len(set(TRAIN+DEV+CONF))==len(TRAIN+DEV+CONF)
+          assert not set(TRAIN+DEV+CONF)&{s+j for s in DEV+CONF for j in (10000,20000,40000)}
+          print("Observed endpoint coverage and disjoint partitions passed")
+          PY
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed_${{ matrix.seed }}
+          python -u -m ss7.weak_signal_confirmation test --seed ${{ matrix.seed }} --local results/local/local_models.joblib --frozen results/frozen/models.joblib --special results/specialist/specialist.joblib --meta results/meta/meta.joblib --output results/seed_${{ matrix.seed }} 2>&1 | tee results/seed_${{ matrix.seed }}/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: confirm-weak-seed-${{ matrix.seed }}
+          path: results/seed_${{ matrix.seed }}
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: confirm-weak-seed-*
+          path: results/collected
+      - run: python -m ss7.weak_signal_confirmation aggregate --stage confirm --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-weak-confirm-summary
+          path: results/summary
