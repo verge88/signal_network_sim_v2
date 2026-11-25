@@ -1,0 +1,65 @@
+name: SIP TICD predictive censored likelihood and policy evidence
+on:
+  push:
+    branches: [study/ticd-predictive-likelihood]
+    paths:
+      - 'sip/ticd_predictive_likelihood.py'
+      - 'experiments/evaluate_ticd_predictive_likelihood.py'
+      - '.github/workflows/sip-ticd-predictive-likelihood.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+      PYTHONHASHSEED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install and compile
+        run: |
+          set -euo pipefail
+          python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+          python -m compileall -q sip/ticd_predictive_likelihood.py experiments/evaluate_ticd_predictive_likelihood.py
+          python -m pip freeze > predictive_environment.txt
+      - name: Recover frozen comparators
+        run: |
+          set -euo pipefail
+          gh run download 45626804800 --repo "${{ github.repository }}" --name sip-ticd-joint-channel --dir prior
+          p="$(find prior -type f -name joint_channel_models.pkl -print -quit)"
+          test -n "$p"
+          echo "PRIOR_DIR=$(dirname "$p")" >> "$GITHUB_ENV"
+      - name: Calibrate and independently evaluate
+        run: python -m experiments.evaluate_ticd_predictive_likelihood --prior "$PRIOR_DIR" --out results_predictive
+      - name: Verify experiment integrity
+        run: |
+          python - <<'PY'
+          import json
+          d=json.load(open('results_predictive/predictive_report.json'))
+          assert not d['test_used_for_selection'] and not d['real_field_validation']
+          assert all(d[k] for k in ('censor_likelihood_normalization_verified','ack_not_used_in_transport_posterior','prefix_causality','oracle_removal_verified','observational_equivalence_verified','reload_verified'))
+          seeds=[s for k in ('scale_seeds','validation_seeds','development_seeds','test_seeds') for ss in d[k].values() for s in ss]
+          assert len(seeds)==len(set(seeds))
+          assert len(d['heldout'])==40 and len(d['summary'])==11 and len(d['paired'])==24
+          assert len(d['selection'])==114 and all(len(v)==10 for v in d['test_seeds'].values())
+          print('PRED_AUDIT_VERIFIED',d['operational_gates'])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-ticd-predictive-likelihood
+          path: |
+            results_predictive/
+            predictive_environment.txt
+          if-no-files-found: warn
+          retention-days: 30
