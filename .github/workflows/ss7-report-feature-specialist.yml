@@ -1,0 +1,123 @@
+name: SS7 report feature specialist
+on:
+  push:
+    branches: [ss7-report-feature-specialist]
+    paths: [.github/workflows/ss7-report-feature-specialist.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-report-feature-specialist-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/report_feature_specialist.py
+      - name: Check report-only features and temporal causality
+        run: |
+          python - <<'PY'
+          from types import SimpleNamespace as S
+          import numpy as np
+          import pandas as pd
+          from ss7.report_feature_specialist import directional,add_history,DIRECTION,PEER,TRAIN,TEST
+          k=(1,2); l=(2,3)
+          def rep(out,inc):
+              return S(state=S(link_out=out,link_in=inc))
+          reps={1:rep({k:8},{k:5}),2:rep({k:5,l:10},{k:10,l:5}),3:rep({l:5},{l:10})}
+          topo=S(linksets={k:None,l:None})
+          f=directional(reps,topo)
+          assert np.isclose(f[1]["dir_out_res"],-4/18)
+          assert np.isclose(f[2]["dir_in_res"],4/18)
+          assert np.isclose(f[1]["peer_other_mean"],0)
+          assert f[1]["peer_excess"]>0
+          assert all(set(x)==set(DIRECTION+PEER) for x in f.values())
+          d=pd.DataFrame(dict(nid=[1,1,1,2],t=[0,1,3,0],**{k:[1.,2.,7.,9.] for k in DIRECTION+PEER}))
+          a=add_history(d)
+          assert np.allclose(a[DIRECTION[0]+"__delta1"],[np.nan,1.,np.nan,np.nan],equal_nan=True)
+          for i in range(1,len(d)+1):
+              pd.testing.assert_frame_equal(add_history(d.iloc[:i]),a.iloc[:i])
+          assert not set(TRAIN)&set(TEST)
+          assert not set(TRAIN)&{s+j for s in TEST for j in (10000,20000,40000)}
+          print("Report-only direction, adjacency, time-gap and prefix checks passed")
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - run: python -u -m ss7.report_feature_specialist train --frozen results/frozen/models.joblib --output results/trained
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-specialist-trained
+          path: results/trained
+  test:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        seed: [9301,9302,9303,9304,9305,9306,9307,9308]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-specialist-trained
+          path: results/trained
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - uses: actions/download-artifact@v4
+        with:
+          name: incident-local-models
+          path: results/local
+          github-token: ${{ github.token }}
+          run-id: 45440533210
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed_${{ matrix.seed }}
+          python -u -m ss7.report_feature_specialist test --seed ${{ matrix.seed }} --local results/local/local_models.joblib --frozen results/frozen/models.joblib --models results/trained/specialist.joblib --output results/seed_${{ matrix.seed }} 2>&1 | tee results/seed_${{ matrix.seed }}/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: specialist-seed-${{ matrix.seed }}
+          path: results/seed_${{ matrix.seed }}
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: specialist-seed-*
+          path: results/collected
+      - run: python -m ss7.report_feature_specialist aggregate --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-report-feature-specialist-summary
+          path: results/summary
