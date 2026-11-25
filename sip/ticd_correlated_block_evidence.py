@@ -13,7 +13,7 @@ from ticd_full_count_evidence import CountReference
 from ticd_sequential_physical import signed,KEYS
 
 WINDOWS=(16,32,48)
-SCORE_COLS=tuple(f"block_{kind}_{w}" for kind in ("plain","context","supported") for w in WINDOWS)
+SCORE_COLS=tuple(f"block_{kind}_{w}" for kind in ("plain","context","supported","plain_supported") for w in WINDOWS)
 
 def inputs(ref,x):
     z,n,e,reliability,good,p=signed(ref,x)
@@ -109,9 +109,9 @@ def block_features(x,commission,reference):
                     # adjacent non-overlapping blocks; no future data.
                     pooled=max(0.,max(sum(parts[:j])/np.sqrt(j) for j in range(1,len(parts)+1)))
                     scores[f"block_{kind}_{width}"][i]=pooled
-                    if kind=="context":
-                        support=max(0.,float(np.median(parts))) if len(parts)==3 else 0.
-                        scores[f"block_supported_{width}"][i]=.4*pooled+.6*min(pooled,support)
+                    support=max(0.,float(np.median(parts))) if len(parts)==3 else 0.
+                    skind="supported" if kind=="context" else "plain_supported"
+                    scores[f"block_{skind}_{width}"][i]=.4*pooled+.6*min(pooled,support)
     for name,values in scores.items():
         out[name]=0.
         out.loc[z.index,name]=values

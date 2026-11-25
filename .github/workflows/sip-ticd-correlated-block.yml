@@ -3,8 +3,8 @@ on:
   push:
     branches: [study/ticd-correlated-block-evidence]
     paths:
-      - 'sip/ticd_correlated_block.py'
-      - 'experiments/evaluate_ticd_correlated_block.py'
+      - 'sip/ticd_correlated_block_evidence.py'
+      - 'experiments/evaluate_ticd_correlated_block_evidence.py'
       - '.github/workflows/sip-ticd-correlated-block.yml'
   workflow_dispatch:
 permissions:
@@ -30,7 +30,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
-          python -m compileall -q sip/ticd_correlated_block.py experiments/evaluate_ticd_correlated_block.py
+          python -m compileall -q sip/ticd_correlated_block_evidence.py experiments/evaluate_ticd_correlated_block_evidence.py
           python -m pip freeze > sequential_environment.txt
       - name: Recover frozen comparator
         run: |
@@ -40,7 +40,7 @@ jobs:
           test -n "$p"
           echo "PRIOR_DIR=$(dirname "$p")" >> "$GITHUB_ENV"
       - name: Calibrate, select and independently evaluate
-        run: python -m experiments.evaluate_ticd_correlated_block --prior "$PRIOR_DIR" --out results_correlated_block
+        run: python -m experiments.evaluate_ticd_correlated_block_evidence --prior "$PRIOR_DIR" --out results_correlated_block
       - name: Verify experiment integrity
         run: |
           python - <<'PY'
@@ -50,7 +50,7 @@ jobs:
           assert all(d[k] for k in ('prefix_causality','label_and_batch_invariance','oracle_removal_verified','reload_verified','observational_equivalence_verified','all_original_invariants_preserved','frozen_feature_references'))
           seeds=[s for k in ('validation_seeds','development_seeds','test_seeds') for ss in d[k].values() for s in ss]
           assert len(seeds)==len(set(seeds))
-          assert len(d['heldout'])==40 and len(d['summary'])==10 and len(d['paired'])==18
+          assert len(d['heldout'])==40 and len(d['summary'])==11 and len(d['paired'])==21
           assert all(len(v)==5 for v in d['test_seeds'].values())
           print('BLOCK_AUDIT_VERIFIED', 'operational_gate_pass=',d['operational_gate_pass'])
           PY

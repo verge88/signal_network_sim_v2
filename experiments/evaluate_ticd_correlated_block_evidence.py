@@ -71,16 +71,17 @@ def main():
     chosen=max((n for n in candidates if n.startswith("block_supported_") or n.startswith("block_context_")),
         key=lambda n:(selection[n]["feasible"],selection[n]["utility"]))
     mtag=chosen.split("_")[-2][1:]
-    ablation=chosen.replace("block_supported_","block_plain_").replace("block_context_","block_plain_")
+    ablation=chosen.replace("block_supported_","block_plain_supported_").replace("block_context_","block_plain_")
+    no_support=chosen.replace("block_supported_","block_context_")
     control="control_"+mtag
     models={**{"frozen_"+k:v for k,v in frozen.items()},
             "frozen_sequential":old,"recalibrated":candidates[control],"proposed":candidates[chosen],
-            "no_context_correction":candidates[ablation]}
+            "no_context_correction":candidates[ablation],"no_block_confirmation":candidates[no_support]}
     print("BLOCK_SELECTED",json.dumps({"chosen":chosen,"ablation":ablation,"control":control,"development":selection}),flush=True)
     # Causal feature and score checks: truncate full operational prefix,
     # remove oracle / derived statistics / labels, compare equivalent worlds.
     raw,_,_,c=group([370001],cal,"clean_loss10",causal)
-    latent,_,_,lc=group([330001],cal,"latent_identical",causal)
+    latent,_,_,lc=group([370001],cal,"latent_identical",causal)
     x=prepare(raw,c,"adaptive_fast")
     l=prepare(latent,lc,"adaptive_fast")
     pd.testing.assert_frame_equal(x,l)
@@ -92,7 +93,7 @@ def main():
     bad += [col for col in raw if col.startswith("gt_") or col in ("is_anomaly","attack_type","attacker_sophistication","normal_event","is_compromised","eval_active_deficit")]
     stripped=prepare(raw.drop(columns=bad,errors="ignore"),c.drop(columns=bad,errors="ignore"),"adaptive_fast")
     pd.testing.assert_frame_equal(x,stripped)
-    for name in ("proposed","no_context_correction","recalibrated"):
+    for name in ("proposed","no_context_correction","no_block_confirmation","recalibrated"):
         m=models[name];z=m.predict_levels(x);sample=x.sample(n=200,random_state=42)
         assert np.array_equal(z,m.predict_levels(l))
         assert np.array_equal(z[sample.index.to_numpy()],m.predict_levels(sample))
@@ -108,7 +109,7 @@ def main():
         for mode in MODES:
             xx=labels(prepare(raw,c,mode),raw)
             names=["frozen_"+mode]
-            if mode=="adaptive_fast":names+=["frozen_sequential","recalibrated","proposed","no_context_correction"]
+            if mode=="adaptive_fast":names+=["frozen_sequential","recalibrated","proposed","no_context_correction","no_block_confirmation"]
             for name in names:
                 held[k][name],per[k][name]=pair_metrics(models[name],xx,False)
         print("BLOCK_HELDOUT",json.dumps({"cohort":k,**{n:short(v) for n,v in held[k].items()}}),flush=True)
@@ -123,7 +124,7 @@ def main():
           "native_recall":float(np.mean([held[k][name]["confirmed_recall"] for k in NATIVE]))}
         print("BLOCK_SUMMARY",json.dumps({"model":name,**summary[name]}),flush=True)
     paired={}
-    for other in ("frozen_adaptive_fast","frozen_sequential","recalibrated","no_context_correction","frozen_oracle","frozen_hybrid"):
+    for other in ("frozen_adaptive_fast","frozen_sequential","recalibrated","no_context_correction","no_block_confirmation","frozen_oracle","frozen_hybrid"):
         for label,ks,metric in (("native",NATIVE,"confirmed_recall"),("weak",WEAK,"confirmed_recall"),("FPR",KINDS,"confirmed_alert_FPR")):
             ds=[np.array([u[metric]-v[metric] for u,v in zip(per[k]["proposed"],per[k][other])]) for k in ks]
             d=np.concatenate(ds);rng=np.random.default_rng(61319)
@@ -135,7 +136,7 @@ def main():
         prev=max(prev,min(1.,(len(paired)-i)*v["p_unadjusted"]));v["p_holm"]=prev
     report={"source_run":45598072369,"frozen_feature_references":True,"real_field_validation":False,
         "test_used_for_selection":False,"validation_seeds":VAL,"development_seeds":DEV,"test_seeds":TEST,
-        "selected":chosen,"ablation":ablation,"selection":selection,"manifests":{n:m.manifest() for n,m in models.items()},
+        "selected":chosen,"ablation":ablation,"no_block_confirmation":no_support,"selection":selection,"manifests":{n:m.manifest() for n,m in models.items()},
         "development":dev,"development_by_seed":dp,"heldout":held,"per_seed":per,"summary":summary,"paired":paired,
         "prefix_causality":True,"label_and_batch_invariance":True,"oracle_removal_verified":True,"reload_verified":True,
         "scenario_units":{"weak_0025":0.0025,"weak_005":0.005,"weak_01":0.01,"role_loss_suffix":"multiplier of baseline link loss, not percent"},"primary_only":True,"all_original_invariants_preserved":True,"observational_equivalence_verified":True,
