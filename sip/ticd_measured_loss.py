@@ -15,7 +15,8 @@ from ticd_commissioned_reference import CommissionedReference
 from ticd_independent_loss import IndependentLossReference,LossFusionTICD,WINDOWS
 from ticd_observability_factorial import prepare_policy_history,PolicyEvidence
 
-MODES=("oracle","cu","active","passive","hybrid")
+from ticd_loss_state_filter import estimate,SETTINGS
+MODES=("oracle","cu","active","passive","hybrid",*SETTINGS)
 # Exact allowed primitive observations. No simulator loss, calculated delay,
 # ground truth, precomputed loss-dependent statistics or attack labels here.
 RAW=("simulation_seed","node_id","node_type","interval","zone_id","primary_observer_valid",
@@ -76,6 +77,9 @@ def measured_frame(df,mode,commission=False):
         p=np.where(av,pa,pc);v=np.where(av,va,vc);available=av
     elif mode=="passive":
         p=np.where(pv,pp,pc);v=np.where(pv,vp,vc);available=pv
+    elif mode in SETTINGS:
+        p,v,available,wa,wp,held=estimate(x,pc,vc,mode)
+        x["state_active_gain"]=wa;x["state_passive_gain"]=wp;x["state_missing_age"]=held
     else:
         # Conservative combination; do not assume passive/probe independence.
         wa=np.where(av,.7,0.);wp=np.where(pv,.3,0.);den=wa+wp
@@ -202,7 +206,8 @@ class FullMeasuredReference:
         return {"mode":self.mode,"full_refit":True,"oracle_only":self.mode=="oracle",
                 "core":self.core.manifest(),"all_original_invariants_preserved":True,
                 "raw_observation_columns":RAW,"inactive_old_context_removed":True,
-                "fallback":"causal CU delivery frequency","measurement_variance_used":True}
+                "fallback":"bounded state prediction and CU pull" if self.mode in SETTINGS else "causal CU delivery frequency","measurement_variance_used":True,
+                "state_filter_settings":SETTINGS.get(self.mode)}
 
 class MeasuredFusion(LossFusionTICD):
     def __init__(self,mode,window,budgets,calibration_mode):
@@ -212,5 +217,5 @@ class MeasuredFusion(LossFusionTICD):
     def manifest(self):
         d=super().manifest()
         d.update({"observation_mode":self.observation_mode,"loss_source":self.observation_mode,"oracle_only":self.observation_mode=="oracle",
-                  "synthetic_measurement":self.observation_mode in ("active","passive","hybrid")})
+                  "synthetic_measurement":self.observation_mode in ("active","passive","hybrid",*SETTINGS)})
         return d
