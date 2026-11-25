@@ -29,9 +29,16 @@ def report_votes(frame, normalize=False, ratio_resolution=.001):
     rounding = .5 * len(RATIOS) * ratio_resolution + 1e-12
     bad_total = np.abs(total - 1) > max(.012, rounding)
     bad_dominance = disagreement > .07 * remainder + max(.005, rounding) * (1 + np.abs(dominance))
+    # The INVITE/ACK ratio and the two method shares have the same report window.
+    # This identity survives renormalization of the entire histogram.
+    invite_ack = frame.obs_invite_ack_ratio.to_numpy()
+    ack = np.maximum(.001, share[:, METHODS.index("ack")])
+    pair_error = np.abs(share[:, METHODS.index("invite")] - invite_ack * ack)
+    single_rounding = .5 * ratio_resolution + 1e-6
+    bad_pair = pair_error > .060 * ack + single_rounding * (1 + np.abs(invite_ack))
     valid = frame.primary_observer_valid & frame.cu_delivered.astype(bool)
     finite = np.isfinite(share).all(axis=1) & np.isfinite(dominance)
-    return (bad_total | bad_dominance) & valid.to_numpy() & finite
+    return (bad_total | bad_dominance | (bad_pair & np.isfinite(invite_ack))) & valid.to_numpy() & finite
 
 
 def extra_evidence(raw, normalize=False, ratio_resolution=.001):
@@ -56,9 +63,13 @@ def extra_evidence(raw, normalize=False, ratio_resolution=.001):
     k = x.audit_mismatch_count
     if not (np.isfinite(n) & np.isfinite(k) & n.ge(k) & k.ge(0)).all():
         raise ValueError("invalid policy audit counts")
-    audit_segment = (gap | n.eq(0)).groupby(groups, sort=False).cumsum()
+    # A missed poll adds zero information; the finite windows expire stale evidence.
+    # An actual gap in the input timeline still starts a new audit segment.
+    audit_keys = groups + [gap.groupby(groups, sort=False).cumsum()]
     log_lr = k * np.log(.045 / .013) + (n - k) * np.log(.955 / .987)
-    audit = n.gt(0) & rolling(log_lr, groups + [audit_segment], 16).gt(9)
+    short = rolling(log_lr, audit_keys, 16)
+    long = rolling(log_lr, audit_keys, 32)
+    audit = n.gt(0) & (short.gt(9) | long.gt(12))
     return pd.DataFrame({"report": report, "audit": audit}).reindex(raw.index)
 
 

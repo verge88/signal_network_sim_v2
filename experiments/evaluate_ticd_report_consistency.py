@@ -15,7 +15,7 @@ from evaluate_ticd_full_count_evidence import POLICY
 from ticd_measured_loss import RAW
 from ticd_report_consistency import ReportConsistencyTICD, RATIOS, extra_evidence
 
-COLUMNS = list(dict.fromkeys([*RAW, *RATIOS, "obs_method_dominance_ratio",
+COLUMNS = list(dict.fromkeys([*RAW, *RATIOS, "obs_method_dominance_ratio", "obs_invite_ack_ratio",
                              "audit_observed_count", "audit_mismatch_count"]))
 MODELS = ("block", "block_report", "full", "normalized", "coherent", "rounded_2dp")
 REPLICATES = 10
@@ -35,7 +35,7 @@ def evaluate(package, shard, out):
     model = ReportConsistencyTICD(ref, prior["models"]["frozen_block"])
     rows = []
     for i, kind in enumerate(KINDS):
-        seed = 620001 + i * 100 + shard
+        seed = 640001 + i * 100 + shard
         raw, _, _, commissioning = group([seed], prior["calibration"], kind, ref.core.causal)
         obs = raw[COLUMNS]
         commissioning = commissioning[list(RAW)]
@@ -52,6 +52,7 @@ def evaluate(package, shard, out):
         coherent[RATIOS] = shares
         high = shares.max(axis=1)
         coherent["obs_method_dominance_ratio"] = high / (shares.sum(axis=1) - high).clip(lower=.001)
+        coherent["obs_invite_ack_ratio"] = shares.obs_ratio_invite / shares.obs_ratio_ack.clip(lower=.001)
         consistent = extra_evidence(coherent)
         assert not consistent.report.any()
         levels = {"block": base, "block_report": np.where(evidence.report, 2, base),
