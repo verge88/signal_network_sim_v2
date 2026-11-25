@@ -1,0 +1,88 @@
+name: SS7 operational calibration development
+on:
+  push:
+    branches: [ss7-operational-calibration-development]
+    paths: [.github/workflows/ss7-operational-calibration-development.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-operational-calibration-development-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        seed: [8901,8902,8903,8904,8905,8906,8907,8908]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/operational_calibration_development.py
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - uses: actions/download-artifact@v4
+        with:
+          name: incident-local-models
+          path: results/local
+          github-token: ${{ github.token }}
+          run-id: 45440533210
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed_${{ matrix.seed }}
+          python -u -m ss7.operational_calibration_development test --seed ${{ matrix.seed }} --local results/local/local_models.joblib --frozen results/frozen/models.joblib --output results/seed_${{ matrix.seed }} 2>&1 | tee results/seed_${{ matrix.seed }}/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operational-seed-${{ matrix.seed }}
+          path: results/seed_${{ matrix.seed }}
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - name: Check fusion and reference calibration
+        run: |
+          python - <<'PY'
+          import numpy as np
+          import pandas as pd
+          from ss7.operational_calibration_development import fuse, reference_cutoff
+          from ss7.incident_calibration_study import triple
+          a=np.array([.1,.5,.9])
+          assert np.allclose(fuse(a,a),a)
+          assert np.allclose(fuse(a,1-a),.5)
+          assert np.isfinite(fuse(np.array([0.,1.]),np.array([1.,0.]))).all()
+          d=pd.DataFrame(dict(nid=[1]*6,t=list(range(6)),label=[0,0,0,1,1,1]))
+          s=np.array([.1,.2,.3,.9,.99,.95])
+          cutoff=reference_cutoff(d,s,triple(d,s))
+          assert cutoff==.3
+          print("Fusion and calibration checks passed")
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: operational-seed-*
+          path: results/collected
+      - run: python -m ss7.operational_calibration_development aggregate --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-operational-calibration-development-summary
+          path: results/summary
