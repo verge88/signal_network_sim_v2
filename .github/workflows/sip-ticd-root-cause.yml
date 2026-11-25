@@ -1,0 +1,59 @@
+name: SIP TICD frozen-model root cause diagnostics
+on:
+  push:
+    branches: [study/ticd-root-cause-diagnostics]
+    paths:
+      - 'experiments/diagnose_ticd_root_causes.py'
+      - '.github/workflows/sip-ticd-root-cause.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+      PYTHONHASHSEED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install and compile
+        run: |
+          set -euo pipefail
+          python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+          python -m compileall -q experiments/diagnose_ticd_root_causes.py
+      - name: Recover exact frozen models and per-seed report
+        run: |
+          set -euo pipefail
+          gh run download 45626804800 --repo "${{ github.repository }}" --name sip-ticd-joint-channel --dir prior
+          p="$(find prior -type f -name joint_channel_models.pkl -print -quit)"
+          test -n "$p"
+          echo "PRIOR_DIR=$(dirname "$p")" >> "$GITHUB_ENV"
+          test -f "$(dirname "$p")/joint_channel_report.json"
+      - name: Diagnose frozen model and paired sensor counterfactuals
+        run: python -m experiments.diagnose_ticd_root_causes --prior "$PRIOR_DIR" --out results_root_cause
+      - name: Verify diagnosis
+        run: |
+          python - <<'PY'
+          import json
+          d=json.load(open('results_root_cause/root_cause_report.json'))
+          assert d['no_training_or_threshold_changes'] and d['oracle_controls_diagnostic_only']
+          assert len(d['original_violations'])==3
+          assert len(d['sensor_pairs'])==10 and all(v['physical_rows_identical'] for v in d['sensor_pairs'].values())
+          print('DIAG_AUDIT_VERIFIED')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-ticd-root-cause
+          path: results_root_cause/
+          if-no-files-found: warn
+          retention-days: 30
