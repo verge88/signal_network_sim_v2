@@ -2116,6 +2116,7 @@ def main(config=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=TrainingConfig.seed)
     parser.add_argument("--train-data", default=TrainingConfig.data_path)
     parser.add_argument("--validation-data")
     parser.add_argument("--stack-data")
@@ -2124,7 +2125,7 @@ if __name__ == "__main__":
     parser.add_argument("--results-dir", default=TrainingConfig.results_dir)
     args = parser.parse_args()
     main(TrainingConfig(
-        data_path=args.train_data, validation_path=args.validation_data,
+        seed=args.seed, data_path=args.train_data, validation_path=args.validation_data,
         stack_path=args.stack_data, test_path=args.test_data[0] if args.test_data else None,
         additional_test_paths=tuple(args.test_data[1:]) if args.test_data else (),
         results_dir=args.results_dir, compare_tree_reference=args.compare_tree_reference,
