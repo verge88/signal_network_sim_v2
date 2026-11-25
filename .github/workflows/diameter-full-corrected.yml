@@ -18,6 +18,7 @@ concurrency:
 
 jobs:
   full-experiment:
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[recover]')
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -66,6 +67,101 @@ jobs:
             --train-data fixed-42.csv.gz --validation-data fixed-43.csv.gz \
             --stack-data fixed-48.csv.gz --test-data fixed-49.csv.gz fixed-50.csv.gz \
             --results-dir results_full
+      - name: Check results and print the main metrics
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          from diameter.diameter_training_v1 import FEATURE_GROUPS
+          from diameter.diameter_generate_plots import MAIN_MODELS
+          rows = pd.read_csv("results_full/full_comparison_diameter.csv")
+          expected = set(MAIN_MODELS) | {
+              *("Ens:" + name for name in FEATURE_GROUPS),
+              "Ens:ensemble_max", "Ens:ensemble_mean",
+              "Cascade-S1", "RF (no MS)", "RF (no temporal)",
+          }
+          assert len(rows) == len(expected) and set(rows["name"]) == expected
+          grouped = pd.read_csv("results_full/metrics_by_simulation.csv")
+          assert set(grouped["simulation"]) == {"fixed-49", "fixed-50"}
+          assert all(set(group["name"]) == expected and len(group) == len(expected)
+                     for _, group in grouped.groupby("simulation"))
+          recall = pd.read_csv("results_full/recall_by_simulation_and_attack.csv")
+          assert len(recall) == 2 * len(expected) * 5
+          print(rows.to_string(index=False))
+          print(grouped[grouped["name"].isin(MAIN_MODELS)].to_string(index=False))
+          print(recall[recall["name"].isin(MAIN_MODELS) &
+                       recall["attack_type"].isin(["node_compromise", "signaling_dos"])].to_string(index=False))
+          PY
+      - name: Build publication plots with the Diameter generator
+        run: |
+          python diameter/diameter_generate_plots.py \
+            --results-dir results_full --calibration-verification results_full/calibration_verification.json
+          test -s results_full/publication_plots/17_metrics_by_simulation.png
+          test -s results_full/publication_plots/17_metrics_by_simulation.svg
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diameter-full-corrected-results
+          path: |
+            results_full/publication_plots/
+            results_full/*.csv
+            results_full/*.json
+            results_full/input_sha256.txt
+            results_full/sim-*.log
+          if-no-files-found: warn
+
+  recover-export:
+    if: github.event_name == 'push' && contains(github.event.head_commit.message, '[recover]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+      OPENBLAS_NUM_THREADS: "4"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install CPU dependencies and verify the report lifecycle
+        run: |
+          python -m pip install numpy pandas scipy networkx scikit-learn matplotlib
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m py_compile diameter/diameter_{sim_v1,training_v1,generate_plots,report_recurrence}.py
+          python -m unittest discover -s tests -p test_diameter_report_recurrence.py -v
+      - name: Retrieve the frozen simulator calibration profile
+        uses: actions/download-artifact@v4
+        with:
+          name: diameter-calibrated-full-experiment
+          path: archived
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 45449352344
+      - name: Retrieve completed model scores and metrics
+        uses: actions/download-artifact@v4
+        with:
+          name: diameter-full-corrected-results
+          path: results_full
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 45573380953
+      - name: Generate five corrected simulations
+        env:
+          DIAMETER_CALIBRATION_PROFILE: archived/results_diameter_calibration/calibration_profile.json
+        run: |
+          set -euo pipefail
+          mkdir -p results_full
+          test -s "$DIAMETER_CALIBRATION_PROFILE"
+          pids=()
+          for seed in 42 43 48 49 50; do
+            python -u diameter/diameter_sim_v1.py --seed "$seed" --out "fixed-${seed}.csv.gz" > "recovery-${seed}.log" &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do wait "$pid"; done
+      - name: Recover the three missing ablation rows
+        run: |
+          python -u diameter/diameter_recover_ablation.py \
+            --train fixed-42.csv.gz --validation fixed-43.csv.gz --stack fixed-48.csv.gz \
+            --test fixed-49.csv.gz fixed-50.csv.gz --results results_full
       - name: Check results and print the main metrics
         run: |
           python - <<'PY'

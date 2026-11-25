@@ -1365,6 +1365,76 @@ def set_global_seed(seed: int) -> None:
         torch.use_deterministic_algorithms(True)
 
 
+METRIC_TABLES = (
+    "full_comparison_diameter.csv", "metrics_by_simulation.csv",
+    "recall_by_simulation_and_attack.csv",
+)
+
+
+def evaluate_ablation_variants(config, pipeline, train, validation, test, attack_types,
+                               stage1=None):
+    """Evaluate the three ablations using the same validation FPR budget."""
+    X_train, y_train = train
+    X_val, y_val = validation
+    X_test, y_test = test
+    template = CascadeCompromiseDetector(config, config.seed).stage1_rf
+    if stage1 is None:
+        stage1 = template.fit(X_train, y_train)
+
+    variants = []
+    for name, block in (("RF (no MS)", MS_FEATURES),
+                        ("RF (no temporal)", DataPipeline.TEMPORAL_FEATURES)):
+        features = [i for i, name in enumerate(pipeline.feature_cols) if name not in block]
+        model = clone(template).set_params(n_estimators=config.rf_trees)
+        model.fit(X_train[:, features], y_train)
+        threshold, _ = select_supervised_threshold(
+            model.predict_proba(X_val[:, features])[:, 1], y_val, config.supervised_max_fpr)
+        variants.append(evaluate_model(
+            name, model.predict_proba(X_test[:, features])[:, 1], y_test,
+            attack_types, threshold=threshold))
+    threshold, _ = select_supervised_threshold(
+        stage1.predict_proba(X_val)[:, 1], y_val, config.supervised_max_fpr)
+    variants.append(evaluate_model(
+        "Cascade-S1", stage1.predict_proba(X_test)[:, 1], y_test,
+        attack_types, threshold=threshold))
+    return variants
+
+
+def collect_metric_tables(results_list, test_df, y_test, attack_types_test, sequences=None):
+    save_cols = ['name', 'auc_roc', 'auc_pr', 'f1', 'fpr',
+                 'tp', 'fp', 'fn', 'tn']
+    res_df = pd.DataFrame([{k: r[k] for k in save_cols}
+                           for r in results_list])
+    test_runs = test_df["_test_simulation"].to_numpy()
+    metrics_rows, attack_rows = [], []
+    for result in results_list:
+        if "y_true" in result:
+            runs, labels, attacks = sequences
+        else:
+            runs, labels, attacks = test_runs, y_test, attack_types_test
+        for run in pd.unique(runs):
+            mask = runs == run
+            scores, pred = result["scores"][mask], result["y_pred"][mask]
+            y = labels[mask]
+            tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
+            metrics_rows.append({
+                "simulation": run, "name": result["name"], "windows": len(y),
+                "auc_roc": roc_auc_score(y, scores) if len(np.unique(y)) > 1 else 0.0,
+                "auc_pr": average_precision_score(y, scores) if len(np.unique(y)) > 1 else 0.0,
+                "f1": f1_score(y, pred, zero_division=0),
+                "fpr": fp / (fp + tn) if fp + tn else 0.0,
+                "tp": tp, "fp": fp, "fn": fn, "tn": tn, "threshold": result["threshold"],
+            })
+            for attack in sorted(set(attacks[mask]) - {"none"}):
+                attack_mask = attacks[mask] == attack
+                hits = int(pred[attack_mask].sum())
+                count = int(attack_mask.sum())
+                attack_rows.append({"simulation": run, "name": result["name"],
+                                    "attack_type": attack, "detected": hits,
+                                    "windows": count, "recall": hits / count})
+    return res_df, pd.DataFrame(metrics_rows), pd.DataFrame(attack_rows)
+
+
 def main(config=None):
     config = config or TrainingConfig()
     set_global_seed(config.seed)
@@ -1733,70 +1803,20 @@ def main(config=None):
         'compromise_rate': 100 * comp_full / max(1, comp_total),
     })
 
-    # Without MS features
-    non_ms = [c for c in pipeline.feature_cols if c not in MS_FEATURES]
-    non_ms_idx = [pipeline.feature_cols.index(c) for c in non_ms]
-    rf_no_ms = RandomForestClassifier(
-        n_estimators=config.rf_trees, random_state=config.seed,
-        class_weight="balanced_subsample", n_jobs=-1,
-        max_depth=config.rf_max_depth,
-        min_samples_leaf=config.rf_min_samples_leaf,
-        min_samples_split=config.rf_min_samples_split,
-        max_features=config.rf_max_features,
-        bootstrap=True, max_samples=config.rf_max_samples)
-    rf_no_ms.fit(X_train[:, non_ms_idx], y_train)
-    rf_no_ms_v = rf_no_ms.predict_proba(X_val[:, non_ms_idx])[:, 1]
-    rf_no_ms_p = rf_no_ms.predict_proba(X_test[:, non_ms_idx])[:, 1]
-    th_no_ms, _ = select_supervised_threshold(
-        rf_no_ms_v, y_val, config.supervised_max_fpr)
-    r_no_ms = evaluate_model("RF (no MS)", rf_no_ms_p, y_test,
-                             attack_types_test, threshold=th_no_ms)
-    comp_no_ms = (rf_no_ms_p[comp_mask] >= th_no_ms).sum()
-    ablation.append({
-        'config': f'No MS\n({len(non_ms)} feat)',
-        'f1': r_no_ms['f1'],
-        'compromise_rate': 100 * comp_no_ms / max(1, comp_total),
-    })
-
-    # Without temporal
     temporal = DataPipeline.TEMPORAL_FEATURES
-    non_temp = [c for c in pipeline.feature_cols if c not in temporal]
-    non_temp_idx = [pipeline.feature_cols.index(c) for c in non_temp]
-    rf_no_temp = RandomForestClassifier(
-        n_estimators=config.rf_trees, random_state=config.seed,
-        class_weight="balanced_subsample", n_jobs=-1,
-        max_depth=config.rf_max_depth,
-        min_samples_leaf=config.rf_min_samples_leaf,
-        min_samples_split=config.rf_min_samples_split,
-        max_features=config.rf_max_features,
-        bootstrap=True, max_samples=config.rf_max_samples)
-    rf_no_temp.fit(X_train[:, non_temp_idx], y_train)
-    rf_no_temp_v = rf_no_temp.predict_proba(X_val[:, non_temp_idx])[:, 1]
-    rf_no_temp_p = rf_no_temp.predict_proba(X_test[:, non_temp_idx])[:, 1]
-    th_no_temp, _ = select_supervised_threshold(
-        rf_no_temp_v, y_val, config.supervised_max_fpr)
-    r_no_temp = evaluate_model("RF (no temporal)", rf_no_temp_p, y_test,
-                               attack_types_test, threshold=th_no_temp)
-    comp_no_temp = (rf_no_temp_p[comp_mask] >= th_no_temp).sum()
-    ablation.append({
-        'config': f'No temporal\n({len(non_temp)} feat)',
-        'f1': r_no_temp['f1'],
-        'compromise_rate': 100 * comp_no_temp / max(1, comp_total),
-    })
-
-    # Cascade stage 1 only
-    s1_val_scores = cascade.predict_proba_stage1(X_val)
-    s1_scores = cascade.predict_proba_stage1(X_test)
-    th_s1, _ = select_supervised_threshold(
-        s1_val_scores, y_val, config.supervised_max_fpr)
-    r_s1 = evaluate_model("Cascade-S1", s1_scores, y_test,
-                          attack_types_test, threshold=th_s1)
-    comp_s1 = (s1_scores[comp_mask] >= th_s1).sum()
-    ablation.append({
-        'config': 'Cascade\nStage-1 only',
-        'f1': r_s1['f1'],
-        'compromise_rate': 100 * comp_s1 / max(1, comp_total),
-    })
+    variants = evaluate_ablation_variants(
+        config, pipeline, (X_train, y_train), (X_val, y_val), (X_test, y_test),
+        attack_types_test, stage1=cascade.stage1_rf)
+    for result, label in zip(variants, (
+        f"No MS\n({sum(c not in MS_FEATURES for c in pipeline.feature_cols)} feat)",
+        f"No temporal\n({sum(c not in temporal for c in pipeline.feature_cols)} feat)",
+        "Cascade\nStage-1 only",
+    )):
+        ablation.append({
+            "config": label, "f1": result["f1"],
+            "compromise_rate": result["per_attack"].get("node_compromise", (0, 0, 0))[2],
+        })
+    results_list.extend(variants)
 
     # Cascade full
     casc_r = next(r for r in results_list if r['name'] == 'Cascade')
@@ -1979,43 +1999,11 @@ def main(config=None):
     # ══════════════════════════════════════════════════
     #  Save Results
     # ══════════════════════════════════════════════════
-    save_cols = ['name', 'auc_roc', 'auc_pr', 'f1', 'fpr',
-                 'tp', 'fp', 'fn', 'tn']
-    res_df = pd.DataFrame([{k: r[k] for k in save_cols}
-                           for r in results_list])
-    res_df.to_csv(os.path.join(config.results_dir,
-                               "full_comparison_diameter.csv"), index=False)
-    test_runs = test_df["_test_simulation"].to_numpy()
-    metrics_rows, attack_rows = [], []
-    for result in results_list:
-        if "y_true" in result:
-            runs, labels, attacks = seq_test_runs, seq_y_test, seq_at_test
-        else:
-            runs, labels, attacks = test_runs, y_test, attack_types_test
-        for run in pd.unique(runs):
-            mask = runs == run
-            scores, pred = result["scores"][mask], result["y_pred"][mask]
-            y = labels[mask]
-            tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
-            metrics_rows.append({
-                "simulation": run, "name": result["name"], "windows": len(y),
-                "auc_roc": roc_auc_score(y, scores) if len(np.unique(y)) > 1 else 0.0,
-                "auc_pr": average_precision_score(y, scores) if len(np.unique(y)) > 1 else 0.0,
-                "f1": f1_score(y, pred, zero_division=0),
-                "fpr": fp / (fp + tn) if fp + tn else 0.0,
-                "tp": tp, "fp": fp, "fn": fn, "tn": tn, "threshold": result["threshold"],
-            })
-            for attack in sorted(set(attacks[mask]) - {"none"}):
-                attack_mask = attacks[mask] == attack
-                hits = int(pred[attack_mask].sum())
-                count = int(attack_mask.sum())
-                attack_rows.append({"simulation": run, "name": result["name"],
-                                    "attack_type": attack, "detected": hits,
-                                    "windows": count, "recall": hits / count})
-    pd.DataFrame(metrics_rows).to_csv(
-        Path(config.results_dir) / "metrics_by_simulation.csv", index=False)
-    pd.DataFrame(attack_rows).to_csv(
-        Path(config.results_dir) / "recall_by_simulation_and_attack.csv", index=False)
+    metric_tables = collect_metric_tables(
+        results_list, test_df, y_test, attack_types_test,
+        (seq_test_runs, seq_y_test, seq_at_test))
+    for name, table in zip(METRIC_TABLES, metric_tables):
+        table.to_csv(Path(config.results_dir) / name, index=False)
     recurrence = next((r for r in results_list if r["name"] == RECURRENCE_MODEL), None)
     if recurrence is not None:
         print(f"\n  {RECURRENCE_MODEL} thresholds: "
