@@ -211,6 +211,6 @@ class MeasuredFusion(LossFusionTICD):
         self.warning_budget=.002
     def manifest(self):
         d=super().manifest()
-        d.update({"observation_mode":self.observation_mode,"oracle_only":self.observation_mode=="oracle",
+        d.update({"observation_mode":self.observation_mode,"loss_source":self.observation_mode,"oracle_only":self.observation_mode=="oracle",
                   "synthetic_measurement":self.observation_mode in ("active","passive","hybrid")})
         return d
