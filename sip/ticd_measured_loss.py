@@ -150,7 +150,7 @@ class MeasuredPhysicalReference(IndependentLossReference):
             if m.sum()>=200:
                 w=m.sum()/(m.sum()+500.)
                 self.center[(mode,key)]=float(w*np.average(z[m],weights=np.sqrt(v[m]))+(1-w)*self.center[(mode,key.split("|")[0])])
-        y=self.raw(train,mode);r=y.index.map(train.node_type).to_numpy()
+        y=self.raw(train,mode);r=train.loc[y.index,"node_type"].astype(str).to_numpy()
         for w in WINDOWS:
             q=y["loss_raw_cu_"+str(w)].to_numpy()
             for role in ROLES:self.q[(mode,w,role)]=max(1.,float(np.quantile(q[r==role],.99,method="higher")))
