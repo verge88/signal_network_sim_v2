@@ -93,6 +93,7 @@ class TrainingConfig:
     validation_path: Optional[str] = None
     stack_path: Optional[str] = None
     test_path: Optional[str] = None
+    additional_test_paths: Tuple[str, ...] = ()
     compare_tree_reference: bool = False
     results_dir: str = "results_diameter_v1"
     plots_dir: str = "results_diameter_v1/plots"
@@ -305,16 +306,35 @@ class DataPipeline:
     def load_and_prepare(self):
         config = self.config
         optional_paths = (config.validation_path, config.stack_path, config.test_path)
-        if any(optional_paths):
+        if any(optional_paths) or config.additional_test_paths:
             if not all(optional_paths):
                 raise ValueError("Provide validation, stacking and test files together")
-            paths = [Path(p).resolve() for p in (config.data_path, *optional_paths)]
-            if len(set(paths)) != 4:
+            paths = [Path(p).resolve() for p in (
+                config.data_path, *optional_paths, *config.additional_test_paths)]
+            if len(set(paths)) != len(paths):
                 raise ValueError("Each partition requires a separate simulation file")
-            partitions = tuple(pd.read_csv(path) for path in paths)
-            if any(partitions[i].equals(partitions[j])
-                   for i in range(4) for j in range(i)):
+            simulations = [pd.read_csv(path) for path in paths]
+            if any(simulations[i].equals(simulations[j])
+                   for i in range(len(simulations)) for j in range(i)):
                 raise ValueError("Duplicate simulations in evaluation partitions")
+            test_names = [p.stem.removesuffix(".csv") for p in paths[3:]]
+            if len(set(test_names)) != len(test_names):
+                raise ValueError("Test simulation filenames must be distinct")
+            test_frames = []
+            next_node_id = 0
+            for name, frame in zip(test_names, simulations[3:]):
+                if set(frame[self.LABEL_COL].unique()) != {0, 1}:
+                    raise ValueError(f"{name} needs both benign and anomalous records")
+                if len(test_names) > 1:
+                    # Give each simulation its own node namespace for both
+                    # sequence construction and report recurrence.
+                    codes, nodes = pd.factorize(frame["node_id"], sort=True)
+                    if (codes < 0).any():
+                        raise ValueError(f"Missing node IDs in {name}")
+                    frame = frame.assign(node_id=codes + next_node_id)
+                    next_node_id += len(nodes)
+                test_frames.append(frame.assign(_test_simulation=name))
+            partitions = (*simulations[:3], pd.concat(test_frames, ignore_index=True))
             self.split_protocol = "separate simulation files"
         else:
             df = pd.read_csv(config.data_path)
@@ -332,6 +352,7 @@ class DataPipeline:
             partitions = tuple(df[blocks.isin(group.index)].copy()
                                for group in (fit, validation, stack, test))
             self.split_protocol = "disjoint 30-minute blocks of one simulation"
+            partitions[-1]["_test_simulation"] = "test"
 
         train = partitions[0]
         if "node_type" in train and "node_type_enc" not in train:
@@ -376,10 +397,10 @@ class DataPipeline:
         normal = df[df[self.LABEL_COL] == 0]
         return self.get_features_labels(normal, fit=fit)
 
-    def get_sequential_data(self, df, seq_len):
+    def get_sequential_data(self, df, seq_len, include_simulation=False):
         ordered = df.sort_values(["node_id", "interval"], kind="stable")
         X_all, y_all = self.get_features_labels(ordered)
-        seqs, labels, attack_types, benign = [], [], [], []
+        seqs, labels, attack_types, benign, simulations = [], [], [], [], []
         for positions in ordered.groupby("node_id", sort=False).indices.values():
             if len(positions) < seq_len:
                 continue
@@ -389,17 +410,22 @@ class DataPipeline:
                 raise ValueError("Duplicate interval for a Diameter node")
             contiguous = times[seq_len - 1:] - times[:len(times) - seq_len + 1] == seq_len - 1
             windows = np.lib.stride_tricks.sliding_window_view(
-                X_all[positions], seq_len, axis=0).swapaxes(1, 2)
+                X_all[positions].astype(np.float32), seq_len, axis=0).swapaxes(1, 2)
             y_node = y_all[positions]
             seqs.append(windows[contiguous])
             labels.append(y_node[seq_len - 1:][contiguous])
             attack_types.append(rows[self.ATTACK_COL].to_numpy()[seq_len - 1:][contiguous])
             benign.append(~np.lib.stride_tricks.sliding_window_view(
                 y_node.astype(bool), seq_len).any(axis=1)[contiguous])
+            if include_simulation:
+                simulations.append(rows["_test_simulation"].to_numpy()[seq_len - 1:][contiguous])
         if not seqs:
-            return (np.empty((0, seq_len, X_all.shape[1])), np.array([], dtype=int),
-                    np.array([], dtype=str), np.array([], dtype=bool))
-        return tuple(np.concatenate(parts) for parts in (seqs, labels, attack_types, benign))
+            empty = (np.empty((0, seq_len, X_all.shape[1]), dtype=np.float32),
+                     np.array([], dtype=int), np.array([], dtype=str), np.array([], dtype=bool))
+            return (*empty, np.array([], dtype=str)) if include_simulation else empty
+        groups = (seqs, labels, attack_types, benign)
+        return tuple(np.concatenate(parts) for parts in (
+            (*groups, simulations) if include_simulation else groups))
 
 
 # ══════════════════════════════════════════════════════════
@@ -652,12 +678,15 @@ class AETrainer:
 
     def reconstruction_error(self, X):
         self.model.eval()
+        errors = []
         with torch.no_grad():
-            t = torch.FloatTensor(X).to(self.device)
-            err = torch.mean((t - self.model(t)) ** 2, dim=-1)
-            if err.dim() > 1:
-                err = err.mean(dim=-1)
-        return err.cpu().numpy()
+            for start in range(0, len(X), 2048):
+                t = torch.as_tensor(X[start:start + 2048], dtype=torch.float32, device=self.device)
+                err = torch.mean((t - self.model(t)) ** 2, dim=-1)
+                if err.dim() > 1:
+                    err = err.mean(dim=-1)
+                errors.append(err.cpu().numpy())
+        return np.concatenate(errors) if errors else np.empty(0, dtype=np.float32)
 
 
 class VAETrainer:
@@ -754,16 +783,17 @@ class VAETrainer:
         return total / max(count, 1)
 
     def anomaly_score(self, X):
-        # Deterministic score improves reproducibility and avoids adding
-        # Monte-Carlo noise to threshold selection.
         self.model.eval()
+        errors = []
         with torch.no_grad():
-            t = torch.FloatTensor(X).to(self.device)
-            mu, lv = self.model.encode(t)
-            x_hat = self.model.decoder(mu)
-            recon = torch.mean((t - x_hat) ** 2, dim=-1)
-            kl = -0.5 * torch.sum(1 + lv - mu.pow(2) - lv.exp(), dim=-1)
-        return (recon + self.kl_weight * kl).cpu().numpy()
+            for start in range(0, len(X), 2048):
+                t = torch.as_tensor(X[start:start + 2048], dtype=torch.float32, device=self.device)
+                mu, lv = self.model.encode(t)
+                x_hat = self.model.decoder(mu)
+                recon = torch.mean((t - x_hat) ** 2, dim=-1)
+                kl = -0.5 * torch.sum(1 + lv - mu.pow(2) - lv.exp(), dim=-1)
+                errors.append((recon + self.kl_weight * kl).cpu().numpy())
+        return np.concatenate(errors) if errors else np.empty(0, dtype=np.float32)
 
 
 # ══════════════════════════════════════════════════════════
@@ -1472,8 +1502,8 @@ def main(config=None):
         val_df, config.lstm_seq_len)
     seq_val = np.arcsinh(seq_val)
     seq_val_normal = seq_val[benign_val_windows]
-    seq_test, seq_y_test, seq_at_test, _ = pipeline.get_sequential_data(
-        test_df, config.lstm_seq_len)
+    seq_test, seq_y_test, seq_at_test, _, seq_test_runs = pipeline.get_sequential_data(
+        test_df, config.lstm_seq_len, include_simulation=True)
     seq_test = np.arcsinh(seq_test)
     lstm_done = False
     if len(seq_train) > 100 and len(seq_val_normal) and len(seq_test):
@@ -1522,6 +1552,7 @@ def main(config=None):
             "Temporal-Attention-AE", tat_st, seq_y_test,
             seq_at_test, threshold=th_tat))
         results_list[-1]["y_true"] = seq_y_test
+        del seq_train, seq_val, seq_val_normal, seq_test
 
     # ── 7. Random Forest ──
     print("\n[7] Random Forest...")
@@ -1924,6 +1955,14 @@ def main(config=None):
             "benign_fpr_max": config.compromise_total_fpr_budget,
         },
     }
+    recurrence = next((r for r in results_list if r["name"] == RECURRENCE_MODEL), None)
+    if recurrence is not None:
+        hits, total, _ = recurrence["per_attack"].get("node_compromise", (0, 0, 0))
+        compromise_diag["recurrence_validation"] = recurrence["compromise_threshold_info"]
+        compromise_diag["test"].update({
+            "recurrence_compromise_recall": float(hits / total) if total else None,
+            "recurrence_benign_fpr": float(recurrence["fpr"]),
+        })
     with open(os.path.join(
             config.results_dir, "compromise_recall_diagnostics.json"),
             "w", encoding="utf-8") as f:
@@ -1946,6 +1985,41 @@ def main(config=None):
                            for r in results_list])
     res_df.to_csv(os.path.join(config.results_dir,
                                "full_comparison_diameter.csv"), index=False)
+    test_runs = test_df["_test_simulation"].to_numpy()
+    metrics_rows, attack_rows = [], []
+    for result in results_list:
+        if "y_true" in result:
+            runs, labels, attacks = seq_test_runs, seq_y_test, seq_at_test
+        else:
+            runs, labels, attacks = test_runs, y_test, attack_types_test
+        for run in pd.unique(runs):
+            mask = runs == run
+            scores, pred = result["scores"][mask], result["y_pred"][mask]
+            y = labels[mask]
+            tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
+            metrics_rows.append({
+                "simulation": run, "name": result["name"], "windows": len(y),
+                "auc_roc": roc_auc_score(y, scores) if len(np.unique(y)) > 1 else 0.0,
+                "auc_pr": average_precision_score(y, scores) if len(np.unique(y)) > 1 else 0.0,
+                "f1": f1_score(y, pred, zero_division=0),
+                "fpr": fp / (fp + tn) if fp + tn else 0.0,
+                "tp": tp, "fp": fp, "fn": fn, "tn": tn, "threshold": result["threshold"],
+            })
+            for attack in sorted(set(attacks[mask]) - {"none"}):
+                attack_mask = attacks[mask] == attack
+                hits = int(pred[attack_mask].sum())
+                count = int(attack_mask.sum())
+                attack_rows.append({"simulation": run, "name": result["name"],
+                                    "attack_type": attack, "detected": hits,
+                                    "windows": count, "recall": hits / count})
+    pd.DataFrame(metrics_rows).to_csv(
+        Path(config.results_dir) / "metrics_by_simulation.csv", index=False)
+    pd.DataFrame(attack_rows).to_csv(
+        Path(config.results_dir) / "recall_by_simulation_and_attack.csv", index=False)
+    recurrence = next((r for r in results_list if r["name"] == RECURRENCE_MODEL), None)
+    if recurrence is not None:
+        print(f"\n  {RECURRENCE_MODEL} thresholds: "
+              f"{recurrence['compromise_threshold_info']['thresholds']}")
 
     with open(os.path.join(config.results_dir,
                            "feature_columns_diameter.json"), "w") as f:
@@ -2057,13 +2131,14 @@ if __name__ == "__main__":
     parser.add_argument("--train-data", default=TrainingConfig.data_path)
     parser.add_argument("--validation-data")
     parser.add_argument("--stack-data")
-    parser.add_argument("--test-data")
+    parser.add_argument("--test-data", nargs="+")
     parser.add_argument("--compare-tree-reference", action="store_true")
     parser.add_argument("--results-dir", default=TrainingConfig.results_dir)
     args = parser.parse_args()
     main(TrainingConfig(
         data_path=args.train_data, validation_path=args.validation_data,
-        stack_path=args.stack_data, test_path=args.test_data,
+        stack_path=args.stack_data, test_path=args.test_data[0] if args.test_data else None,
+        additional_test_paths=tuple(args.test_data[1:]) if args.test_data else (),
         results_dir=args.results_dir, compare_tree_reference=args.compare_tree_reference,
         plots_dir=str(Path(args.results_dir) / "plots"),
     ))

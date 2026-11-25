@@ -601,6 +601,44 @@ def build_manifest(out_dir: Path, generated: Iterable[str],
     )
 
 
+def plot_results_by_simulation(metrics: pd.DataFrame, recall: pd.DataFrame,
+                               out_dir: Path) -> List[str]:
+    models = [model for model in MAIN_MODELS if model in set(metrics["name"])]
+    runs = sorted(metrics["simulation"].unique())
+    y = np.arange(len(models))
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10), sharey=True)
+    attack_scores = recall.pivot(index=["simulation", "name"], columns="attack_type",
+                                 values="recall").reset_index()
+    data = metrics.merge(attack_scores, on=["simulation", "name"], how="left")
+    panels = [
+        ("auc_pr", "AUC-PR", 1, None),
+        ("fpr", "Доля ложных тревог, %", 100, 2),
+        ("node_compromise", "Полнота обнаружения компрометации, %", 100, 85),
+        ("signaling_dos", "Полнота обнаружения сигнального DoS, %", 100, None),
+    ]
+    width = 0.76 / len(runs)
+    for ax, (key, title, scale, target) in zip(axes.flat, panels):
+        for index, run in enumerate(runs):
+            values = data[data["simulation"] == run].set_index("name").reindex(models)
+            if key not in values:
+                continue
+            shift = width * (index - (len(runs) - 1) / 2)
+            ax.barh(y + shift, values[key] * scale, height=width, label=run,
+                    facecolor=("0.35", "0.80")[index % 2], edgecolor="black",
+                    hatch=("", "//", "..", "xx")[index % 4])
+        if target is not None:
+            ax.axvline(target, color="black", linestyle=":", linewidth=1)
+        if key != "fpr":
+            ax.set_xlim(0, scale)
+        ax.set_yticks(y, models)
+        ax.set_xlabel(title)
+    axes[0, 0].invert_yaxis()
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=min(4, len(runs)))
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    return save_figure(fig, out_dir, "17_metrics_by_simulation")
+
+
 def plot_recurrence_benchmark(summary: dict, out_dir: Path) -> List[str]:
     trials = summary["tests"]
     x = np.arange(len(trials))
@@ -712,6 +750,11 @@ def main() -> None:
     generated += plot_fpr_vs_f1(metrics, out_dir)
     generated += plot_external_validation(external_attacks, out_dir)
     generated += plot_calibration(calibration, out_dir)
+    simulation_metrics = results_dir / "metrics_by_simulation.csv"
+    attack_recall = results_dir / "recall_by_simulation_and_attack.csv"
+    if simulation_metrics.is_file() and attack_recall.is_file():
+        generated += plot_results_by_simulation(
+            pd.read_csv(simulation_metrics), pd.read_csv(attack_recall), out_dir)
 
     source_files = [
         csv_path,
@@ -720,6 +763,8 @@ def main() -> None:
         args.external_benign,
         args.external_attacks,
         args.calibration_verification,
+        simulation_metrics,
+        attack_recall,
     ]
     build_manifest(out_dir, generated, source_files)
     print(f"Generated {len(generated)//2} figures in {out_dir}")
