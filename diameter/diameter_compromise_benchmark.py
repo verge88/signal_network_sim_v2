@@ -12,7 +12,7 @@ from diameter_report_recurrence import (
 )
 from diameter_training_v1 import (
     CascadeCompromiseDetector, DataPipeline, TrainingConfig, combine_cascade_scores,
-    evaluate_model, select_compromise_aware_thresholds,
+    calibrate_cascade_across_domains, evaluate_model,
 )
 
 
@@ -60,39 +60,48 @@ def trial_metrics(frame, scores, model):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", type=Path, required=True)
-    parser.add_argument("--validation", type=Path, required=True)
+    parser.add_argument("--validation", type=Path, nargs="+", required=True)
+    parser.add_argument("--calibration-budget", type=float, default=None)
     parser.add_argument("--test", type=Path, nargs="+", required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
     train, train_hash = load_partition(args.train)
-    val, val_hash = load_partition(args.validation)
-    seen = {train_hash, val_hash}
-    if len(seen) != 2 or train.equals(val):
-        raise ValueError("Training and validation simulations must differ")
+    seen = {train_hash}
     config = TrainingConfig()
+    budget = (config.compromise_total_fpr_budget if args.calibration_budget is None
+              else args.calibration_budget)
     pipeline = DataPipeline(config)
     pipeline._build_feature_cols(train)
     X, y = pipeline.get_features_labels(train, fit=True)
-    Xval, yval = pipeline.get_features_labels(val)
     cascade = CascadeCompromiseDetector(config, config.seed)
     cascade.fit(X, y, None, train["is_compromised"].to_numpy())
-    general, hist = cascade.predict_components(Xval, None)
-    validation = {}
-    for model, score in (("Cascade", hist), (MODEL_NAME, report_recurrence(val))):
-        t1, t2, _, diag = select_compromise_aware_thresholds(
-            general, score, yval, val["is_compromised"].to_numpy(),
-            general_fpr_budget=config.compromise_general_fpr_budget,
-            total_fpr_budget=config.compromise_total_fpr_budget,
-            target_recall=config.compromise_target_recall,
-        )
-        validation[model] = {"thresholds": [t1, t2], **diag}
+
+    domains = {"Cascade": [], MODEL_NAME: []}
+    validation_checksums = {}
+    for path in args.validation:
+        frame, checksum = load_partition(path)
+        name = path.stem.removesuffix(".csv")
+        if name in validation_checksums or checksum in seen or frame.equals(train):
+            raise ValueError(f"Simulation reused across partitions: {path}")
+        seen.add(checksum)
+        validation_checksums[name] = checksum
+        xval, yval = pipeline.get_features_labels(frame)
+        general, hist = cascade.predict_components(xval, None)
+        compromised = frame["is_compromised"].to_numpy()
+        domains["Cascade"].append((name, general, hist, yval, compromised))
+        domains[MODEL_NAME].append(
+            (name, general, report_recurrence(frame), yval, compromised))
+    validation = {
+        model: calibrate_cascade_across_domains(partitions, config, budget)
+        for model, partitions in domains.items()
+    }
 
     # Both decision rules are fixed before any test dataset is read.
     tests = []
     for path in args.test:
         frame, checksum = load_partition(path)
-        if checksum in seen or frame.equals(train) or frame.equals(val):
+        if checksum in seen or frame.equals(train):
             raise ValueError(f"Simulation reused across partitions: {path}")
         seen.add(checksum)
         Xt, _ = pipeline.get_features_labels(frame)
@@ -105,7 +114,7 @@ def main():
                       "models": evaluated})
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    result = {"train_sha256": train_hash, "validation_sha256": val_hash,
+    result = {"train_sha256": train_hash, "validation_sha256": validation_checksums,
               "validation": validation, "tests": tests}
     as_json = json.dumps(result, indent=2, allow_nan=False)
     args.out.write_text(as_json + "\n", encoding="utf-8")

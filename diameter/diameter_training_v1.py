@@ -181,6 +181,7 @@ class TrainingConfig:
     compromise_gb_positive_weight: float = 6.0
     compromise_general_fpr_budget: float = 0.004
     compromise_total_fpr_budget: float = 0.020
+    recurrence_calibration_budget: float = 0.010
     compromise_target_recall: float = 0.85
 
     threshold_percentile: float = 95.0
@@ -911,6 +912,37 @@ def combine_cascade_scores(p_general, p_compromise,
     )
 
 
+def calibrate_cascade_across_domains(domains, config, fpr_budget):
+    """Use the most conservative cutoff for each branch across validation days."""
+    if not 0 < config.compromise_general_fpr_budget <= fpr_budget <= config.compromise_total_fpr_budget:
+        raise ValueError("Invalid cascade calibration FPR budget")
+    cutoffs = [
+        select_compromise_aware_thresholds(
+            general, specific, y, compromised,
+            general_fpr_budget=config.compromise_general_fpr_budget,
+            total_fpr_budget=fpr_budget,
+            target_recall=config.compromise_target_recall,
+        )[:2]
+        for _, general, specific, y, compromised in domains
+    ]
+    general_cut, specific_cut = map(max, zip(*cutoffs))
+    measured = {}
+    for name, general, specific, y, compromised in domains:
+        alerts = combine_cascade_scores(general, specific, general_cut, specific_cut) >= 1
+        measured[name] = {
+            "benign_fpr": float(alerts[y == 0].mean()),
+            "compromise_recall": (float(alerts[compromised == 1].mean())
+                                  if (compromised == 1).any() else None),
+        }
+    return {
+        "thresholds": [general_cut, specific_cut],
+        "calibration_fpr_budget": fpr_budget,
+        "total_fpr_budget": config.compromise_total_fpr_budget,
+        "target_compromise_recall": config.compromise_target_recall,
+        "per_simulation": measured,
+    }
+
+
 def evaluate_model(name, scores, y_true, attack_types,
                    threshold=None, percentile=95.0):
     if threshold is None:
@@ -1571,16 +1603,18 @@ def main(config=None):
 
     # An alternative second stage scores persistence of repeated fresh
     # report profiles. Stage 1 and the validation budget match the baseline.
-    if all(RECURRENCE_COLUMNS <= set(frame.columns) for frame in (val_df, test_df)):
-        recurrence_v = report_recurrence(val_df)
-        rec_t1, rec_t2, _, rec_validation = select_compromise_aware_thresholds(
-            casc1_pv, recurrence_v, y_val, y_val_comp,
-            general_fpr_budget=config.compromise_general_fpr_budget,
-            total_fpr_budget=config.compromise_total_fpr_budget,
-            target_recall=config.compromise_target_recall,
-        )
+    stack_general = cascade.predict_proba_stage1(X_stack)
+    if all(RECURRENCE_COLUMNS <= set(frame.columns)
+           for frame in (val_df, stack_df, test_df)):
+        recurrence_domains = [
+            ("validation", casc1_pv, report_recurrence(val_df), y_val, y_val_comp),
+            ("stack", stack_general, report_recurrence(stack_df), y_stack,
+             stack_df[pipeline.ATTACK_COL].eq("node_compromise").to_numpy()),
+        ]
+        rec_validation = calibrate_cascade_across_domains(
+            recurrence_domains, config, config.recurrence_calibration_budget)
         recurrence_t = combine_cascade_scores(
-            casc1_pt, report_recurrence(test_df), rec_t1, rec_t2)
+            casc1_pt, report_recurrence(test_df), *rec_validation["thresholds"])
         recurrence_result = evaluate_model(
             RECURRENCE_MODEL, recurrence_t, y_test, attack_types_test, threshold=1.0)
         recurrence_result["compromise_threshold_info"] = rec_validation
@@ -1607,7 +1641,6 @@ def main(config=None):
     print("\n[11] Meta-Ensemble...")
 
     # Use raw cascade branch probabilities, independent of validation labels.
-    stack_general = cascade.predict_proba_stage1(X_stack)
     stack_compromise = cascade.predict_proba_stage2(None, X_stack)
     meta_stack = np.column_stack([
         -iso.score_samples(apply_iso_robust_bounds(X_stack, iso_low, iso_high)),

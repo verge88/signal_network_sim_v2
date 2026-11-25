@@ -48,14 +48,14 @@ jobs:
           DIAMETER_CALIBRATION_PROFILE: archived/results_diameter_calibration/calibration_profile.json
         run: |
           test -s "$DIAMETER_CALIBRATION_PROFILE"
-          for seed in 42 43 46 47; do
+          for seed in 42 43 48 49 50; do
             python diameter/diameter_sim_v1.py --seed "$seed" --out "fixed-${seed}.csv.gz"
           done
       - name: Compare cascade models under the same validation budget
         run: |
           python diameter/diameter_compromise_benchmark.py \
-            --train fixed-42.csv.gz --validation fixed-43.csv.gz \
-            --test fixed-46.csv.gz fixed-47.csv.gz \
+            --train fixed-42.csv.gz --validation fixed-43.csv.gz fixed-48.csv.gz \
+            --calibration-budget 0.01 --test fixed-49.csv.gz fixed-50.csv.gz \
             --out results_recurrence/report_recurrence_summary.json
       - name: Build PNG and SVG with the Diameter figure generator
         run: |
