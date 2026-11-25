@@ -674,11 +674,81 @@ def plot_recurrence_benchmark(summary: dict, out_dir: Path) -> List[str]:
     return save_figure(fig, out_dir, "16_report_recurrence_benchmark")
 
 
+def plot_learning_curve_suite(reference: Path, points: Path, out_dir: Path) -> None:
+    artifacts_file = reference / "plot_artifacts.json"
+    diagnostics_file = reference / "overfitting_diagnostics.json"
+    reference_file = reference / "full_comparison_diameter.csv"
+    artifacts = load_json(artifacts_file)
+    diagnostics = load_json(diagnostics_file)
+    table = pd.read_csv(reference_file)
+    if len(table) != 23 or not table["name"].is_unique:
+        raise ValueError("The archived full benchmark must contain all 23 configurations")
+    temporal_and_neural = {"Autoencoder", "VAE", "LSTM-Autoencoder", "Temporal-Attention-AE"}
+    models = [name for name in table["name"] if name not in temporal_and_neural]
+    rows = []
+    sources = [artifacts_file, diagnostics_file, reference_file]
+    for metadata in sorted(points.rglob("curve_point.json")):
+        point = pd.read_csv(metadata.with_name(reference_file.name))
+        if not set(models).issubset(point["name"]):
+            raise ValueError(f"Incomplete learning curve point: {metadata}")
+        rows.append(point[point["name"].isin(models)].assign(**load_json(metadata)))
+        sources.extend([metadata, metadata.with_name(reference_file.name)])
+    if len(rows) != 3:
+        raise ValueError("Expected three subset fits")
+    rows.append(table[table["name"].isin(models)].assign(
+        fraction=1.0, train_rows=86400, test_rows=172800))
+    curves = pd.concat(rows).sort_values(["name", "fraction"])
+    if len(curves) != 4 * len(models) or curves.duplicated(["name", "fraction"]).any():
+        raise ValueError("Expected four points per model")
+    curves.to_csv(out_dir / "learning_curve_by_training_size.csv", index=False)
+    histories = artifacts["trainers_history"]
+    epoch_rows = [
+        {"component": name, "epoch": i, "train_loss": train, "validation_loss": val,
+         "best_epoch": diagnostics["neural"][name]["best_epoch"]}
+        for name, history in histories.items()
+        for i, (train, val) in enumerate(zip(history["train_eval_losses"],
+                                             history["val_losses"]), start=1)
+    ]
+    pd.DataFrame(epoch_rows).to_csv(out_dir / "learning_curve_by_epoch.csv", index=False)
+
+    generated = plot_training_curves(artifacts, diagnostics, out_dir)
+    generated += plot_training_curves(artifacts, diagnostics, out_dir, specialized=True)
+    for page, start in enumerate(range(0, len(models), 7), start=1):
+        names = models[start:start + 7]
+        fig, axes = plt.subplots((len(names) + 2) // 3, 3, figsize=(13, 8), squeeze=False)
+        for ax, name in zip(axes.flat, names):
+            run = curves[curves["name"] == name]
+            ax.plot(run["train_rows"], run["auc_pr"], "-o", color="0.2", linewidth=1.4)
+            ax.scatter(run["train_rows"].iloc[-1], run["auc_pr"].iloc[-1],
+                       facecolors="white", edgecolors="black", zorder=3)
+            ax.set_xscale("log", base=2)
+            ax.set_xticks(run["train_rows"], [f"{f * 100:g}%" for f in run["fraction"]])
+            ax.tick_params(axis="x", labelsize=8)
+            ax.set_ylim(0, 1.02)
+            ax.set_title(name, fontsize=10)
+            ax.set_ylabel("AUC-PR на тесте")
+        for ax in list(axes.flat)[len(names):]:
+            ax.set_visible(False)
+        fig.suptitle("Кривые обучения Diameter по доле обучающей выборки")
+        fig.supxlabel("Доля обучающих окон. Пустой маркер — полный эксперимент")
+        fig.tight_layout()
+        generated += save_figure(fig, out_dir, f"18_learning_curve_size_{page}")
+    (out_dir / "protocol.txt").write_text(
+        "Epoch curves: training (eval mode) and validation losses from run 45579805922.\n"
+        "Size curves: nested subsets stratified by training attack type (seed 42), "
+        "calibration 43, stacking 48, fixed evaluation seeds 49 and 50.\n"
+        "Only the training partition varies. The 100% point is archived. "
+        "Meta-Ensemble stack size is held fixed. Test scores are diagnostic only.\n",
+        encoding="utf-8")
+    build_manifest(out_dir, generated, sources)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--results-dir", type=Path,
                    default=Path("results_diameter_v1"))
     p.add_argument("--out-dir", type=Path, default=None)
+    p.add_argument("--learning-curve-points", type=Path)
     p.add_argument("--recurrence-benchmark", type=Path,
                    help="Generate the cascade comparison from a benchmark JSON")
     p.add_argument("--external-benign", type=Path,
@@ -699,6 +769,9 @@ def main() -> None:
     results_dir = args.results_dir
     out_dir = args.out_dir or (results_dir / "publication_plots")
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.learning_curve_points:
+        plot_learning_curve_suite(results_dir, args.learning_curve_points, out_dir)
+        return
     if args.recurrence_benchmark:
         summary = load_json(args.recurrence_benchmark)
         generated = plot_recurrence_benchmark(summary, out_dir)

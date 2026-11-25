@@ -1,0 +1,117 @@
+name: Diameter learning curves
+
+on:
+  push:
+    branches: [experiment/diameter-learning-curves]
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: diameter-learning-curves-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy pandas networkx scikit-learn
+      - uses: actions/download-artifact@v4
+        with:
+          name: diameter-calibrated-full-experiment
+          path: archive
+          run-id: 45449352344
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate the five fixed simulations
+        env:
+          DIAMETER_CALIBRATION_PROFILE: archive/results_diameter_calibration/calibration_profile.json
+        run: |
+          set -euo pipefail
+          mkdir data
+          pids=()
+          for n in 42 43 48 49 50; do
+            python diameter/diameter_sim_v1.py --seed "$n" --out "data/fixed-$n.csv.gz" > "data/sim-$n.log" &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do wait "$pid"; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: curve-inputs
+          path: data/*.csv.gz
+          compression-level: 0
+          if-no-files-found: error
+  fits:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        fraction: ["0.0625", "0.125", "0.25"]
+    env:
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+      OPENBLAS_NUM_THREADS: "4"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          pip install numpy pandas scipy scikit-learn matplotlib
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m py_compile diameter/diameter_training_v1.py diameter/diameter_generate_plots.py
+      - uses: actions/download-artifact@v4
+        with:
+          name: curve-inputs
+          path: data
+      - name: Refit on the prescribed training subset
+        run: |
+          python -u diameter/diameter_training_v1.py \
+            --train-data data/fixed-42.csv.gz --validation-data data/fixed-43.csv.gz \
+            --stack-data data/fixed-48.csv.gz --test-data data/fixed-49.csv.gz data/fixed-50.csv.gz \
+            --curve-train-fraction "${{ matrix.fraction }}" --results-dir point
+      - uses: actions/upload-artifact@v4
+        with:
+          name: curve-point-${{ matrix.fraction }}
+          path: |
+            point/curve_point.json
+            point/full_comparison_diameter.csv
+          if-no-files-found: error
+  figures:
+    needs: fits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy pandas scipy scikit-learn matplotlib
+      - uses: actions/download-artifact@v4
+        with:
+          name: diameter-full-corrected-results
+          path: full
+          run-id: 45579805922
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: curve-point-*
+          path: points
+      - name: Generate all learning curves from measured results
+        run: |
+          python diameter/diameter_generate_plots.py --results-dir full \
+            --learning-curve-points points --out-dir figures
+          test -s figures/18_learning_curve_size_3.svg
+          test -s figures/07_training_curves.svg
+          test -s figures/14_specialized_training_curves.svg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diameter-all-learning-curves
+          path: figures/
+          if-no-files-found: error

@@ -94,6 +94,7 @@ class TrainingConfig:
     stack_path: Optional[str] = None
     test_path: Optional[str] = None
     additional_test_paths: Tuple[str, ...] = ()
+    curve_train_fraction: Optional[float] = None
     compare_tree_reference: bool = False
     results_dir: str = "results_diameter_v1"
     plots_dir: str = "results_diameter_v1/plots"
@@ -1443,6 +1444,17 @@ def main(config=None):
 
     pipeline = DataPipeline(config)
     train_df, val_df, stack_df, test_df = pipeline.load_and_prepare()
+    if config.curve_train_fraction is not None:
+        fraction = config.curve_train_fraction
+        if not 0 < fraction < 1:
+            raise ValueError("Curve training fraction must be between zero and one")
+        groups = train_df.groupby(pipeline.ATTACK_COL, sort=True)
+        sampled = [
+            group.sample(frac=1, random_state=config.seed).iloc[:max(1, round(len(group) * fraction))]
+            for _, group in groups
+        ]
+        train_df = pd.concat(sampled).sort_index()
+        print(f"Curve training rows: {len(train_df)}; fraction={fraction}")
 
     X_train, y_train = pipeline.get_features_labels(train_df, fit=True)
     X_val, y_val = pipeline.get_features_labels(val_df)
@@ -1563,66 +1575,68 @@ def main(config=None):
     results_list.append(evaluate_model("VAE", vae_st, y_test,
                                        attack_types_test, threshold=th_vae))
 
-    # ── 5. LSTM-AE ──
-    print("\n[5] LSTM-Autoencoder...")
-    seq_train, _, _, benign_train = pipeline.get_sequential_data(
-        train_df, config.lstm_seq_len)
-    seq_train = np.arcsinh(seq_train[benign_train])
-    seq_val, _, _, benign_val_windows = pipeline.get_sequential_data(
-        val_df, config.lstm_seq_len)
-    seq_val = np.arcsinh(seq_val)
-    seq_val_normal = seq_val[benign_val_windows]
-    seq_test, seq_y_test, seq_at_test, _, seq_test_runs = pipeline.get_sequential_data(
-        test_df, config.lstm_seq_len, include_simulation=True)
-    seq_test = np.arcsinh(seq_test)
-    lstm_done = False
-    if len(seq_train) > 100 and len(seq_val_normal) and len(seq_test):
-        lstm = LSTMAutoencoder(n_feat, config.lstm_hidden,
-                               config.lstm_layers,
-                               config.lstm_seq_len,
-                               dropout=config.lstm_dropout)
-        lstm_trainer = AETrainer(
-            lstm, config.lstm_lr, config.lstm_epochs, config.lstm_batch,
-            patience=config.lstm_patience,
-            weight_decay=config.lstm_weight_decay,
-            min_delta=config.lstm_min_delta)
-        lstm_trainer.fit(seq_train, seq_val_normal)
-        trainers_dict['LSTM-AE'] = lstm_trainer
+    seq_test_runs = seq_y_test = seq_at_test = None
+    if config.curve_train_fraction is None:
+        # ── 5. LSTM-AE ──
+        print("\n[5] LSTM-Autoencoder...")
+        seq_train, _, _, benign_train = pipeline.get_sequential_data(
+            train_df, config.lstm_seq_len)
+        seq_train = np.arcsinh(seq_train[benign_train])
+        seq_val, _, _, benign_val_windows = pipeline.get_sequential_data(
+            val_df, config.lstm_seq_len)
+        seq_val = np.arcsinh(seq_val)
+        seq_val_normal = seq_val[benign_val_windows]
+        seq_test, seq_y_test, seq_at_test, _, seq_test_runs = pipeline.get_sequential_data(
+            test_df, config.lstm_seq_len, include_simulation=True)
+        seq_test = np.arcsinh(seq_test)
+        lstm_done = False
+        if len(seq_train) > 100 and len(seq_val_normal) and len(seq_test):
+            lstm = LSTMAutoencoder(n_feat, config.lstm_hidden,
+                                   config.lstm_layers,
+                                   config.lstm_seq_len,
+                                   dropout=config.lstm_dropout)
+            lstm_trainer = AETrainer(
+                lstm, config.lstm_lr, config.lstm_epochs, config.lstm_batch,
+                patience=config.lstm_patience,
+                weight_decay=config.lstm_weight_decay,
+                min_delta=config.lstm_min_delta)
+            lstm_trainer.fit(seq_train, seq_val_normal)
+            trainers_dict['LSTM-AE'] = lstm_trainer
 
-        lstm_st = lstm_trainer.reconstruction_error(seq_test)
-        lstm_sv = lstm_trainer.reconstruction_error(seq_val)
-        th_lstm = float(np.percentile(
-            lstm_sv[benign_val_windows], config.threshold_percentile))
-        results_list.append(evaluate_model(
-            "LSTM-Autoencoder", lstm_st, seq_y_test,
-            seq_at_test, threshold=th_lstm))
-        results_list[-1]["y_true"] = seq_y_test
-        lstm_done = True
-    else:
-        print("  Skipped: not enough sequences.")
+            lstm_st = lstm_trainer.reconstruction_error(seq_test)
+            lstm_sv = lstm_trainer.reconstruction_error(seq_val)
+            th_lstm = float(np.percentile(
+                lstm_sv[benign_val_windows], config.threshold_percentile))
+            results_list.append(evaluate_model(
+                "LSTM-Autoencoder", lstm_st, seq_y_test,
+                seq_at_test, threshold=th_lstm))
+            results_list[-1]["y_true"] = seq_y_test
+            lstm_done = True
+        else:
+            print("  Skipped: not enough sequences.")
 
-    # ── 6. Temporal-Attention-AE ──
-    print("\n[6] Temporal-Attention-AE...")
-    if lstm_done and len(seq_train) > 100:
-        tat = TemporalAttentionAE(
-            n_feat, config.tat_hidden, config.tat_heads, config.tat_layers,
-            config.lstm_seq_len, config.tat_dropout)
-        tat_trainer = AETrainer(
-            tat, config.tat_lr, config.tat_epochs, config.tat_batch,
-            patience=config.tat_patience,
-            weight_decay=config.tat_weight_decay,
-            min_delta=config.tat_min_delta)
-        tat_trainer.fit(seq_train, seq_val_normal)
-        trainers_dict['TA-AE'] = tat_trainer
-        tat_st = tat_trainer.reconstruction_error(seq_test)
-        tat_sv = tat_trainer.reconstruction_error(seq_val)
-        th_tat = float(np.percentile(
-            tat_sv[benign_val_windows], config.threshold_percentile))
-        results_list.append(evaluate_model(
-            "Temporal-Attention-AE", tat_st, seq_y_test,
-            seq_at_test, threshold=th_tat))
-        results_list[-1]["y_true"] = seq_y_test
-        del seq_train, seq_val, seq_val_normal, seq_test
+        # ── 6. Temporal-Attention-AE ──
+        print("\n[6] Temporal-Attention-AE...")
+        if lstm_done and len(seq_train) > 100:
+            tat = TemporalAttentionAE(
+                n_feat, config.tat_hidden, config.tat_heads, config.tat_layers,
+                config.lstm_seq_len, config.tat_dropout)
+            tat_trainer = AETrainer(
+                tat, config.tat_lr, config.tat_epochs, config.tat_batch,
+                patience=config.tat_patience,
+                weight_decay=config.tat_weight_decay,
+                min_delta=config.tat_min_delta)
+            tat_trainer.fit(seq_train, seq_val_normal)
+            trainers_dict['TA-AE'] = tat_trainer
+            tat_st = tat_trainer.reconstruction_error(seq_test)
+            tat_sv = tat_trainer.reconstruction_error(seq_val)
+            th_tat = float(np.percentile(
+                tat_sv[benign_val_windows], config.threshold_percentile))
+            results_list.append(evaluate_model(
+                "Temporal-Attention-AE", tat_st, seq_y_test,
+                seq_at_test, threshold=th_tat))
+            results_list[-1]["y_true"] = seq_y_test
+            del seq_train, seq_val, seq_val_normal, seq_test
 
     # ── 7. Random Forest ──
     print("\n[7] Random Forest...")
@@ -2004,6 +2018,12 @@ def main(config=None):
         (seq_test_runs, seq_y_test, seq_at_test))
     for name, table in zip(METRIC_TABLES, metric_tables):
         table.to_csv(Path(config.results_dir) / name, index=False)
+    if config.curve_train_fraction is not None:
+        metadata = {"fraction": config.curve_train_fraction,
+                    "train_rows": len(train_df), "test_rows": len(test_df)}
+        (Path(config.results_dir) / "curve_point.json").write_text(
+            json.dumps(metadata), encoding="utf-8")
+        return
     recurrence = next((r for r in results_list if r["name"] == RECURRENCE_MODEL), None)
     if recurrence is not None:
         print(f"\n  {RECURRENCE_MODEL} thresholds: "
@@ -2120,6 +2140,7 @@ if __name__ == "__main__":
     parser.add_argument("--validation-data")
     parser.add_argument("--stack-data")
     parser.add_argument("--test-data", nargs="+")
+    parser.add_argument("--curve-train-fraction", type=float)
     parser.add_argument("--compare-tree-reference", action="store_true")
     parser.add_argument("--results-dir", default=TrainingConfig.results_dir)
     args = parser.parse_args()
@@ -2127,6 +2148,7 @@ if __name__ == "__main__":
         data_path=args.train_data, validation_path=args.validation_data,
         stack_path=args.stack_data, test_path=args.test_data[0] if args.test_data else None,
         additional_test_paths=tuple(args.test_data[1:]) if args.test_data else (),
+        curve_train_fraction=args.curve_train_fraction,
         results_dir=args.results_dir, compare_tree_reference=args.compare_tree_reference,
         plots_dir=str(Path(args.results_dir) / "plots"),
     ))
