@@ -62,8 +62,16 @@ def main():
                          pct(m["window_recall"]), f"{m['false_alarms']}/{m['benign_windows']}",
                          pct(m["benign_fpr"]), f"{m['episodes_detected']}/{m['episodes']}", delay]
             headings.append("| " + " | ".join(headlines) + " |")
-    headings += ["", "The paired 95% session-bootstrap intervals are in the JSON results.",
-                 "Intervals and delays describe this workload and these observation fixtures."]
+    headings += ["", "Paired differences (recurrence minus baseline) and 95% session-bootstrap intervals:", ""]
+    for key, case in MODES.items():
+        values = results[key]
+        for metric in ("window_recall", "benign_fpr"):
+            bounds = values["paired_delta_recurrence_minus_cascade_ci95"][metric]
+            if bounds is not None:
+                left, right = (values["summary"][m][metric] for m in MODELS)
+                headings.append(f"- {case}, {metric}: {100 * (right - left):+.2f} pp "
+                                f"[{100 * bounds[0]:+.2f}, {100 * bounds[1]:+.2f}].")
+    headings += ["", "Intervals and delays describe this workload and these observation fixtures."]
     (args.results / "summary.md").write_text("\n".join(headings) + "\n", encoding="utf-8")
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.8), layout="constrained")

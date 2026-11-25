@@ -60,7 +60,8 @@ def templates():
                 avps.append(AVP(268, val=2001))
             if sub:
                 avps.append(AVP(416, val=sub))
-            TEMPLATE[index, answer] = bytes(constructor(code, drAppId=app, avpList=avps))
+            flags = 0x40 if answer else 0xC0
+            TEMPLATE[index, answer] = bytes(constructor(code, drAppId=app, drFlags=flags, avpList=avps))
 
 
 def dial(kind, identity, answer=False):
@@ -266,6 +267,8 @@ def run_session(index, root, model, step, base_port):
                 client = socket.create_connection((HOST, tcp_port), timeout=15)
                 peer, _ = server.accept()
                 peer.settimeout(15)
+                for connection in (client, peer):
+                    connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             peers.append((client, peer))
             unit = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             agent = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
