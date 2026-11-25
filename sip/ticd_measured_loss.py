@@ -185,7 +185,8 @@ class FullMeasuredReference:
         self.core.physical.base_model=InactiveContext()
         self.audit=PolicyEvidence()
     def frame(self,df,commission=False):
-        return measured_frame(df,self.mode,commission,getattr(self,"variance_calibrator",None))
+        calibrator=getattr(self,"variance_calibrator",None)
+        return measured_frame(df,self.mode,commission) if calibrator is None else measured_frame(df,self.mode,commission,calibrator)
     def fit(self,train,commission,val):
         t=labels(self.frame(train),train)
         c=labels(self.frame(commission,True),commission)
@@ -214,7 +215,9 @@ class FullMeasuredReference:
                 "core":self.core.manifest(),"all_original_invariants_preserved":True,
                 "raw_observation_columns":RAW,"inactive_old_context_removed":True,
                 "fallback":"bounded state prediction and CU pull" if self.mode in SETTINGS else "causal CU delivery frequency","measurement_variance_used":True,
-                "state_filter_settings":SETTINGS.get(self.mode)}
+                "state_filter_settings":SETTINGS.get(self.mode),
+                "sensor_reconciliation":self.mode in RECONCILED,
+                "variance_calibration":getattr(self,"variance_calibrator",None).manifest() if getattr(self,"variance_calibrator",None) is not None else None}
 
 class MeasuredFusion(LossFusionTICD):
     def __init__(self,mode,window,budgets,calibration_mode):

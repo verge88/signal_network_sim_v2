@@ -23,10 +23,13 @@ def estimate_reconciled(x,pc,vc,reconcile=True,delay_correct=True):
     # When CU is delivered the transport count is trusted and matches the
     # upstream observation population. Never count it twice.
     if reconcile:received=np.where(paired,n,received)
-    pa=(lost+.25)/(2*sent+.5)
-    pp=(m-received+.25)/(m+.5)
-    va=np.maximum(pa*(1-pa)/(2*sent+1.5),2e-8)
-    vp=np.maximum(pp*(1-pp)/(m+1.5),2e-8)
+    # Unbiased count frequencies; pseudo counts stabilize variance only.
+    # A pseudocount in the mean is a material bias at small m.
+    pa=np.divide(lost,2*sent,out=np.zeros(len(x)),where=sent>0)
+    pp=np.divide(m-received,m,out=np.zeros(len(x)),where=m>0)
+    psa=(lost+.25)/(2*sent+.5);psp=(m-received+.25)/(m+.5)
+    va=np.maximum(psa*(1-psa)/(2*sent+1.5),2e-8)
+    vp=np.maximum(psp*(1-psp)/(m+1.5),2e-8)
     p=np.zeros(len(x));v=np.zeros(len(x));wa=np.zeros(len(x));wp=np.zeros(len(x))
     held=np.zeros(len(x),dtype=int)
     for ix in x.groupby(["simulation_seed","node_id"],sort=False).indices.values():
@@ -56,14 +59,14 @@ def estimate_reconciled(x,pc,vc,reconcile=True,delay_correct=True):
                 ar=float(va[i]+(bias_var if reconcile else 0.))
                 if age[i]>0:
                     # Delayed observation is applied as an innovation about
-                    # the stored contemporaneous prediction, not as a new
+                    # the stored contemporaneous filtered estimate, not as a new
                     # observation of the current state. Uncertainty grows.
                     if delay_correct:
-                        obs=mean+(obs-past_mean[t])
+                        obs=mean+(.8**age[i])*(obs-past_mean[t])
                     ar+=age[i]*(.0012**2+prior*.25)
             else:obs=0.;ar=1.
-            # Store the prediction at this interval for future delayed data.
-            past_mean.append(mean);past_passive.append(float(pp[i]))
+            # Store contemporaneous transport observations for later comparison.
+            past_passive.append(float(pp[i]))
             past_pvar.append(float(vp[i]));past_trusted.append(bool(paired[i]))
             if not(a_ok or b_ok):
                 missing+=1
@@ -94,6 +97,7 @@ def estimate_reconciled(x,pc,vc,reconcile=True,delay_correct=True):
                 if a_ok and b_ok:var+=ka*kb*(obs-pp[i])**2
                 wa[i]=ka;wp[i]=kb
             p[i]=np.clip(mean,1e-6,.45);v[i]=var;held[i]=missing
+            past_mean.append(float(p[i]))
     assert np.isfinite(p).all() and np.isfinite(v).all() and (v>=0).all()
     return p,v,av|pv,wa,wp,held
 

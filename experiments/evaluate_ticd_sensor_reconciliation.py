@@ -180,12 +180,14 @@ def main():
     with (a.out/"sensor_reconciliation_models.pkl").open("wb") as f:
         pickle.dump({"models":models,"references":refs,"joint_references":jrefs,"variance_calibration":vc,
             "frozen_package":pkg,"calibration":cal,"selected":specs},f,pickle.HIGHEST_PROTOCOL)
+    with (a.out/"sensor_reconciliation_models.pkl").open("rb") as f:reload=pickle.load(f)
+    assert reload["selected"]==specs and reload["variance_calibration"].manifest()==vc.manifest()
     report={"source_run":45626804800,"diagnostic_run":45652567764,"variance_seeds":VAR,"training_seeds":TRAIN,
         "scale_seeds":SCALE,"validation_seeds":VAL,"development_seeds":DEV,"test_seeds":TEST,"selected":specs,
         "selection":selection,"summary":summary,"heldout":held,"per_seed":per,"paired":paired,"measurement_diagnostics":diagnostics,
         "variance_calibration":vc.manifest(),"all_original_invariants_preserved":True,"full_reference_refit":True,
         "test_used_for_selection":False,"oracle_truth_used_for_variance_calibration_only":True,
-        "oracle_removal_verified":True,"prefix_causality":True,"observational_equivalence_verified":True,
+        "oracle_removal_verified":True,"reload_verified":True,"prefix_causality":True,"observational_equivalence_verified":True,
         "matched_200_population_assumed":True,"real_field_validation":False,
         "operational_gate_pass":summary["proposed"]["FPR_pass"]==400 and summary["proposed"]["FWR_pass"]==400}
     (a.out/"sensor_reconciliation_report.json").write_text(json.dumps(report,indent=2)+"\n")
