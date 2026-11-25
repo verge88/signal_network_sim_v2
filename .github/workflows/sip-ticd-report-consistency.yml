@@ -1,0 +1,67 @@
+name: SIP TICD report consistency and 90 percent recall
+on:
+  push:
+    branches: [study/ticd-report-consistency]
+    paths:
+      - 'sip/ticd_report_consistency.py'
+      - 'experiments/evaluate_ticd_report_consistency.py'
+      - '.github/workflows/sip-ticd-report-consistency.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+env:
+  OPENBLAS_NUM_THREADS: '1'
+  OMP_NUM_THREADS: '1'
+  MKL_NUM_THREADS: '1'
+  PYTHONHASHSEED: '0'
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+      - uses: actions/download-artifact@v4
+        with:
+          name: sip-ticd-sensor-reconciliation
+          run-id: 45656972020
+          github-token: ${{ github.token }}
+          path: prior
+      - name: Evaluate locked detector on fresh seeds
+        run: |
+          p="$(find prior -name sensor_reconciliation_models.pkl -print -quit)"
+          test -n "$p"
+          python -m experiments.evaluate_ticd_report_consistency --package "$p" --shard ${{ matrix.shard }} --out results
+      - uses: actions/upload-artifact@v4
+        with:
+          name: report-part-${{ matrix.shard }}
+          path: results/part-*.json
+          if-no-files-found: error
+  summarize:
+    needs: evaluate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: report-part-*
+          merge-multiple: true
+          path: results
+      - run: python -m experiments.evaluate_ticd_report_consistency --out results
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sip-ticd-90-report
+          path: results/report.json
+          if-no-files-found: error
