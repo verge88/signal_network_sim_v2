@@ -1,0 +1,143 @@
+name: SS7 meta episode development
+on:
+  push:
+    branches: [ss7-meta-episode-development]
+    paths: [.github/workflows/ss7-meta-episode-development.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-meta-episode-development-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/meta_episode_development.py
+      - name: Check route proxy, score causality and independent partitions
+        run: |
+          python - <<'PY'
+          from types import SimpleNamespace as S
+          import numpy as np
+          import pandas as pd
+          from ss7.meta_episode_development import RouteProxy,features,union,TRAIN,TEST
+          from ss7.incident_calibration_study import elapsed,triple,bucket_peaks
+          def route(a,b):
+              return S(paths=[(1,2,3)] if (a,b)==(1,3) else [(a,b)],shares=[1.])
+          topo=S(nodes={1:None,2:None,3:None},route=route)
+          def rep(dest,transit):
+              return S(state=S(dest=dest,transited=transit))
+          reps={1:rep({3:8},0),2:rep({},9),3:rep({1:10},0)}
+          proxy=RouteProxy(topo)
+          f=proxy.features(reps)
+          assert np.isclose(f[2]["route_expected_log"],np.log1p(9.))
+          assert f[2]["route_transit_res"]==0.
+          reps[2]=rep({},3)
+          assert np.isclose(proxy.features(reps)[2]["route_transit_res"],-1.)
+          assert np.isnan(proxy.features({1:reps[1]})[1]["route_transit_res"])
+          d=pd.DataFrame(dict(nid=[1,1,1,1,2,2],t=[0,1,2,4,0,1],label=[0]*6))
+          a=np.array([.1,.2,.3,.9,.8,.3]);b=a[::-1].copy()
+          z=features(d,a,b)
+          for i in range(1,len(d)+1):
+              assert np.allclose(features(d.iloc[:i],a[:i],b[:i]),z[:i])
+          assert np.array_equal(features(d.assign(label=1),a,b),z)
+          x,y,extra=union((d,),(a,),(b,))
+          u=np.maximum(a-x,b-y)-extra
+          assert (u>0).sum()<=int(10*elapsed(d))
+          assert (bucket_peaks(d,triple(d,u))>0).sum()<=int(elapsed(d))
+          assert not set(TRAIN)&set(TEST)
+          assert not set(TRAIN)&{s+j for s in TEST for j in (10000,20000,40000)}
+          print("Route proxy, causal score, partition and union budget checks passed")
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-specialist-trained
+          path: results/specialist
+          github-token: ${{ github.token }}
+          run-id: 45640796971
+      - run: python -u -m ss7.meta_episode_development train --frozen results/frozen/models.joblib --special results/specialist/specialist.joblib --output results/trained
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-meta-trained
+          path: results/trained
+  test:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        seed: [9501,9502,9503,9504,9505,9506,9507,9508]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-meta-trained
+          path: results/trained
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - uses: actions/download-artifact@v4
+        with:
+          name: incident-local-models
+          path: results/local
+          github-token: ${{ github.token }}
+          run-id: 45440533210
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-specialist-trained
+          path: results/specialist
+          github-token: ${{ github.token }}
+          run-id: 45640796971
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed_${{ matrix.seed }}
+          python -u -m ss7.meta_episode_development test --seed ${{ matrix.seed }} --local results/local/local_models.joblib --frozen results/frozen/models.joblib --special results/specialist/specialist.joblib --meta results/trained/meta.joblib --output results/seed_${{ matrix.seed }} 2>&1 | tee results/seed_${{ matrix.seed }}/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: meta-episode-seed-${{ matrix.seed }}
+          path: results/seed_${{ matrix.seed }}
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: meta-episode-seed-*
+          path: results/collected
+      - run: python -m ss7.meta_episode_development aggregate --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-meta-episode-development-summary
+          path: results/summary
