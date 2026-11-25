@@ -73,6 +73,24 @@ def extra_evidence(raw, normalize=False, ratio_resolution=.001):
     return pd.DataFrame({"report": report, "audit": audit}).reindex(raw.index)
 
 
+def qualified_levels(raw, base):
+    """Require recent transport coverage and repeated base evidence for a physical-only alert."""
+    x = raw.sort_values(KEYS)
+    groups = [x[k] for k in KEYS[:2]]
+    reset = x.interval.groupby(groups, sort=False).diff().ne(1) | ~x.primary_observer_valid
+    segments = groups + [reset.groupby(groups, sort=False).cumsum()]
+    available = (x.primary_observer_valid & x.passive_sent.gt(0) & x.active_sent.gt(0)
+                 & x.active_age.between(0, 3))
+    coverage = available.groupby(segments, sort=False).transform(
+        lambda v: v.rolling(32, min_periods=1).mean())
+    levels = pd.Series(base, index=raw.index).reindex(x.index)
+    reliable_hit = available & coverage.ge(.8) & levels.eq(2)
+    hits = reliable_hit.groupby(segments, sort=False).transform(
+        lambda v: v.rolling(5, min_periods=1).sum())
+    retain = reliable_hit & hits.ge(3)
+    return levels.mask(levels.eq(2) & ~retain, 0).reindex(raw.index).to_numpy(dtype=np.int8)
+
+
 class ReportConsistencyTICD:
     def __init__(self, reference, block_model, ratio_resolution=.001):
         self.ratio_resolution = ratio_resolution
@@ -89,6 +107,6 @@ class ReportConsistencyTICD:
         return np.where(raw.primary_observer_valid, levels, 0).astype(np.int8)
 
     def predict_levels(self, raw, commissioning):
-        base = self.baseline(raw, commissioning)
+        base = qualified_levels(raw, self.baseline(raw, commissioning))
         confirm = extra_evidence(raw, ratio_resolution=self.ratio_resolution).any(axis=1)
         return np.where(confirm, 2, base).astype(np.int8)

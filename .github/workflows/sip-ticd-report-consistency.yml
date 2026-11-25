@@ -58,6 +58,7 @@ jobs:
             results/report_consistency_ticd.pkl
             results/requirements-frozen.txt
             results/source-commit.txt
+            results/regression.json
           if-no-files-found: error
   summarize:
     needs: evaluate

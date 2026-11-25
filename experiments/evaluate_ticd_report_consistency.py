@@ -13,11 +13,11 @@ sys.path[:0] = [str(ROOT / "sip"), str(ROOT / "experiments")]
 from evaluate_ticd_adaptive_loss_fusion import KINDS, NATIVE, WEAK, group
 from evaluate_ticd_full_count_evidence import POLICY
 from ticd_measured_loss import RAW
-from ticd_report_consistency import ReportConsistencyTICD, RATIOS, extra_evidence
+from ticd_report_consistency import ReportConsistencyTICD, RATIOS, extra_evidence, qualified_levels
 
 COLUMNS = list(dict.fromkeys([*RAW, *RATIOS, "obs_method_dominance_ratio", "obs_invite_ack_ratio",
                              "audit_observed_count", "audit_mismatch_count"]))
-MODELS = ("block", "block_report", "full", "normalized", "coherent", "rounded_2dp")
+MODELS = ("block", "block_report", "unguarded", "full", "normalized", "coherent", "rounded_2dp")
 REPLICATES = 10
 
 
@@ -34,12 +34,22 @@ def evaluate(package, shard, out):
     ref = prior["references"]["adaptive_fast"]
     model = ReportConsistencyTICD(ref, prior["models"]["frozen_block"])
     rows = []
+    if shard == 0:
+        # This previously observed failure is a named regression, outside the new holdout.
+        r, _, _, c = group([643404], prior["calibration"], "probe_outage_clean", ref.core.causal)
+        z = model.predict_levels(r[COLUMNS], c[list(RAW)])
+        old = model.baseline(r[COLUMNS], c[list(RAW)])
+        replay = {"seed": 643404, "original": counts(old, r.is_anomaly),
+                  "qualified": counts(z, r.is_anomaly)}
+        (out / "regression.json").write_text(json.dumps(replay))
+        print("TRANSPORT_REGRESSION", json.dumps(replay), flush=True)
     for i, kind in enumerate(KINDS):
-        seed = 640001 + i * 100 + shard
+        seed = 680001 + i * 100 + shard
         raw, _, _, commissioning = group([seed], prior["calibration"], kind, ref.core.causal)
         obs = raw[COLUMNS]
         commissioning = commissioning[list(RAW)]
         base = model.baseline(obs, commissioning)
+        qualified = qualified_levels(obs, base)
         evidence = extra_evidence(obs)
         norm = extra_evidence(obs, normalize=True)
         # Independent representation controls on exactly the same underlying run.
@@ -55,11 +65,12 @@ def evaluate(package, shard, out):
         coherent["obs_invite_ack_ratio"] = shares.obs_ratio_invite / shares.obs_ratio_ack.clip(lower=.001)
         consistent = extra_evidence(coherent)
         assert not consistent.report.any()
-        levels = {"block": base, "block_report": np.where(evidence.report, 2, base),
-                  "full": np.where(evidence.any(axis=1), 2, base),
-                  "normalized": np.where(norm.any(axis=1), 2, base),
-                  "coherent": np.where(consistent.any(axis=1), 2, base),
-                  "rounded_2dp": np.where(coarse.any(axis=1), 2, base)}
+        levels = {"block": base, "block_report": np.where(evidence.report, 2, qualified),
+                  "unguarded": np.where(evidence.any(axis=1), 2, base),
+                  "full": np.where(evidence.any(axis=1), 2, qualified),
+                  "normalized": np.where(norm.any(axis=1), 2, qualified),
+                  "coherent": np.where(consistent.any(axis=1), 2, qualified),
+                  "rounded_2dp": np.where(coarse.any(axis=1), 2, qualified)}
         blind = ~obs.primary_observer_valid & obs.audit_observed_count.eq(0)
         assert not np.any(levels["full"][blind] > 0)
         if i == 0:
