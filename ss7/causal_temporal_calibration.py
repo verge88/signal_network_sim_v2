@@ -47,7 +47,8 @@ def causal(d,s,k):
     z=pd.Series(l).groupby(groups,sort=False).rolling(k,min_periods=1).mean().droplevel(0).to_numpy()
     return 1/(1+np.exp(-z))
 
-def cutoff(d,s,raw,notice):
+def cutoffs(d,s,raw,notice):
+    """Return separate thresholds for raw windows and confirmed notifications."""
     neg=d.label.to_numpy()==0
     z=triple(d,np.where(neg,s,-np.inf))
     b=bucket_peaks(d,z)
@@ -56,7 +57,10 @@ def cutoff(d,s,raw,notice):
     # No all-negative consecutive windows means no estimable incident tail;
     # fail closed rather than silently skipping the constraint.
     ni=threshold(b,notice,elapsed(d)) if np.isfinite(b).any() else 1.
-    return max(nr,ni)
+    return nr,ni
+
+def cutoff(d,s,raw,notice):
+    return max(cutoffs(d,s,raw,notice))
 
 def calibrate(refs,ss,mode,fraction):
     """Allocate the network-wide budgets proportionally to monitored nodes."""

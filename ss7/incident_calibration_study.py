@@ -86,9 +86,9 @@ def notify(d,z,thr):
                    bucket=d.t.to_numpy()[idx]//BUCKET))
     return selected.drop_duplicates(["nid","bucket"],keep="first").i.to_numpy(int)
 
-def metrics(d,s,z,thr,eligible=None):
+def metrics(d,s,z,thr,eligible=None,*,notification_threshold=None):
     fire=s>thr
-    ix=notify(d,z,thr)
+    ix=notify(d,z,thr if notification_threshold is None else notification_threshold)
     y=d.label.to_numpy();eid=d.episode_id.to_numpy();t=d.t.to_numpy()
     # Classify notifications by all three constituent windows; mixed onset
     # alerts are reported separately. Test labels do not affect notification.
