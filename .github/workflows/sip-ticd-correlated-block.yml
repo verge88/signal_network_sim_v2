@@ -1,0 +1,65 @@
+name: SIP TICD correlation-aware block evidence
+on:
+  push:
+    branches: [study/ticd-correlated-block-evidence]
+    paths:
+      - 'sip/ticd_correlated_block.py'
+      - 'experiments/evaluate_ticd_correlated_block.py'
+      - '.github/workflows/sip-ticd-correlated-block.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+      PYTHONHASHSEED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install and compile
+        run: |
+          set -euo pipefail
+          python -m pip install 'numpy>=1.26,<3' 'pandas>=2,<3' 'scipy>=1.11,<2' 'scikit-learn>=1.4,<2' 'networkx>=3,<4'
+          python -m compileall -q sip/ticd_correlated_block.py experiments/evaluate_ticd_correlated_block.py
+          python -m pip freeze > sequential_environment.txt
+      - name: Recover frozen comparator
+        run: |
+          set -euo pipefail
+          gh run download 45598072369 --repo "${{ github.repository }}" --name sip-ticd-sequential-physical --dir prior
+          p="$(find prior -type f -name sequential_physical_models.pkl -print -quit)"
+          test -n "$p"
+          echo "PRIOR_DIR=$(dirname "$p")" >> "$GITHUB_ENV"
+      - name: Calibrate, select and independently evaluate
+        run: python -m experiments.evaluate_ticd_correlated_block --prior "$PRIOR_DIR" --out results_correlated_block
+      - name: Verify experiment integrity
+        run: |
+          python - <<'PY'
+          import json
+          d=json.load(open('results_correlated_block/correlated_block_report.json'))
+          assert not d['test_used_for_selection'] and not d['real_field_validation']
+          assert all(d[k] for k in ('prefix_causality','label_and_batch_invariance','oracle_removal_verified','reload_verified','observational_equivalence_verified','all_original_invariants_preserved','frozen_feature_references'))
+          seeds=[s for k in ('validation_seeds','development_seeds','test_seeds') for ss in d[k].values() for s in ss]
+          assert len(seeds)==len(set(seeds))
+          assert len(d['heldout'])==40 and len(d['summary'])==10 and len(d['paired'])==18
+          assert all(len(v)==5 for v in d['test_seeds'].values())
+          print('BLOCK_AUDIT_VERIFIED', 'operational_gate_pass=',d['operational_gate_pass'])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sip-ticd-correlated-block
+          path: |
+            results_correlated_block/
+            sequential_environment.txt
+          if-no-files-found: warn
+          retention-days: 30
