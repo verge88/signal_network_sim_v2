@@ -1,0 +1,202 @@
+name: SS7 factorial frozen model versus attack comparison
+on:
+  push:
+    branches: [ss7-factorial-model-comparison]
+    paths: [.github/workflows/ss7-factorial-model-comparison.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-factorial-model-comparison-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/factorial_model_comparison.py
+      - name: Validate balanced coverage and no overlapping compromises
+        run: |
+          python - <<'PY'
+          from ss7.factorial_model_comparison import *
+          for arm in ARMS:
+              for seed in SEEDS:
+                  cfg=F.SimConfig(seed=seed,days=DAYS)
+                  sim=(F.Ss7Sim if arm=="legacy" else O.CorrectedSim)(cfg,F.RngBook(seed))
+                  eps=balanced(arm,sim,cfg,F.RngBook(seed)["episode"],n_compromise=0,n_normal=128,n_ext=20)
+                  q=[e for e in eps if e.kind=="compromise"]
+                  expected=220 if arm=="legacy" else 100
+                  assert len(q)==expected
+                  keys={(e.sophistication.value,scenario_name(arm,e),e.hidden_rate,sim.topo.nodes[e.nid].ntype.value) for e in q}
+                  assert len(keys)==expected
+                  for n in sim.topo.slaves:
+                      intervals=sorted((e.t0,e.t1) for e in q if e.nid==n)
+                      assert all(b+3<c for (a,b),(c,d) in zip(intervals,intervals[1:]))
+                  assert all(WARMUP<e.t0<=e.t1<cfg.n_intervals for e in q)
+              print(arm,expected,"complete distinct cells per world")
+          assert not set(SEEDS)&{s+j for s in SEEDS for j in (10000,20000,40000)}
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: incident-local-models
+          path: results/models/local
+          github-token: ${{ github.token }}
+          run-id: 45440533210
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/models/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-specialist-trained
+          path: results/models/specialist
+          github-token: ${{ github.token }}
+          run-id: 45640796971
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-meta-trained
+          path: results/models/meta
+          github-token: ${{ github.token }}
+          run-id: 45659800298
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-weak-trained
+          path: results/models/weak
+          github-token: ${{ github.token }}
+          run-id: 45673139066
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-episode-ranks
+          path: results/models/ranks
+          github-token: ${{ github.token }}
+          run-id: 45783712788
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-multiscale-trained
+          path: results/models/multi
+          github-token: ${{ github.token }}
+          run-id: 45800784779
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-observability-trained
+          path: results/models/corrected
+          github-token: ${{ github.token }}
+          run-id: 45828084337
+      - name: Verify frozen artifact registry
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from ss7.factorial_model_comparison import load_all
+          a=load_all(Path("results/models"))
+          for k,v in a.items(): print(k,sorted(v))
+          assert {"own","report_inv","report_full","report_no_od","report_link_only"}<=set(a["frozen"])
+          assert {"strict_local"}<=set(a["local"])
+          assert {"peer_only","direction_only","enhanced","enhanced_hard","refit_full"}<=set(a["specialist"])
+          assert {"meta_hgb","meta_logistic","meta_route"}<=set(a["meta"])
+          assert {"weak","weak_route"}<=set(a["weak"])
+          assert {"rank2","rank4","rank8"}<=set(a["ranks"])
+          assert {"refit","multiscale"}<=set(a["multi"])
+          assert {"local","report","typed","boundary","expanded","role_expanded"}<=set(a["corrected"])
+          PY
+  test:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        arm: [legacy, corrected]
+        seed: [14001,14002,14003,14004,14005,14006,14007,14008]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: incident-local-models
+          path: results/models/local
+          github-token: ${{ github.token }}
+          run-id: 45440533210
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/models/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-specialist-trained
+          path: results/models/specialist
+          github-token: ${{ github.token }}
+          run-id: 45640796971
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-meta-trained
+          path: results/models/meta
+          github-token: ${{ github.token }}
+          run-id: 45659800298
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-weak-trained
+          path: results/models/weak
+          github-token: ${{ github.token }}
+          run-id: 45673139066
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-episode-ranks
+          path: results/models/ranks
+          github-token: ${{ github.token }}
+          run-id: 45783712788
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-multiscale-trained
+          path: results/models/multi
+          github-token: ${{ github.token }}
+          run-id: 45800784779
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-observability-trained
+          path: results/models/corrected
+          github-token: ${{ github.token }}
+          run-id: 45828084337
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed
+          python -u -m ss7.factorial_model_comparison test --arm ${{ matrix.arm }} --seed ${{ matrix.seed }} --models results/models --output results/seed 2>&1 | tee results/seed/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: factorial-${{ matrix.arm }}-${{ matrix.seed }}
+          path: results/seed
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: factorial-*
+          path: results/collected
+      - run: python -u -m ss7.factorial_model_comparison aggregate --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-factorial-comparison-summary
+          path: results/summary
