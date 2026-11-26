@@ -1,0 +1,135 @@
+name: SIP TICD full comparison with article models
+on:
+  push:
+    branches: [study/ticd-article-benchmark]
+    paths:
+      - 'experiments/evaluate_ticd_article_benchmark.py'
+      - '.github/workflows/sip-ticd-article-benchmark.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+env:
+  OPENBLAS_NUM_THREADS: '1'
+  OMP_NUM_THREADS: '1'
+  MKL_NUM_THREADS: '1'
+  PYTHONHASHSEED: '0'
+  PY_BASE: 'numpy==2.4.6 pandas==2.3.3 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1'
+  GH_TOKEN: ${{ github.token }}
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install $PY_BASE
+      - name: Recover frozen model and source calibration
+        run: |
+          gh run download 45688280428 -n sip-ticd-report-consistency-model -D prior
+          gh run download 45656972020 -n sip-ticd-sensor-reconciliation -D prior
+          if [[ ! -f prior/sensor_reconciliation_models.pkl ]]; then
+            cp "$(find prior -mindepth 2 -name sensor_reconciliation_models.pkl -print -quit)" prior/
+          fi
+      - run: python -m experiments.evaluate_ticd_article_benchmark prepare --prior prior --shard ${{ matrix.shard }} --out data
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-data-${{ matrix.shard }}
+          path: data/*.pkl.gz
+          compression-level: 0
+          if-no-files-found: error
+  fit:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        track: [article, shared]
+        family: [isolation_forest, one_class_svm, autoencoder, random_forest, gradient_boosting]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install $PY_BASE
+      - if: matrix.family == 'autoencoder'
+        run: python -m pip install torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-data-*
+          path: data
+          merge-multiple: true
+      - run: python -m experiments.evaluate_ticd_article_benchmark fit --data data --track ${{ matrix.track }} --family ${{ matrix.family }} --out fitted
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-model-${{ matrix.track }}-${{ matrix.family }}
+          path: fitted/
+          if-no-files-found: error
+  test:
+    needs: fit
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install $PY_BASE
+      - run: python -m pip install torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
+      - name: Recover frozen TICD and original test ledger
+        run: |
+          gh run download 45688280428 -n sip-ticd-report-consistency-model -D prior
+          gh run download 45688280428 -n sip-ticd-90-report -D prior
+          gh run download 45656972020 -n sip-ticd-sensor-reconciliation -D prior
+          if [[ ! -f prior/sensor_reconciliation_models.pkl ]]; then
+            cp "$(find prior -mindepth 2 -name sensor_reconciliation_models.pkl -print -quit)" prior/
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-model-*
+          merge-multiple: true
+          path: fitted
+      - run: python -m experiments.evaluate_ticd_article_benchmark test --prior prior --models fitted --shard ${{ matrix.shard }} --out scored
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-scores-${{ matrix.shard }}
+          path: scored/
+          compression-level: 0
+          if-no-files-found: error
+  summarize:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install $PY_BASE matplotlib
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-model-*
+          merge-multiple: true
+          path: fitted
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-scores-*
+          merge-multiple: true
+          path: scored
+      - run: python -m experiments.evaluate_ticd_article_benchmark summarize --data scored --models fitted --out benchmark
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sip-ticd-article-comparison
+          path: benchmark/
+          if-no-files-found: error
