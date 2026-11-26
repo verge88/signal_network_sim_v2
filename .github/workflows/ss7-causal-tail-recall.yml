@@ -1,0 +1,135 @@
+name: SS7 causal tail accumulation recall target
+on:
+  push:
+    branches: [ss7-causal-tail-recall]
+    paths: [.github/workflows/ss7-causal-tail-recall.yml, ss7/causal_tail_recall.py]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - name: Check causal prefix, gap reset and node isolation
+        run: |
+          python - <<'PY'
+          import numpy as np
+          import pandas as pd
+          from ss7.causal_tail_recall import accumulated, reference_tails
+          ref = pd.DataFrame(dict(nid=[1]*10+[2]*10, label=[0]*20))
+          tails = reference_tails(ref, np.tile(np.arange(10)/10, 2))
+          d = pd.DataFrame(dict(nid=[1]*10+[2]*4, t=[0,1,2,3,4,5,7,8,9,10,1,2,3,4]))
+          x = np.full(len(d), .99)
+          y = accumulated(d, x, tails, (1,4))
+          assert y[3] > y[0] and y[6] == y[0] == y[10]
+          for i in range(1,len(d)+1):
+              np.testing.assert_allclose(accumulated(d.iloc[:i], x[:i], tails, (1,4)), y[:i])
+          PY
+  validate:
+    needs: check
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [15101, 15102, 15103, 15104, 15105, 15106]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-observability-trained
+          run-id: 45828084337
+          github-token: ${{ github.token }}
+          path: models
+      - run: python -u -m ss7.causal_tail_recall validate --seed ${{ matrix.seed }} --models models/models.joblib --output results
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validate-${{ matrix.seed }}
+          path: results
+          if-no-files-found: error
+  select:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: validate-*
+          path: collected
+      - run: python -u -m ss7.causal_tail_recall select --input collected --output results
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validation-selection
+          path: results
+          if-no-files-found: error
+  confirm:
+    needs: select
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [15201, 15202, 15203, 15204, 15205, 15206, 15207, 15208, 15209, 15210, 15211, 15212, 15213, 15214, 15215, 15216]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: validation-selection
+          path: selected
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-observability-trained
+          run-id: 45828084337
+          github-token: ${{ github.token }}
+          path: models
+      - run: python -u -m ss7.causal_tail_recall confirm --seed ${{ matrix.seed }} --models models/models.joblib --selection selected/selection.json --output results
+      - uses: actions/upload-artifact@v4
+        with:
+          name: confirm-${{ matrix.seed }}
+          path: results
+          if-no-files-found: error
+  summary:
+    needs: confirm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: validation-selection
+          path: selected
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: confirm-*
+          path: collected
+      - run: python -u -m ss7.causal_tail_recall summary --input collected --selection selected/selection.json --output results
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-tail-confirmation
+          path: results
+          if-no-files-found: error
