@@ -34,7 +34,8 @@ def prepare(repeat, reference, calibration, folder):
                 assert not raw.is_anomaly.any(), kind
             if stage == "train" and kind in NORMAL:
                 references.append(labels(raw[bench.COLUMNS], raw))
-                commissioning.append(commission[list(bench.RAW)])
+                assert not commission.is_anomaly.any()
+                commissioning.append(labels(commission[list(bench.RAW)], commission))
             if stage == "val":
                 validation[kind] = (labels(raw[bench.COLUMNS], raw), commission[list(bench.RAW)])
             features, available = bench.measurements(raw)
