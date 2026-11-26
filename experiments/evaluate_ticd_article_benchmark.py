@@ -115,7 +115,7 @@ def threshold(scores, budget):
     return float(np.partition(scores, len(scores) - 1 - keep)[len(scores) - 1 - keep])
 
 
-def fit(which, track, data, out):
+def fit(which, track, data, out, *, fit_seed=FIT_SEED, shards=(0, 1)):
     from sklearn.ensemble import GradientBoostingClassifier, IsolationForest, RandomForestClassifier
     from sklearn.impute import SimpleImputer
     from sklearn.model_selection import train_test_split
@@ -123,17 +123,17 @@ def fit(which, track, data, out):
     from sklearn.svm import OneClassSVM
 
     train, val = [pd.concat([pd.read_pickle(data / f"{stage}-{track}-{i}.pkl.gz")
-                            for i in range(2)], ignore_index=True) for stage in ("train", "val")]
+                            for i in shards], ignore_index=True) for stage in ("train", "val")]
     assert not set(train.seed) & set(val.seed) and not val.y.any()
     supervised = which in SUPERVISED
     features = train.columns.difference(["y", "seed", "clean_run", "visible"]).tolist()
     pool = train[train.visible & (True if supervised else train.clean_run & ~train.y)]
     # Fixed original article training size keeps the kernel SVM tractable.
     if supervised:
-        sample, _ = train_test_split(pool, train_size=SAMPLE_SIZE, stratify=pool.y, random_state=FIT_SEED)
+        sample, _ = train_test_split(pool, train_size=SAMPLE_SIZE, stratify=pool.y, random_state=fit_seed)
         assert sample.y.any()
     else:
-        sample = pool.sample(SAMPLE_SIZE, random_state=FIT_SEED)
+        sample = pool.sample(SAMPLE_SIZE, random_state=fit_seed)
         assert not sample.y.any()
     imputer = SimpleImputer(strategy="median", keep_empty_features=True).fit(sample[features])
     scaler = StandardScaler().fit(imputer.transform(sample[features]))
@@ -143,17 +143,19 @@ def fit(which, track, data, out):
         import torch
         from train_ticd import train_ae
         torch.set_num_threads(1)
-        torch.manual_seed(FIT_SEED)
+        torch.manual_seed(fit_seed)
         model, hist = train_ae(X)
     else:
         constructors = {
-            "isolation_forest": lambda: IsolationForest(n_estimators=300, contamination=.05, random_state=FIT_SEED, n_jobs=2),
+            "isolation_forest": lambda: IsolationForest(n_estimators=300, contamination=.05, random_state=fit_seed, n_jobs=2),
             "one_class_svm": lambda: OneClassSVM(nu=.05, kernel="rbf", gamma="scale", cache_size=1024),
-            "random_forest": lambda: RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=FIT_SEED, n_jobs=2),
-            "gradient_boosting": lambda: GradientBoostingClassifier(n_estimators=300, learning_rate=.05, max_depth=5, random_state=FIT_SEED),
+            "random_forest": lambda: RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=fit_seed, n_jobs=2),
+            "gradient_boosting": lambda: GradientBoostingClassifier(n_estimators=300, learning_rate=.05, max_depth=5, random_state=fit_seed),
         }
         estimator = constructors[which]()
         model = estimator.fit(X, sample.y) if supervised else estimator.fit(X)
+    if which == "gradient_boosting":
+        hist = model.train_score_.tolist()
     scores = np.asarray(score(which, model, scaler.transform(imputer.transform(val[features]))), float)
     assert np.isfinite(scores).all()
     scores[~val.visible.to_numpy()] = -np.inf
@@ -169,13 +171,14 @@ def fit(which, track, data, out):
                for ix in val.groupby("seed").indices.values())
     manifest = {"model": which, "track": track, "supervised": supervised, "features": features,
                 "training_rows": len(sample), "training_attack_rows": int(sample.y.sum()),
-                "training_seeds": sorted(map(int, sample.seed.unique())), "training_rng": FIT_SEED,
+                "training_seeds": sorted(map(int, sample.seed.unique())), "training_rng": fit_seed,
                 "validation_rows": len(val), "validation_seeds": sorted(map(int, val.seed.unique())),
                 "thresholds": cuts, "validation_fpr": val_rates, "training_loss": hist}
     print("BASELINE_FIT", json.dumps(manifest), flush=True)
     with (out / f"{track}-{which}.pkl").open("wb") as f:
         pickle.dump((imputer, scaler, model, manifest), f, pickle.HIGHEST_PROTOCOL)
     dump(out / f"{track}-{which}.json", manifest)
+    return imputer, scaler, model, manifest
 
 
 def test_part(prior, models, shard, out):
