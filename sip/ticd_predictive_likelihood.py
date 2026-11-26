@@ -9,6 +9,7 @@ model, not an exact posterior for a time-varying latent process.
 """
 from __future__ import annotations
 import numpy as np
+import pandas as pd
 from scipy.special import betaincinv,logsumexp
 from scipy.stats import binom
 
@@ -113,7 +114,8 @@ def features(x):
                 scores[f"pred_{source}_cusum"][i]=state[j].max()
     out=x.copy()
     for k,v in scores.items():out.loc[z.index,k]=v
-    out.loc[z.index,"pred_valid"]=valid
+    out["pred_valid"]=pd.Series(valid,index=z.index,dtype=bool).reindex(x.index)
+    assert out["pred_valid"].dtype==bool and not out["pred_valid"].isna().any()
     return out
 
 class PredictiveFusion:

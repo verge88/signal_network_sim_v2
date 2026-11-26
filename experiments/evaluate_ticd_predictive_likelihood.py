@@ -87,6 +87,7 @@ def main():
     for n in ("frozen_adaptive_fast","frozen_sequential","frozen_block","frozen_oracle"):models[n]=pkg["models"][n]
     models["frozen_joint"]=base
     print("PRED_SELECTED",json.dumps({"selected":specs,"selection":selection,"feasible_count":sum(v["feasible"] for v in selection.values())}),flush=True)
+    (a.out/"development_selection.json").write_text(json.dumps({"selected":specs,"selection":selection,"development_only":True},indent=2)+"\n")
     raw,_,_,c=group([510001],cal,"clean_loss10",causal)
     latent,_,_,lc=group([510001],cal,"latent_identical",causal)
     x=prep(raw,c);l=prep(latent,lc);pd.testing.assert_frame_equal(x,l)
@@ -96,7 +97,16 @@ def main():
     pd.testing.assert_frame_equal(x,prep(raw.drop(columns=bad,errors="ignore"),c.drop(columns=bad,errors="ignore")))
     prefix=prep(raw.loc[raw.interval<180],c)
     for col in [k for k in x if k.startswith("pred_") or k.startswith("joint_")]:
-        np.testing.assert_allclose(prefix[col],x.loc[prefix.index,col],atol=1e-9,rtol=0)
+        left=prefix[col];right=x.loc[prefix.index,col]
+        if col=="pred_valid":
+            assert not left.isna().any() and not right.isna().any()
+            assert left.isin([True,False]).all() and right.isin([True,False]).all()
+            np.testing.assert_array_equal(left.to_numpy(dtype=bool),right.to_numpy(dtype=bool),err_msg=col)
+        else:
+            u=left.to_numpy(dtype=float);v=right.to_numpy(dtype=float)
+            assert np.isfinite(u).all() and np.isfinite(v).all(),col
+            np.testing.assert_allclose(u,v,atol=1e-9,rtol=0,err_msg=col)
+    print("PRED_PREFIX_VERIFIED",flush=True)
     # ACK cannot influence inferred transport distribution.
     perturbed=x.copy();perturbed["cu_n_ack_transit"]=0
     for u,v in zip(posterior(x)[3:],posterior(perturbed)[3:]):np.testing.assert_array_equal(u,v)
