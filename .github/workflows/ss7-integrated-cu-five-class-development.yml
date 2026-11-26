@@ -1,0 +1,179 @@
+name: SS7 integrated CU and five class comparison
+on:
+  push:
+    branches: [ss7-integrated-cu-five-class-development]
+    paths: [.github/workflows/ss7-integrated-cu-five-class-development.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-integrated-cu-five-class-development-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/integrated_cu_five_class_development.py
+      - name: Test CU path transport, episode coverage and end-to-end feature extraction
+        run: |
+          python - <<'PY'
+          import numpy as np
+          import ss7.integrated_cu_five_class_development as I
+          from collections import Counter
+          F=I.F
+          assert len(I.ARTICLE)==50 and len(set(I.ARTICLE))==50
+          assert len(I.SPECIAL)==21 and len(set(I.SPECIAL))==21
+          assert I.wire_bytes(257)>I.wire_bytes(256)>256
+          assert not set(I.TRAIN+I.VAL+I.TEST)&{s+j for s in I.VAL+I.TEST for j in (10000,20000,40000)}
+          for seed in I.TRAIN+I.VAL+I.TEST:
+              cfg=F.SimConfig(seed=seed,days=3.)
+              sim=I.IntegratedSim(cfg,F.RngBook(seed))
+              eps=I.make_episodes(sim,cfg,F.RngBook(seed)["episode"],True)
+              q=[e for e in eps if e.kind in I.CLASSES]
+              assert Counter(e.kind for e in q)=={"compromise":100,**{k:25 for k in I.OTHER}}
+              assert len({(e.sophistication.value,I.B.scenario_name("corrected",e),e.hidden_rate,sim.topo.nodes[e.nid].ntype.value) for e in q if e.kind=="compromise"})==100
+              for n in sim.topo.slaves:
+                  iv=sorted((e.t0,e.t1) for e in q if e.nid==n)
+                  assert all(b+3<c for (a,b),(c,d) in zip(iv,iv[1:]))
+              for e in q:
+                  if e.kind!="compromise": assert sim.attack_paths(e.kind,e.nid)
+              plans=sim.poll_plans(0,set())
+              assert set(plans)==set(sim.topo.slaves)
+              for n,(p,size) in plans.items():
+                  assert p[-1]==n and sim.topo.nodes[p[0]].role==F.NodeRole.MASTER and size>=50
+                  assert len(p)==len(set(p))
+              p,size=next(iter(plans.values()))
+              k=tuple(sorted(p[:2]))
+              lstate={x:(.5,1.,0.) for x in sim.topo.linksets}
+              assert I.transmit(p,size,lstate,sim.topo,np.random.default_rng(seed))[0]
+              lstate[k]=(.5,1.,1.)
+              assert not I.transmit(p,size,lstate,sim.topo,np.random.default_rng(seed))[0]
+          I.DAYS=.03
+          d,sim,eps,tr=I.generate(16000,False)
+          assert len(d)>0 and d.label.sum()==0 and len(tr)==len(sim.topo.slaves)
+          assert d.cu_delivered.isin([0,1]).all()
+          assert (d.loc[d.cu_delivered==1,"cu_staleness"]==0).all()
+          assert d.loc[d.cu_delivered==0,"cu_rtt_delay"].isna().all()
+          assert d.loc[d.cu_delivered==0,"pair_mean"].isna().all()
+          for n in I.BASE+("expanded_special","article_special"):
+              names=I.cols(d,n)
+              assert set(names)<=set(d.columns)
+              assert not set(names)&{"label","attack","episode_id","hidden_msgs","audit_visible","nid","t"}
+          print("CU transport, all registered episode schedules, no stale residuals, feature registry and smoke generation passed")
+          PY
+      - run: python -u -m ss7.integrated_cu_five_class_development train --output results/trained
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-integrated-cu-trained
+          path: results/trained
+  validate:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        seed: [16101,16102,16103,16104]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-integrated-cu-trained
+          path: results/trained
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed
+          python -u -m ss7.integrated_cu_five_class_development validate --seed ${{ matrix.seed }} --models results/trained/models.joblib --output results/seed 2>&1 | tee results/seed/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integrated-validate-seed-${{ matrix.seed }}
+          path: results/seed
+  select:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: integrated-validate-seed-*
+          path: results/collected
+      - run: python -m ss7.integrated_cu_five_class_development select --input results/collected --output results/selection
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-integrated-cu-selection
+          path: results/selection
+  test:
+    needs: select
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        seed: [16201,16202,16203,16204,16205,16206,16207,16208]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-integrated-cu-trained
+          path: results/trained
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-integrated-cu-selection
+          path: results/selection
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed
+          python -u -m ss7.integrated_cu_five_class_development test --seed ${{ matrix.seed }} --models results/trained/models.joblib --selection results/selection/selection.json --output results/seed 2>&1 | tee results/seed/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integrated-test-seed-${{ matrix.seed }}
+          path: results/seed
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: integrated-test-seed-*
+          path: results/collected
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-integrated-cu-selection
+          path: results/selection
+      - run: python -u -m ss7.integrated_cu_five_class_development aggregate --input results/collected --selection results/selection/selection.json --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-integrated-cu-summary
+          path: results/summary
