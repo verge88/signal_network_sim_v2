@@ -1,0 +1,283 @@
+name: SS7 multiscale role development
+on:
+  push:
+    branches: [ss7-multiscale-role-development]
+    paths: [.github/workflows/ss7-multiscale-role-development.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-multiscale-role-development-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  old_overlap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-episode-ranking-summary
+          path: results/old
+          github-token: ${{ github.token }}
+          run-id: 45783712788
+      - run: python -m ss7.multiscale_role_development old_overlap --input results/old --output results/overlap
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-previous-weak-rank-overlap
+          path: results/overlap
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/multiscale_role_development.py
+      - name: Verify causal windows, role-tail calibration and partition independence
+        run: |
+          python - <<'PY'
+          import numpy as np
+          import pandas as pd
+          from ss7.multiscale_role_development import multiscale,role_tail,INVARIANTS,TRAIN,VAL,TEST,CONF
+          d=pd.DataFrame(dict(nid=[1]*5+[2]*3,t=[0,1,2,4,5,0,1,2],
+              **{c:[-1.,2.,-3.,4.,5.,6.,7.,8.] for c in INVARIANTS}))
+          q=multiscale(d)
+          assert q.shape==(8,42)
+          c=INVARIANTS[0]
+          assert np.allclose(q[c+"_mean3"],[np.nan,np.nan,-2/3,np.nan,np.nan,np.nan,np.nan,7.],equal_nan=True)
+          assert np.allclose(q[c+"_abs3"],[np.nan,np.nan,2.,np.nan,np.nan,np.nan,np.nan,7.],equal_nan=True)
+          for i in range(1,len(d)+1):
+              pd.testing.assert_frame_equal(multiscale(d.iloc[:i]),q.iloc[:i])
+          ref=pd.DataFrame(dict(ntype=["A"]*1000+["B"]*1000,label=[0]*2000))
+          scores=np.r_[np.linspace(0,.4,1000),np.linspace(.6,1,1000)]
+          test=pd.DataFrame(dict(ntype=["A","B","C"],label=[0,0,0]))
+          v=np.array([.5,.5,.5])
+          a=role_tail((ref,),(scores,),[(test,v)])[0]
+          assert a[0]>a[2]>a[1]
+          assert np.array_equal(a,role_tail((ref,),(scores,),[(test.assign(label=1),v)])[0])
+          assert len(set(TRAIN+VAL+TEST+CONF))==len(TRAIN+VAL+TEST+CONF)
+          assert not set(TRAIN+VAL+TEST+CONF)&{s+j for s in VAL+TEST+CONF for j in (10000,20000,40000)}
+          print("42 causal features, role survival and partition checks passed")
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-specialist-trained
+          path: results/specialist
+          github-token: ${{ github.token }}
+          run-id: 45640796971
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-meta-trained
+          path: results/meta
+          github-token: ${{ github.token }}
+          run-id: 45659800298
+      - uses: actions/download-artifact@v4
+        with:
+          name: incident-local-models
+          path: results/local
+          github-token: ${{ github.token }}
+          run-id: 45440533210
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-weak-trained
+          path: results/weak
+          github-token: ${{ github.token }}
+          run-id: 45673139066
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-episode-ranks
+          path: results/ranks
+          github-token: ${{ github.token }}
+          run-id: 45783712788
+      - run: python -u -m ss7.multiscale_role_development train --local results/local/local_models.joblib --frozen results/frozen/models.joblib --special results/specialist/specialist.joblib --meta results/meta/meta.joblib --weak results/weak/weak.joblib --ranks results/ranks/ranks.joblib --output results/extra
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-multiscale-trained
+          path: results/extra
+  validate:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        seed: [12101,12102,12103,12104,12105,12106]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-specialist-trained
+          path: results/specialist
+          github-token: ${{ github.token }}
+          run-id: 45640796971
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-meta-trained
+          path: results/meta
+          github-token: ${{ github.token }}
+          run-id: 45659800298
+      - uses: actions/download-artifact@v4
+        with:
+          name: incident-local-models
+          path: results/local
+          github-token: ${{ github.token }}
+          run-id: 45440533210
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-weak-trained
+          path: results/weak
+          github-token: ${{ github.token }}
+          run-id: 45673139066
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-episode-ranks
+          path: results/ranks
+          github-token: ${{ github.token }}
+          run-id: 45783712788
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-multiscale-trained
+          path: results/extra
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed_${{ matrix.seed }}
+          python -u -m ss7.multiscale_role_development validate --seed ${{ matrix.seed }} --local results/local/local_models.joblib --frozen results/frozen/models.joblib --special results/specialist/specialist.joblib --meta results/meta/meta.joblib --weak results/weak/weak.joblib --ranks results/ranks/ranks.joblib --extra results/extra/multiscale.joblib --output results/seed_${{ matrix.seed }} 2>&1 | tee results/seed_${{ matrix.seed }}/test.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validate-multiscale-seed-${{ matrix.seed }}
+          path: results/seed_${{ matrix.seed }}
+  select:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: validate-multiscale-seed-*
+          path: results/collected
+      - run: python -m ss7.multiscale_role_development select --input results/collected --output results/selection
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-multiscale-selection
+          path: results/selection
+  test:
+    needs: select
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        seed: [12201,12202,12203,12204,12205,12206,12207,12208]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-specialist-trained
+          path: results/specialist
+          github-token: ${{ github.token }}
+          run-id: 45640796971
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-meta-trained
+          path: results/meta
+          github-token: ${{ github.token }}
+          run-id: 45659800298
+      - uses: actions/download-artifact@v4
+        with:
+          name: incident-local-models
+          path: results/local
+          github-token: ${{ github.token }}
+          run-id: 45440533210
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-weak-trained
+          path: results/weak
+          github-token: ${{ github.token }}
+          run-id: 45673139066
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-episode-ranks
+          path: results/ranks
+          github-token: ${{ github.token }}
+          run-id: 45783712788
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-multiscale-trained
+          path: results/extra
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-multiscale-selection
+          path: results/selection
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed_${{ matrix.seed }}
+          python -u -m ss7.multiscale_role_development test --seed ${{ matrix.seed }} --local results/local/local_models.joblib --frozen results/frozen/models.joblib --special results/specialist/specialist.joblib --meta results/meta/meta.joblib --weak results/weak/weak.joblib --ranks results/ranks/ranks.joblib --extra results/extra/multiscale.joblib --selection results/selection/selection.json --output results/seed_${{ matrix.seed }} 2>&1 | tee results/seed_${{ matrix.seed }}/test.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-multiscale-seed-${{ matrix.seed }}
+          path: results/seed_${{ matrix.seed }}
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: test-multiscale-seed-*
+          path: results/collected
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-multiscale-selection
+          path: results/selection
+      - run: python -m ss7.multiscale_role_development aggregate --stage dev --input results/collected --selection results/selection/selection.json --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-multiscale-dev-summary
+          path: results/summary
