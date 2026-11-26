@@ -1,0 +1,141 @@
+name: SS7 observability audit and corrected telemetry development
+on:
+  push:
+    branches: [ss7-observability-audit-development]
+    paths: [.github/workflows/ss7-observability-audit-development.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-observability-audit-development-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  legacy_audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-episode-ranking-summary
+          path: results/old
+          github-token: ${{ github.token }}
+          run-id: 45783712788
+      - run: python -u -m ss7.observability_audit_development legacy_audit --input results/old --output results/audit
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-legacy-snr-audit
+          path: results/audit
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/observability_audit_development.py
+      - name: Verify role-compatible paths, zero-activity null and counter identities
+        run: |
+          python - <<'PY'
+          import numpy as np
+          import pandas as pd
+          from collections import defaultdict
+          from ss7 import fix as F
+          from ss7.observability_audit_development import CorrectedSim,add_record,empty,feature_names,MODES,EXTRA,TRAIN,TEST
+          cfg=F.SimConfig(seed=13000,days=.02)
+          a=CorrectedSim(cfg,F.RngBook(cfg.seed))
+          b=CorrectedSim(cfg,F.RngBook(cfg.seed))
+          for n in a.topo.slaves:
+              typ=a.topo.nodes[n].ntype
+              opts=a.candidates(n)
+              assert opts, (n,typ)
+              for f,path in opts:
+                  assert len(path)==len(set(path))
+                  assert path in a.topo.route(f.src,f.dst).paths
+                  if typ==F.NodeType.SP:assert path[0]==n
+                  elif typ==F.NodeType.SCP:assert path[-1]==n
+                  else:assert n in path[1:-1]
+          eps=[F.Episode("compromise",a.topo.slaves[0],0,2,hidden_rate=0.)]
+          for t in range(3):
+              x=a.step_true(t,[]);y=b.step_true(t,eps)
+              assert x[0]==y[0] and x[1]==y[1] and x[2:6]==y[2:6]
+              assert all(x[0][n]==x[1][n] for n in x[0])
+          st=empty(2,0);typed=defaultdict(int);mat=defaultdict(int)
+          add_record(st,typed,mat,(1,2,3),1,F.Service.SMS_MT,10,8)
+          st.check_identities()
+          assert st.transited==10 and st.dlg_begin==0 and st.dest=={}
+          assert st.total()==40 and sum(mat.values())==20
+          for i in (0,2):
+              st=empty(i+1,0);typed=defaultdict(int);mat=defaultdict(int)
+              add_record(st,typed,mat,(1,2,3),i,F.Service.SMS_MT,10,8)
+              st.check_identities()
+              assert st.total()==20 and st.dlg_begin==10 and st.dlg_end==8 and not mat
+          d=pd.DataFrame(columns=list(F.OWN)+list(EXTRA)+["label","hidden_msgs","audit_visible","episode_id"])
+          for mode in MODES:
+              assert not set(feature_names(d,mode))&{"label","hidden_msgs","audit_visible","episode_id"}
+          assert not set(TRAIN)&set(TEST)
+          assert not set(TRAIN+TEST)&{s+j for s in TEST for j in (10000,20000,40000)}
+          print("Role routes, null activity, exact counter identities and feature exclusion passed")
+          PY
+      - run: python -u -m ss7.observability_audit_development train --output results/trained
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-observability-trained
+          path: results/trained
+  test:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        seed: [13101,13102,13103,13104,13105,13106,13107,13108]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-observability-trained
+          path: results/trained
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed_${{ matrix.seed }}
+          python -u -m ss7.observability_audit_development test --seed ${{ matrix.seed }} --models results/trained/models.joblib --output results/seed_${{ matrix.seed }} 2>&1 | tee results/seed_${{ matrix.seed }}/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: observability-seed-${{ matrix.seed }}
+          path: results/seed_${{ matrix.seed }}
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: observability-seed-*
+          path: results/collected
+      - run: python -m ss7.observability_audit_development aggregate --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-observability-summary
+          path: results/summary
