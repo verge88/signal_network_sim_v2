@@ -285,9 +285,13 @@ def generate(seed,balanced=True,template=None,stress=False):
     cfg=F.SimConfig(seed=seed,days=DAYS);book=F.RngBook(seed)
     sim=IntegratedSim(cfg,book,topo=template.topo if template else None,template=template)
     eps=make_episodes(sim,cfg,book["episode"],balanced,stress);ids={id(e):i for i,e in enumerate(eps)}
-    cached={};last_rtt={};rows=[];transport=[]
+    cached={};last_rtt={};rows=[];transport=[];loads=[]
     for t in range(cfg.n_intervals):
         truth,claimed,typed,mat,boundary,audit,lstate=sim.step_true(t,eps)
+        load_by_link=defaultdict(float)
+        for path,size in sim.plans.values():
+            for u,v in zip(path[:-1],path[1:]):load_by_link[tuple(sorted((u,v)))]+=8*(wire_bytes(50)+wire_bytes(size))/cfg.interval_s
+        loads.append((t,sum(load_by_link.values()),max((v/sim.topo.linksets[k].capacity_bps for k,v in load_by_link.items()),default=0.)))
         rng=book.child("measure",t);trng=O.extra_rng(seed,2,t);brng=O.extra_rng(seed,3,t);crng=O.extra_rng(seed,5,t)
         active={e.nid:e for e in eps if e.kind in CLASSES and e.t0<=t<=e.t1}
         fresh={};held={};tc={};mc={};sensors={};cu={}
@@ -355,6 +359,9 @@ def generate(seed,balanced=True,template=None,stress=False):
     tr=tr[tr.t>=WARMUP]
     stats=tr.groupby("nid").agg(delivery=("delivered","mean"),request_delivery=("request","mean"),
         payload=("payload","mean"),wire=("wire","mean"),rtt=("rtt","median"),age=("age","mean")).reset_index()
+    load=pd.DataFrame(loads,columns=["t","reserved_cu_bps","peak_link_cu_share"]);load=load[load.t>=WARMUP]
+    stats["network_mean_reserved_cu_bps"]=load.reserved_cu_bps.mean()
+    stats["network_peak_link_cu_share"]=load.peak_link_cu_share.max()
     return d,sim,eps,stats
 
 def article_features(d):
@@ -446,7 +453,8 @@ def evaluate(seed,models,out,selection=None):
         ss[n]=[np.maximum(p-x,q-y)-z for p,q in zip(a,b)]
     names+=("article_cascade_fixed05",)
     ss["article_cascade_fixed05"]=ss["article_cascade"]
-    rows=[];events=[]
+    rows=[];events=[];window=[];controls=[]
+    y=d.label.to_numpy();t=d.t.to_numpy();nid=d.nid.to_numpy()
     for n in names:
         s=ss[n];tau=.5 if n.endswith("fixed05") else 0. if n.startswith("dual_") else joint_cut(refs,s[:3],RAW_BUDGET*.5,INCIDENT_BUDGET*.5)
         u=s[3];z=triple(d,u);m,det=metrics(d,u,z,tau,eligible);rows.append(dict(seed=seed,model=n,**m))
@@ -456,8 +464,21 @@ def evaluate(seed,models,out,selection=None):
                 ntype=sim.topo.nodes[e.nid].ntype.value,sophistication=e.sophistication.value if e.kind=="compromise" else "na",
                 hidden_rate=e.hidden_rate,mask_family=B.scenario_name("corrected",e) if e.kind=="compromise" else "na",
                 delay_seconds=det.get(i),cu_delivery=q.cu_delivered.mean()))
+        # Window-level recall reported separately from operational episode recall.
+        for cls in CLASSES:
+            mask=d.attack.to_numpy()==cls
+            window.append(dict(seed=seed,model=n,attack=cls,positive_windows=int(mask.sum()),detected_windows=int((mask&(u>tau)).sum())))
+        alerts=notify(d,z,tau);false_alerts=np.array([j for j in alerts if (y[j-2:j+1]==0).all()],dtype=int)
+        for i,e in enumerate(eps):
+            if e.kind in CLASSES:continue
+            scope=(t>=max(e.t0,WARMUP))&(t<=e.t1)
+            if e.kind!="ext_attack" and e.nid is not None:scope&=nid==e.nid
+            neg=scope&(y==0)
+            if neg.any():controls.append(dict(seed=seed,model=n,episode=i,event=e.kind,
+                negative_windows=int(neg.sum()),false_windows=int((neg&(u>tau)).sum()),false_notifications=int(scope[false_alerts].sum())))
         print(seed,n,m["recall"],m["false_windows_day"],m["false_notifications_day"],flush=True)
     pd.DataFrame(rows).to_csv(out/"metrics.csv",index=False);pd.DataFrame(events).to_csv(out/"episodes.csv",index=False)
+    pd.DataFrame(window).to_csv(out/"window_metrics.csv",index=False);pd.DataFrame(controls).to_csv(out/"controls.csv",index=False)
     tr["seed"]=seed;tr.to_csv(out/"cu_transport.csv",index=False)
     print("CU delivery",tr.delivery.mean(),"median RTT",tr.rtt.median(),flush=True)
 
@@ -478,6 +499,14 @@ def aggregate(root,out,selection):
     tr=pd.concat([pd.read_csv(x) for x in sorted(root.rglob("cu_transport.csv"))],ignore_index=True)
     a=attack_table(e);comp=e[e.attack=="compromise"].groupby(["model","sophistication","mask_family","hidden_rate","ntype"]).agg(
         episodes=("episode","size"),detected=("detected","sum"),recall=("detected","mean")).reset_index()
+    def read(name):
+        p=sorted(root.rglob(name+".csv"))
+        if len(p)!=len(TEST):raise ValueError("incomplete "+name)
+        return pd.concat([pd.read_csv(x) for x in p],ignore_index=True)
+    win=read("window_metrics").groupby(["model","attack"])[["positive_windows","detected_windows"]].sum().reset_index()
+    win["recall"]=win.detected_windows/win.positive_windows
+    ctrl=read("controls").groupby(["model","event"])[["negative_windows","false_windows","false_notifications"]].sum().reset_index()
+    ctrl["fpr"]=ctrl.false_windows/ctrl.negative_windows
     tests=[];rng=np.random.default_rng(16200)
     for cls in ("all",)+CLASSES:
         p=(e if cls=="all" else e[e.attack==cls]).groupby(["seed","model"]).detected.mean().unstack()
@@ -490,10 +519,10 @@ def aggregate(root,out,selection):
     prev=0.
     for i,x in enumerate(sorted(tests,key=lambda z:z["p_raw"])):
         prev=max(prev,min(1.,(len(tests)-i)*x["p_raw"]));x["p_holm"]=prev
-    for n,q in (("summary",s),("attacks",a),("compromise_factorial",comp),("paired",pd.DataFrame(tests)),("all_metrics",m),("episodes",e),("cu_transport",tr)):
+    for n,q in (("summary",s),("attacks",a),("compromise_factorial",comp),("paired",pd.DataFrame(tests)),("all_metrics",m),("episodes",e),("cu_transport",tr),("window_recall",win),("controls",ctrl)):
         q.to_csv(out/(n+".csv"),index=False)
     print("VALIDATION-SELECTED",chosen);print(s.to_string(index=False));print(a.to_string(index=False))
-    print("CU TRANSPORT",tr[["delivery","request_delivery","payload","wire","rtt","age"]].describe().to_string())
+    print("CU TRANSPORT",tr[["delivery","request_delivery","payload","wire","rtt","age","network_mean_reserved_cu_bps","network_peak_link_cu_share"]].describe().to_string())
     print(pd.DataFrame(tests).to_string(index=False))
     print("Synthetic traffic-profile scenarios; article detector reconstructed, not exact original model.")
 
