@@ -1,0 +1,93 @@
+name: SS7 frozen Weak confirmation 32 worlds
+on:
+  push:
+    branches: [ss7-multiscale-role-development]
+    paths: [.github/workflows/ss7-frozen-weak-confirmation.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-frozen-weak-confirmation-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  confirm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        seed: [12301,12302,12303,12304,12305,12306,12307,12308,12309,12310,12311,12312,12313,12314,12315,12316,12317,12318,12319,12320,12321,12322,12323,12324,12325,12326,12327,12328,12329,12330,12331,12332]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-specialist-trained
+          path: results/specialist
+          github-token: ${{ github.token }}
+          run-id: 45640796971
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-meta-trained
+          path: results/meta
+          github-token: ${{ github.token }}
+          run-id: 45659800298
+      - uses: actions/download-artifact@v4
+        with:
+          name: incident-local-models
+          path: results/local
+          github-token: ${{ github.token }}
+          run-id: 45440533210
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-weak-trained
+          path: results/weak
+          github-token: ${{ github.token }}
+          run-id: 45673139066
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-episode-ranks
+          path: results/ranks
+          github-token: ${{ github.token }}
+          run-id: 45783712788
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed_${{ matrix.seed }}
+          python -u -m ss7.multiscale_role_development confirm --seed ${{ matrix.seed }} --local results/local/local_models.joblib --frozen results/frozen/models.joblib --special results/specialist/specialist.joblib --meta results/meta/meta.joblib --weak results/weak/weak.joblib --ranks results/ranks/ranks.joblib --output results/seed_${{ matrix.seed }} 2>&1 | tee results/seed_${{ matrix.seed }}/test.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: confirm-multiscale-seed-${{ matrix.seed }}
+          path: results/seed_${{ matrix.seed }}
+  aggregate:
+    needs: confirm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: confirm-multiscale-seed-*
+          path: results/collected
+      - run: python -m ss7.multiscale_role_development aggregate --stage confirm --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-frozen-weak-summary
+          path: results/summary
