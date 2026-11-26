@@ -1,0 +1,168 @@
+name: SS7 dual channel behavior development
+on:
+  push:
+    branches: [ss7-dual-channel-behavior-development]
+    paths: [.github/workflows/ss7-dual-channel-behavior-development.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-dual-channel-behavior-development-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/dual_channel_behavior_development.py
+      - name: Check causal features, telemetry boundaries and partitions
+        run: |
+          python - <<'PY'
+          import numpy as np
+          import pandas as pd
+          from ss7.dual_channel_behavior_development import *
+          from ss7.factorial_model_comparison import balanced
+          p=profile({(0,(1,2),F.MT_IDX["IAM"]):10,(1,(2,3),F.MT_IDX["ATI"]):10})
+          assert np.isclose(p[0],np.log1p(20)) and np.isclose(p[1],np.log(2))
+          assert p[6]==p[7]==.5
+          cols=list(dict.fromkeys(list(BEHAVIOR)+list(F.OWN)))
+          d=pd.DataFrame({c:np.arange(30,dtype=float) for c in cols})
+          d["nid"]=[1]*20+[2]*10;d["t"]=list(range(10))+list(range(12,22))+list(range(10))
+          q=history(d)
+          assert np.isnan(q.loc[10,"hist_beh_typed_log_total_delta10"])
+          assert np.isnan(q.loc[20,"hist_beh_typed_log_total_delta10"])
+          for i in (7,15,25):
+              pd.testing.assert_frame_equal(history(d.iloc[:i]),q.iloc[:i])
+          assert set(behavior_cols(q)).isdisjoint({"label","episode_id","hidden_msgs","ntype","nid","t","audit_sigma"})
+          assert len(set(TRAIN+VAL+TEST))==len(TRAIN+VAL+TEST)
+          assert not set(TRAIN+VAL+TEST)&{s+j for s in VAL+TEST for j in (10000,20000,40000)}
+          assert all(len(list(B.scenarios("corrected")))*len(B.ROLES)*len(B.RATES)==100 for _ in [0])
+          print("Behavior statistics, temporal causality, input exclusions and disjoint partitions passed")
+          PY
+      - run: python -u -m ss7.dual_channel_behavior_development train --output results/trained
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-dual-behavior-trained
+          path: results/trained
+  validate:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        seed: [15101,15102,15103,15104]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-observability-trained
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45828084337
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-dual-behavior-trained
+          path: results/trained
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed
+          python -u -m ss7.dual_channel_behavior_development validate --seed ${{ matrix.seed }} --frozen results/frozen/models.joblib --models results/trained/models.joblib --output results/seed 2>&1 | tee results/seed/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dual-validate-seed-${{ matrix.seed }}
+          path: results/seed
+  select:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dual-validate-seed-*
+          path: results/collected
+      - run: python -m ss7.dual_channel_behavior_development select --input results/collected --output results/selection
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-dual-behavior-selection
+          path: results/selection
+  test:
+    needs: select
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        seed: [15201,15202,15203,15204,15205,15206,15207,15208]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-observability-trained
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45828084337
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-dual-behavior-trained
+          path: results/trained
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-dual-behavior-selection
+          path: results/selection
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed
+          python -u -m ss7.dual_channel_behavior_development test --seed ${{ matrix.seed }} --frozen results/frozen/models.joblib --models results/trained/models.joblib --selection results/selection/selection.json --output results/seed 2>&1 | tee results/seed/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dual-test-seed-${{ matrix.seed }}
+          path: results/seed
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dual-test-seed-*
+          path: results/collected
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-dual-behavior-selection
+          path: results/selection
+      - run: python -u -m ss7.dual_channel_behavior_development aggregate --input results/collected --selection results/selection/selection.json --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-dual-behavior-summary
+          path: results/summary
