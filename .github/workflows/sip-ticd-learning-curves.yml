@@ -1,0 +1,72 @@
+name: SIP TICD train and validation learning curves
+on:
+  push:
+    branches: [study/ticd-learning-curves]
+    paths:
+      - 'experiments/*ticd_learning_curves.py'
+      - '.github/workflows/sip-ticd-learning-curves.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+env:
+  OPENBLAS_NUM_THREADS: '1'
+  OMP_NUM_THREADS: '1'
+  MKL_NUM_THREADS: '1'
+  PYTHONHASHSEED: '0'
+  PY_BASE: 'numpy==2.4.6 pandas==2.3.3 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1'
+  GH_TOKEN: ${{ github.token }}
+jobs:
+  repeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [0,1,2,3,4,5,6,7,8,9]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: |
+          python -m pip install $PY_BASE
+          python -m pip install torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
+      - name: Recover TICD architecture and benign SIP calibration
+        run: |
+          gh run download 45688280428 -n sip-ticd-report-consistency-model -D prior
+          gh run download 45656972020 -n sip-ticd-sensor-reconciliation -D prior
+          if [[ ! -f prior/sensor_reconciliation_models.pkl ]]; then
+            cp "$(find prior -mindepth 2 -name sensor_reconciliation_models.pkl -print -quit)" prior/
+          fi
+      - name: Refit models at three sample sizes and evaluate both splits
+        run: python -m experiments.evaluate_ticd_learning_curves --repeat ${{ matrix.seed }} --prior prior --out repeat
+      - uses: actions/upload-artifact@v4
+        with:
+          name: learning-repeat-${{ matrix.seed }}
+          path: repeat/learning-*.csv
+          if-no-files-found: error
+  publish:
+    needs: repeat
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install $PY_BASE matplotlib xlsxwriter
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: learning-repeat-*
+          merge-multiple: true
+          path: input
+      - run: python -m experiments.report_ticd_learning_curves --input input --out publication
+      - run: |
+          git rev-parse HEAD > publication/source_commit.txt
+          python -m pip freeze > publication/report_requirements.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SIP_TICD_Train_Validation_Curves
+          path: publication/
+          if-no-files-found: error

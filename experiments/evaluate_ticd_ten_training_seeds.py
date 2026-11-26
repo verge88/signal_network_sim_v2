@@ -22,13 +22,15 @@ def seed_for(repeat, phase, scenario):
     return 900001 + repeat * 10000 + phase * 1000 + scenario
 
 
-def prepare(repeat, reference, calibration, folder):
+def prepare(repeat, reference, calibration, folder, *, capture_training=None):
     references, commissioning, validation = [], [], {}
     for phase, stage, kinds in ((0, "train", TRAIN_KINDS), (1, "val", VAL_KINDS)):
         frames = {t: [] for t in bench.TRACKS}
         for i, kind in enumerate(kinds):
             seed = seed_for(repeat, phase, i)
             raw, _, _, commission = bench.group([seed], calibration, kind, reference.core.causal)
+            if stage == "train" and capture_training is not None:
+                capture_training(kind, raw, commission)
             clean = kind in VAL_KINDS
             if clean:
                 assert not raw.is_anomaly.any(), kind

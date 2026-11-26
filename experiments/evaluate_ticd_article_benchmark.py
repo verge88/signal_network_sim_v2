@@ -115,7 +115,7 @@ def threshold(scores, budget):
     return float(np.partition(scores, len(scores) - 1 - keep)[len(scores) - 1 - keep])
 
 
-def fit(which, track, data, out, *, fit_seed=FIT_SEED, shards=(0, 1)):
+def fit(which, track, data, out, *, fit_seed=FIT_SEED, shards=(0, 1), sample_size=SAMPLE_SIZE):
     from sklearn.ensemble import GradientBoostingClassifier, IsolationForest, RandomForestClassifier
     from sklearn.impute import SimpleImputer
     from sklearn.model_selection import train_test_split
@@ -130,10 +130,10 @@ def fit(which, track, data, out, *, fit_seed=FIT_SEED, shards=(0, 1)):
     pool = train[train.visible & (True if supervised else train.clean_run & ~train.y)]
     # Fixed original article training size keeps the kernel SVM tractable.
     if supervised:
-        sample, _ = train_test_split(pool, train_size=SAMPLE_SIZE, stratify=pool.y, random_state=fit_seed)
+        sample, _ = train_test_split(pool, train_size=sample_size, stratify=pool.y, random_state=fit_seed)
         assert sample.y.any()
     else:
-        sample = pool.sample(SAMPLE_SIZE, random_state=fit_seed)
+        sample = pool.sample(sample_size, random_state=fit_seed)
         assert not sample.y.any()
     imputer = SimpleImputer(strategy="median", keep_empty_features=True).fit(sample[features])
     scaler = StandardScaler().fit(imputer.transform(sample[features]))
