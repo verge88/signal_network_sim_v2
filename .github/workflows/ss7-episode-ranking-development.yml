@@ -1,0 +1,249 @@
+name: SS7 episode ranking development
+on:
+  push:
+    branches: [ss7-episode-ranking-development]
+    paths: [.github/workflows/ss7-episode-ranking-development.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-episode-ranking-development-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/episode_ranking_development.py
+      - name: Check objective gradients, causal episode windows and partitions
+        run: |
+          python - <<'PY'
+          import numpy as np
+          import pandas as pd
+          from scipy.optimize import check_grad
+          from ss7.episode_ranking_development import objective,episode_indices,ranking_features,TRAIN,VAL,TEST,union
+          from ss7.incident_calibration_study import elapsed,triple,bucket_peaks
+          rng=np.random.default_rng(3)
+          worlds=[([rng.normal(size=(5,3,4)),rng.normal(size=(4,3,4))],rng.normal(size=(100,4)))]
+          b=np.array([.1,.2,-.3,.4])
+          assert check_grad(lambda b:objective(b,worlds)[0],lambda b:objective(b,worlds)[1],b)<1e-5
+          d=pd.DataFrame(dict(nid=[1]*6+[2]*3,t=[0,1,2,4,5,6,0,1,2],
+             label=[1,1,1,1,1,1,0,0,0],episode_id=[1,1,1,2,2,3,-1,-1,-1]))
+          e=episode_indices(d)
+          assert len(e)==1 and np.array_equal(e[0],[[0,1,2]])
+          a=rng.uniform(.001,.999,len(d));z=ranking_features(a,a,a,a)
+          for i in range(1,len(d)+1):
+              assert np.allclose(ranking_features(a[:i],a[:i],a[:i],a[:i]),z[:i])
+          assert len(set(TRAIN+VAL+TEST))==len(TRAIN+VAL+TEST)
+          assert not set(TRAIN+VAL+TEST)&{s+j for s in VAL+TEST for j in (10000,20000,40000)}
+          d=d.assign(label=0)
+          for share in (.25,.5,.75):
+              x,y,extra=union((d,),(a,),(a[::-1],),share)
+              u=np.maximum(a-x,a[::-1]-y)-extra
+              assert (u>0).sum()<=int(10*elapsed(d))
+              assert (bucket_peaks(d,triple(d,u))>0).sum()<=int(elapsed(d))
+          print("Episode membership, gradients, causal features and partition checks passed")
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-specialist-trained
+          path: results/specialist
+          github-token: ${{ github.token }}
+          run-id: 45640796971
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-meta-trained
+          path: results/meta
+          github-token: ${{ github.token }}
+          run-id: 45659800298
+      - uses: actions/download-artifact@v4
+        with:
+          name: incident-local-models
+          path: results/local
+          github-token: ${{ github.token }}
+          run-id: 45440533210
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-weak-trained
+          path: results/weak
+          github-token: ${{ github.token }}
+          run-id: 45673139066
+      - run: python -u -m ss7.episode_ranking_development train --local results/local/local_models.joblib --frozen results/frozen/models.joblib --special results/specialist/specialist.joblib --meta results/meta/meta.joblib --weak results/weak/weak.joblib --output results/ranks
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-episode-ranks
+          path: results/ranks
+  validate:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        seed: [11101,11102,11103,11104,11105,11106]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-specialist-trained
+          path: results/specialist
+          github-token: ${{ github.token }}
+          run-id: 45640796971
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-meta-trained
+          path: results/meta
+          github-token: ${{ github.token }}
+          run-id: 45659800298
+      - uses: actions/download-artifact@v4
+        with:
+          name: incident-local-models
+          path: results/local
+          github-token: ${{ github.token }}
+          run-id: 45440533210
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-weak-trained
+          path: results/weak
+          github-token: ${{ github.token }}
+          run-id: 45673139066
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-episode-ranks
+          path: results/ranks
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed_${{ matrix.seed }}
+          python -u -m ss7.episode_ranking_development validate --seed ${{ matrix.seed }} --local results/local/local_models.joblib --frozen results/frozen/models.joblib --special results/specialist/specialist.joblib --meta results/meta/meta.joblib --weak results/weak/weak.joblib --ranks results/ranks/ranks.joblib --output results/seed_${{ matrix.seed }} 2>&1 | tee results/seed_${{ matrix.seed }}/test.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validate-episode-seed-${{ matrix.seed }}
+          path: results/seed_${{ matrix.seed }}
+  select:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: validate-episode-seed-*
+          path: results/collected
+      - run: python -m ss7.episode_ranking_development select --input results/collected --output results/selection
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-episode-selection
+          path: results/selection
+  test:
+    needs: select
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        seed: [11201,11202,11203,11204,11205,11206,11207,11208]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-only-frozen
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45421952080
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-specialist-trained
+          path: results/specialist
+          github-token: ${{ github.token }}
+          run-id: 45640796971
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-meta-trained
+          path: results/meta
+          github-token: ${{ github.token }}
+          run-id: 45659800298
+      - uses: actions/download-artifact@v4
+        with:
+          name: incident-local-models
+          path: results/local
+          github-token: ${{ github.token }}
+          run-id: 45440533210
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-weak-trained
+          path: results/weak
+          github-token: ${{ github.token }}
+          run-id: 45673139066
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-episode-ranks
+          path: results/ranks
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-episode-selection
+          path: results/selection
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed_${{ matrix.seed }}
+          python -u -m ss7.episode_ranking_development test --seed ${{ matrix.seed }} --local results/local/local_models.joblib --frozen results/frozen/models.joblib --special results/specialist/specialist.joblib --meta results/meta/meta.joblib --weak results/weak/weak.joblib --ranks results/ranks/ranks.joblib --selection results/selection/selection.json --output results/seed_${{ matrix.seed }} 2>&1 | tee results/seed_${{ matrix.seed }}/test.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-episode-seed-${{ matrix.seed }}
+          path: results/seed_${{ matrix.seed }}
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: test-episode-seed-*
+          path: results/collected
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-episode-selection
+          path: results/selection
+      - run: python -m ss7.episode_ranking_development aggregate --input results/collected --selection results/selection/selection.json --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-episode-ranking-summary
+          path: results/summary
