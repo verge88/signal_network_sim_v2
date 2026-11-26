@@ -6,13 +6,16 @@ Counts are offered MSUs, not delivered MSUs; monitoring is an optional,
 independent simulated sensor on domestic side of external interconnect.
 No true state, hidden ledger, attack rate or label is passed to inference.
 """
+from __future__ import annotations
 import argparse,json,itertools
+from typing import Dict,List,Tuple
 from collections import defaultdict
 from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
 from ss7 import fix as F
+from ss7.fix import Episode,NodeState,Service,MSG_TYPES,MSG_BYTES,SERVICE_TEMPLATE,INTERVALS_PER_DAY
 from ss7.report_feature_specialist import augmented,add_history,DIRECTION,PEER,generate as legacy_generate
 from ss7.report_only_invariant_study import NEW,columns
 from ss7.weak_signal_confirmation import fit_model,weak_predict
@@ -48,6 +51,9 @@ def add_record(st,typed,mat,path,i,service,cnt,closed):
     else:st.transited+=cnt
     if (i==0 or i==len(path)-1) and service in F.TCAP_SERVICES:
         st.dlg_begin+=cnt;st.dlg_end+=closed
+
+def extra_rng(seed,domain,t):
+    return np.random.default_rng(np.random.SeedSequence(int(seed),spawn_key=(1000,int(domain),int(t))))
 
 def empty(n,t):
     return F.NodeState(n,t,np.zeros(len(F.MSG_TYPES),np.int64))
@@ -100,8 +106,6 @@ class CorrectedSim(F.Ss7Sim):
                 for l in topo.links_of(ep.nid)[:1]:
                     failed_links.add(l)
 
-        states = {n: NodeState(n, t, np.zeros(len(MSG_TYPES), np.int64))
-                  for n in topo.nodes}
         offered: Dict[Tuple[int, int], float] = {}
         pending: List[Tuple] = []
 
@@ -138,7 +142,7 @@ class CorrectedSim(F.Ss7Sim):
 
         # Hidden events use a separate RNG, explicit provenance and legal
         # shortest paths. No artificial detours through endpoint nodes.
-        arng=self.book.child("role_hidden",t)
+        arng=extra_rng(self.cfg.seed,1,t)
         active={e.nid:e for e in episodes if e.kind=="compromise" and e.t0<=t<=e.t1}
         for n,e in active.items():
             h=int(arng.poisson(max(e.hidden_rate*dt,0.)))
@@ -239,7 +243,7 @@ def generate(seed,days,comp,normal,external,template=None,force_hidden=None):
     ids={id(e):i for i,e in enumerate(eps)};rows=[]
     for t in range(cfg.n_intervals):
         truth,claimed,typed,mat,boundary,audit,lstate=sim.step_true(t,eps)
-        rng=book.child("measure",t);trng=book.child("typed_measure",t);brng=book.child("boundary_measure",t)
+        rng=book.child("measure",t);trng=extra_rng(seed,2,t);brng=extra_rng(seed,3,t)
         active={e.nid:e for e in eps if e.kind=="compromise" and e.t0<=t<=e.t1}
         reps={};tc={};mc={};sensors={}
         for n,st in claimed.items():
@@ -338,6 +342,34 @@ def test(seed,models,out):
         print(seed,n,m["recall"],m["false_windows_day"],m["false_notifications_day"],flush=True)
     pd.DataFrame(rows).to_csv(out/"metrics.csv",index=False);pd.DataFrame(events).to_csv(out/"episodes.csv",index=False)
 
+def legacy_audit(source,out):
+    old=pd.read_csv(source/"episodes.csv")
+    old=old[old.model=="weak"].copy()
+    expected=tuple(range(11201,11209))
+    if set(old.seed)!=set(expected) or old.duplicated(["seed","episode"]).any():raise ValueError("unexpected legacy support")
+    rows=[]
+    for seed in expected:
+        d,sim,eps=legacy_generate(seed,1.5,32,64,10)
+        for e in old[old.seed==seed].itertuples():
+            ep=eps[int(e.episode)]
+            q=d[(d.episode_id==e.episode)&(d.nid==ep.nid)]
+            if len(q)!=ep.t1-ep.t0+1 or sim.topo.nodes[ep.nid].ntype.value!=e.ntype:
+                raise ValueError("legacy replay mismatch")
+            # Original hidden ledger is itself under audit. Its ratio to
+            # reported total is a proxy, not measured SNR or true deficit.
+            proxy=q.hidden_msgs/(np.maximum(q.total_messages,1)*sim.rel_sigma)
+            rows.append(dict(seed=seed,episode=e.episode,ntype=e.ntype,detected=e.detected,
+                hidden_rate=e.hidden_rate,mask_family=e.mask_family,
+                hidden_mean=q.hidden_msgs.mean(),reported_mean=q.total_messages.mean(),
+                sigma=sim.rel_sigma,snr_proxy=float(proxy.median()),active_fraction=float((q.hidden_msgs>0).mean())))
+        print("legacy replay",seed,flush=True)
+    t=pd.DataFrame(rows);t.to_csv(out/"legacy_snr_episodes.csv",index=False)
+    summary=t.groupby(["ntype","detected"]).agg(episodes=("episode","size"),
+        snr=("snr_proxy","median"),hidden=("hidden_mean","median"),
+        reported=("reported_mean","median"),active=("active_fraction","median")).reset_index()
+    summary.to_csv(out/"legacy_snr_summary.csv",index=False);print(summary.to_string(index=False))
+    print("Descriptive replay; old hidden counter and reported denominator do not measure physical SNR.")
+
 def aggregate(root,out):
     m,e,s=collect(root,TEST,MODES)
     strata=e.groupby(["model","ntype"]).agg(episodes=("episode","size"),detected=("detected","sum"),recall=("detected","mean")).reset_index()
@@ -359,9 +391,10 @@ def aggregate(root,out):
     print("Corrected synthetic workload, additional telemetry is conditional; no direct legacy performance comparison.")
 
 if __name__=="__main__":
-    p=argparse.ArgumentParser();p.add_argument("mode",choices=["train","test","aggregate"])
+    p=argparse.ArgumentParser();p.add_argument("mode",choices=["train","test","aggregate","legacy_audit"])
     p.add_argument("--seed",type=int);p.add_argument("--models",type=Path);p.add_argument("--input",type=Path)
     p.add_argument("--output",type=Path,required=True);a=p.parse_args();a.output.mkdir(parents=True,exist_ok=True)
     if a.mode=="train":train(a.output)
     elif a.mode=="test":test(a.seed,joblib.load(a.models),a.output)
+    elif a.mode=="legacy_audit":legacy_audit(a.input,a.output)
     else:aggregate(a.input,a.output)
