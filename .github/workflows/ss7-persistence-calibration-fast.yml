@@ -3,8 +3,13 @@ name: SS7 persistence calibration fast check
 # trigger: drift-profile-comparison-v1
 # reuses drift-enabled worlds from run 46063674571
 on:
-  # Model training is now frozen; calibration experiments use eval-only workflow.
+  # Model training is normally frozen. This sentinel enables an explicit
+  # one-off retrain/eval on the regenerated drift-enabled worlds.
   workflow_dispatch:
+  push:
+    branches: [ss7-anti-overfit-development]
+    paths:
+      - ss7/.fast-drift-trigger
 permissions:
   contents: read
   actions: read
