@@ -1,0 +1,172 @@
+name: SS7 five class specialist detection
+on:
+  push:
+    branches: [ss7-five-specialist-development]
+    paths: [.github/workflows/ss7-five-specialist-development.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-five-specialist-development-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/five_specialist_development.py
+      - name: Verify observable features and shared-budget confirmation
+        run: |
+          python - <<'PY'
+          import numpy as np
+          import pandas as pd
+          import ss7.five_specialist_development as S
+          assert len(set(S.TRAIN+S.VAL+S.TEST))==16
+          assert not set(S.TRAIN+S.VAL+S.TEST)&set(S.I.TRAIN+S.I.VAL+S.I.TEST)
+          assert not set(S.TRAIN+S.VAL+S.TEST)&{s+j for s in S.VAL+S.TEST for j in (10000,20000,40000)}
+          d=pd.DataFrame({c:np.arange(30,dtype=float) for c in S.TEMPORAL})
+          d["nid"]=[1]*20+[2]*10;d["t"]=list(range(10))+list(range(12,22))+list(range(10))
+          q=S.context_history(d)
+          assert np.isnan(q.loc[10,"ctxhist_ctx_count_ATI_delta10"])
+          assert np.isnan(q.loc[20,"ctxhist_ctx_count_ATI_delta10"])
+          for i in (7,15,25):pd.testing.assert_frame_equal(S.context_history(d.iloc[:i]),q.iloc[:i])
+          d=pd.DataFrame(dict(nid=[1]*6,t=np.arange(6)))
+          a=np.array([[1.,-1.],[-1.,1.],[1.,-1.],[1.,-1.],[1.,-1.],[1.,-1.]])
+          z,w=S.confirm(d,a)
+          assert z[2]<=0 and z[3]<=0 and z[4]>0 and w[4]==0
+          S.I.DAYS=.03
+          base,_,_,_=S.I.generate(17000,False)
+          ext,_,_,_=S.generate(17000,False)
+          pd.testing.assert_frame_equal(base,ext[base.columns])
+          assert set(S.CONTEXT)<=set(ext.columns)
+          assert np.isfinite(ext.ctx_external_dest_count).any()
+          assert not set(S.cols(ext,True))&{"label","attack","episode_id","hidden_msgs","audit_visible","nid","t"}
+          print("Unchanged simulator, observable feature registry, causality and same-head streak checks passed")
+          PY
+      - run: python -u -m ss7.five_specialist_development train --output results/trained
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-five-specialist-trained
+          path: results/trained
+  validate:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        seed: [17101,17102,17103,17104]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-integrated-cu-trained
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45887176159
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-five-specialist-trained
+          path: results/trained
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed
+          python -u -m ss7.five_specialist_development validate --seed ${{ matrix.seed }} --frozen results/frozen/models.joblib --models results/trained/models.joblib --output results/seed 2>&1 | tee results/seed/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: specialist-validate-seed-${{ matrix.seed }}
+          path: results/seed
+  select:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: specialist-validate-seed-*
+          path: results/collected
+      - run: python -m ss7.five_specialist_development select --input results/collected --output results/selection
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-five-specialist-selection
+          path: results/selection
+  test:
+    needs: select
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        seed: [17201,17202,17203,17204,17205,17206,17207,17208]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-integrated-cu-trained
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45887176159
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-five-specialist-trained
+          path: results/trained
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-five-specialist-selection
+          path: results/selection
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed
+          python -u -m ss7.five_specialist_development test --seed ${{ matrix.seed }} --frozen results/frozen/models.joblib --models results/trained/models.joblib --selection results/selection/selection.json --output results/seed 2>&1 | tee results/seed/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: specialist-test-seed-${{ matrix.seed }}
+          path: results/seed
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: specialist-test-seed-*
+          path: results/collected
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-five-specialist-selection
+          path: results/selection
+      - run: python -u -m ss7.five_specialist_development aggregate --input results/collected --selection results/selection/selection.json --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-five-specialist-summary
+          path: results/summary
