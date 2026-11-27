@@ -1,4 +1,5 @@
 name: SS7 naive compromise observability audit
+# trigger: cal-observability-v1
 on:
   push:
     branches: [ss7-anti-overfit-development]
