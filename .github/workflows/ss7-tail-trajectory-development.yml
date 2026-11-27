@@ -1,0 +1,182 @@
+name: SS7 tail trajectory and hard negative specialists
+on:
+  push:
+    branches: [ss7-tail-trajectory-development]
+    paths: [.github/workflows/ss7-tail-trajectory-development.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-tail-trajectory-development-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0 xgboost==3.1.3
+      - name: Validate causal trajectories, feature exclusion, and XGBoost
+        run: |
+          python - <<'PY'
+          import numpy as np
+          import pandas as pd
+          import ss7.tail_trajectory_development as T
+          d=pd.DataFrame(dict(nid=[1]*400+[2]*400,t=list(range(200))+list(range(201,401))+list(range(400)),ntype=["SP"]*800,total_messages=np.arange(800,dtype=float)))
+          q=T.trajectories(d)
+          assert np.isnan(q.loc[200,"traj_total_messages_mean10"]) and np.isnan(q.loc[400,"traj_total_messages_mean10"])
+          for n in (170,250,450,700):
+              pd.testing.assert_frame_equal(T.trajectories(d.iloc[:n]),q.iloc[:n])
+          p=np.linspace(.01,.99,len(d))
+          for n in (170,250,450,700):
+              np.testing.assert_allclose(T.smooth(d.iloc[:n],p[:n],15),T.smooth(d,p,15)[:n])
+          assert len(set(T.TRAIN+T.VAL+T.TEST))==16
+          assert not set(T.TRAIN+T.VAL+T.TEST)&{s+j for s in T.VAL+T.TEST for j in (10000,20000,40000)}
+          T.I.DAYS=.03
+          base,_,_,_=T.S.generate(19000,False)
+          ext,_,_,_=T.generate(19000,False)
+          pd.testing.assert_frame_equal(base,ext[base.columns])
+          for c in T.CLASSES:
+              assert not set(T.cols(ext,c))&{"label","attack","episode_id","hidden_msgs","audit_visible","nid","t"}
+          x=np.random.default_rng(42).normal(size=(500,6));y=(x[:,0]>0).astype(int)
+          m=T.XGBClassifier(n_estimators=4,n_jobs=2,tree_method="hist").fit(x,y)
+          assert np.isfinite(m.predict_proba(x)).all()
+          print("Causal trajectory, gap reset, unchanged simulator, feature exclusion and XGBoost smoke tests passed")
+          PY
+      - run: python -u -m ss7.tail_trajectory_development train --output results/trained
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-tail-trajectory-trained
+          path: results/trained
+  validate:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        seed: [19101,19102,19103,19104]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0 xgboost==3.1.3
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-integrated-cu-trained
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45887176159
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-five-specialist-trained
+          path: results/special
+          github-token: ${{ github.token }}
+          run-id: 45956489605
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-tail-trajectory-trained
+          path: results/trained
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed
+          python -u -m ss7.tail_trajectory_development validate --seed ${{ matrix.seed }} --frozen results/frozen/models.joblib --special results/special/models.joblib --models results/trained/models.joblib --output results/seed 2>&1 | tee results/seed/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tail-validate-seed-${{ matrix.seed }}
+          path: results/seed
+  select:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0 xgboost==3.1.3
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tail-validate-seed-*
+          path: results/collected
+      - run: python -m ss7.tail_trajectory_development select --input results/collected --output results/selection
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-tail-trajectory-selection
+          path: results/selection
+  test:
+    needs: select
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        seed: [19201,19202,19203,19204,19205,19206,19207,19208]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0 xgboost==3.1.3
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-integrated-cu-trained
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45887176159
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-five-specialist-trained
+          path: results/special
+          github-token: ${{ github.token }}
+          run-id: 45956489605
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-tail-trajectory-trained
+          path: results/trained
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-tail-trajectory-selection
+          path: results/selection
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed
+          python -u -m ss7.tail_trajectory_development test --seed ${{ matrix.seed }} --frozen results/frozen/models.joblib --special results/special/models.joblib --models results/trained/models.joblib --selection results/selection/selection.json --output results/seed 2>&1 | tee results/seed/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tail-test-seed-${{ matrix.seed }}
+          path: results/seed
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0 xgboost==3.1.3
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tail-test-seed-*
+          path: results/collected
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-tail-trajectory-selection
+          path: results/selection
+      - run: python -u -m ss7.tail_trajectory_development aggregate --input results/collected --selection results/selection/selection.json --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-tail-trajectory-summary
+          path: results/summary
