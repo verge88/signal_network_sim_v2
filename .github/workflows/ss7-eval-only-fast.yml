@@ -1,0 +1,47 @@
+name: SS7 eval-only frozen-model check
+on:
+  push:
+    branches: [ss7-anti-overfit-development]
+    paths:
+      - .github/workflows/ss7-eval-only-fast.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-eval-only-fast-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/cu_compact_channel_development.py
+      - run: python -u -m ss7.cu_compact_channel_development selftest
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46035508077
+          pattern: world-compact-21[123]*
+          path: results/worlds
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46063752470
+          name: anti-overfit-trained-models
+          path: results/trained
+      - run: python -u -m ss7.cu_compact_channel_development evaluate --arm compact --root results/worlds --models results/trained --output results/eval
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-eval-only-results
+          path: results/eval
+          retention-days: 7
