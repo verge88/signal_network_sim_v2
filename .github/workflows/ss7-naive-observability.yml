@@ -1,5 +1,5 @@
 name: SS7 naive compromise observability audit
-# trigger: cal-observability-v1
+# trigger: role-aware-cal-v1
 on:
   push:
     branches: [ss7-anti-overfit-development]
@@ -23,7 +23,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: 46035508077
+          run-id: 46063674571
           pattern: world-compact-212*
           path: results/worlds
       - run: python -u -m ss7.naive_observability_diagnostic --root results/worlds --output results/audit
