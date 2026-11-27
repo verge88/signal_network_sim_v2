@@ -1186,11 +1186,10 @@ def calibrate_soph_load_shift(frames,preds,variant,raw=RAW_BUDGET,notice=INCIDEN
     return dict(kind="soph_load_shift",threshold=margin_cut,streak=int(chosen),
         channel_thresholds=thresholds,naive_load_shift=rule,diagnostics=diagnostics)
 
+# Five-world TRAIN+RANK robustness gate (predeclared worst-world AUC >= .70)
+# retained only SCP. IGW/SP/STP candidates were unstable across worlds.
 ROLE_NAIVE_SPEC={
-    "IGW":("obs_ratio_MT_FSM",60,"pos"),
-    "SCP":("obs_ratio_ATI",30,"abs"),
-    "SP":("obs_ratio_ATI",60,"pos"),
-    "STP":("obs_ratio_ISD",60,"pos"),
+    "SCP":("obs_ratio_ATI",60,"abs"),
 }
 
 def _node_roll_mean(d,x,win):
@@ -1334,6 +1333,63 @@ def calibrate_soph_role_supplement(frames,preds,base_raw,raw=RAW_BUDGET,notice=I
         base_raw_budget=float(base_raw),base_threshold=float(base["threshold"]),
         channel_thresholds=base["channel_thresholds"],naive_role=role_rule,
         supplement_threshold=supp,diagnostics=diagnostics)
+
+FINAL_BASE_RAW=16.0
+
+def soph_linear_scp_supplement_channels(d,p,policy):
+    """Frozen final fusion: linear-naive base plus SCP-only robust supplement."""
+    base=soph_linear_naive_channels(d,p,policy["channel_thresholds"])
+    out={k:v-float(policy["base_threshold"]) for k,v in base.items()}
+    out["comp_naive_scp"]=naive_role_margin(d,policy["naive_role"])-float(policy["supplement_threshold"])
+    return out
+
+def calibrate_linear_scp_supplement(frames,preds,base_raw=FINAL_BASE_RAW,
+                                    raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
+    """Reserve 20% of raw false-window budget for the robust SCP supplement.
+
+    Feature/role selection is frozen from TRAIN+RANK. CAL supplies thresholds
+    only. The supplement is calibrated against negative windows and buckets not
+    already consumed by the base detector.
+    """
+    base=calibrate_soph_linear_naive(frames,preds,raw=float(base_raw),notice=notice)
+    role_rule=fit_naive_role(frames,raw=raw)
+    world_cuts=[];diagnostics=[]
+    for d,p in zip(frames,preds):
+        neg=d.label.to_numpy()==0
+        base_ch=soph_linear_naive_channels(d,p,base["channel_thresholds"])
+        shifted={k:v-float(base["threshold"]) for k,v in base_ch.items()}
+        bs,bz=combined(d,shifted,True,negative_only=True,streak_len=base["streak"])
+        role=naive_role_margin(d,role_rule)
+        rneg=np.where(neg,role,-np.inf)
+        rz=streak_score(d,rneg,base["streak"])
+        days=elapsed(d)
+
+        raw_cap=int(np.floor(raw*days))
+        base_raw_count=int((bs>0).sum())
+        raw_left=max(0,raw_cap-base_raw_count)
+        raw_extra=role[neg&(bs<=0)]
+        raw_cut=_count_threshold(raw_extra,raw_left)
+
+        bix=notify(d,bz,0.0)
+        base_buckets={(int(d.nid.iloc[j]),int(d.t.iloc[j]//60)) for j in bix}
+        notice_cap=int(np.floor(notice*days))
+        notice_left=max(0,notice_cap-len(base_buckets))
+        peaks=_supplement_bucket_peaks(d,rz,base_buckets)
+        notice_cut=_count_threshold(peaks,notice_left)
+        cut=max(raw_cut,notice_cut)
+        world_cuts.append(cut)
+        diagnostics.append(dict(base_raw_budget=float(base_raw),base_raw_count=base_raw_count,
+            raw_cap=raw_cap,raw_left=raw_left,base_notifications=len(base_buckets),
+            notice_cap=notice_cap,notice_left=notice_left,raw_cut=raw_cut,
+            notice_cut=notice_cut,world_cut=cut))
+    supp=float(max(world_cuts))
+    return dict(kind="linear_scp_supplement",threshold=0.0,streak=int(base["streak"]),
+        base_raw_budget=float(base_raw),base_threshold=float(base["threshold"]),
+        channel_thresholds=base["channel_thresholds"],naive_role=role_rule,
+        supplement_threshold=supp,selection_gate=dict(
+            worlds=[21001,21002,21003,21101,21102],
+            min_auc=.70,role="SCP",feature="obs_ratio_ATI",window=60,direction="abs"),
+        diagnostics=diagnostics)
 
 def _profile_js_rows(d, recent=5, baseline=60, gap=5):
     """Causal Jensen-Shannon divergence of recent traffic mix from own history."""
@@ -1661,6 +1717,8 @@ def policy_channels(d,p,ref,name,policy):
         return soph_role_channels(d,p,policy["channel_thresholds"],policy["naive_role"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_role_supplement":
         return soph_role_supplement_channels(d,p,policy),True,0.0
+    if policy.get("kind")=="linear_scp_supplement":
+        return soph_linear_scp_supplement_channels(d,p,policy),True,0.0
     if policy.get("kind")=="soph_profile":
         return soph_profile_channels(d,p,policy["channel_thresholds"],policy["naive_profile"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_routing":
@@ -1743,6 +1801,51 @@ def evaluate(root,modelpath,out,arm):
     (out/"thresholds.json").write_text(json.dumps(policies,indent=2))
     print("METRICS",pd.DataFrame(rows).to_string(index=False),flush=True)
 
+
+def evaluate_final(root,modelpath,out,arm,test_seeds):
+    """Evaluate exactly one frozen final policy on an explicit untouched seed set."""
+    models=joblib.load(modelpath/"models.joblib")
+    cal=[load(root,arm,s)[0] for s in CAL];ps=[predict(d,models) for d in cal]
+    policy=calibrate_linear_scp_supplement(cal,ps)
+    controls=[]
+    for seed,d,p in zip(CAL,cal,ps):
+        ch,confirm,thr=policy_channels(d,p,None,"final_linear_scp",policy)
+        score,z=combined(d,ch,confirm,negative_only=True,streak_len=policy["streak"])
+        controls.append(dict(seed=seed,false_windows_day=float((score>thr).sum()/elapsed(d)),
+            false_notifications_day=float(len(notify(d,z,thr))/elapsed(d))))
+    pd.DataFrame(controls).to_csv(out/"calibration_controls.csv",index=False)
+    del cal,ps
+
+    rows=[];episodes=[];overhead=[]
+    for seed in tuple(test_seeds):
+        d,eligible,cu=load(root,arm,int(seed));overhead.append(dict(seed=int(seed),**cu))
+        p=predict(d,models)
+        ch,confirm,thr=policy_channels(d,p,None,"final_linear_scp",policy)
+        score,z=combined(d,ch,confirm,streak_len=policy["streak"])
+        m,det=metrics(d,score,z,thr,eligible);fire=score>thr
+        m.update(seed=int(seed),arm=arm,model="final_linear_scp",streak=policy["streak"],
+            window_f1=f1_score(d.label,fire,zero_division=0),
+            budget_ok=(m["false_windows_day"]<=RAW_BUDGET and
+                       m["false_notifications_day"]<=INCIDENT_BUDGET))
+        rows.append(m)
+        names=list(ch);zz=np.column_stack([streak_score(d,ch[k],policy["streak"]) for k in names])
+        for i,e in eligible.items():
+            mask=d.episode_id.to_numpy()==i;predicted="missed"
+            if i in det:
+                ix=np.flatnonzero(mask&(d.t.to_numpy()==e.t0+det[i]//30))
+                if len(ix):predicted=class_name(names[int(np.argmax(zz[ix[0]]))])
+            episodes.append(dict(seed=int(seed),arm=arm,model="final_linear_scp",
+                episode=i,attack=e.kind,role=d.loc[mask,"ntype"].iloc[0],
+                sophistication=e.sophistication.value if e.kind=="compromise" else "",
+                rate=e.hidden_rate,detected=int(i in det),predicted=predicted,
+                typed=int(predicted==e.kind),delay=det.get(i,np.nan),
+                window_recall=float(fire[mask].mean())))
+    pd.DataFrame(rows).to_csv(out/"metrics.csv",index=False)
+    pd.DataFrame(episodes).to_csv(out/"episodes.csv",index=False)
+    pd.DataFrame(overhead).drop(columns=["link_fraction"],errors="ignore").to_csv(out/"cu.csv",index=False)
+    (out/"policy.json").write_text(json.dumps(policy,indent=2))
+    print("FINAL_POLICY",json.dumps(policy,indent=2),flush=True)
+    print("FINAL_METRICS\n",pd.DataFrame(rows).to_string(index=False),flush=True)
 
 def aggregate(root,out):
     m=pd.concat([pd.read_csv(root/f"eval-{a}"/"metrics.csv") for a in ARMS],ignore_index=True)
