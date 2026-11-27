@@ -63,11 +63,22 @@ def evaluate(seed, d):
     if y.sum()==0 or (~y.astype(bool)).sum()==0:raise ValueError("missing classes")
     rows=[]
     C=candidates(d)
+    roles=d.ntype.astype(str).to_numpy()
     for name,s in C.items():
-        z=np.asarray(s,float)[use]
+        full=np.asarray(s,float)
+        z=full[use]
         if not np.isfinite(z).all():continue
         auc=float(roc_auc_score(y,z));ap=float(average_precision_score(y,z))
-        rows.append(dict(seed=seed,score=name,auc=auc,ap=ap,positive=int(y.sum()),negative=int((y==0).sum())))
+        rows.append(dict(seed=seed,role="ALL",score=name,auc=auc,ap=ap,
+                         positive=int(y.sum()),negative=int((y==0).sum())))
+        for role in sorted(np.unique(roles)):
+            ru=use&(roles==role)
+            yy=naive[ru].astype(int)
+            zz=full[ru]
+            if len(np.unique(yy))<2 or not np.isfinite(zz).all():continue
+            rows.append(dict(seed=seed,role=role,score=name,
+                auc=float(roc_auc_score(yy,zz)),ap=float(average_precision_score(yy,zz)),
+                positive=int(yy.sum()),negative=int((yy==0).sum())))
     # Effect sizes for the most interpretable raw observables.
     effects=[]
     for c in ["local_total_messages","local_map_share","local_isup_share","local_mtype_entropy",
@@ -100,15 +111,17 @@ def main():
         r,x=evaluate(seed,d);tabs.append(r);eff.append(x)
     scores=pd.concat(tabs,ignore_index=True)
     effects=pd.concat(eff,ignore_index=True)
-    summary=scores.groupby("score").agg(auc_mean=("auc","mean"),auc_min=("auc","min"),
+    summary=scores.groupby(["role","score"]).agg(auc_mean=("auc","mean"),auc_min=("auc","min"),
         ap_mean=("ap","mean"),ap_min=("ap","min"),worlds=("seed","nunique")).reset_index()
-    summary=summary.sort_values(["auc_min","ap_mean"],ascending=False)
+    summary=summary.sort_values(["role","auc_min","ap_mean"],ascending=[True,False,False])
     scores.to_csv(a.output/"scores.csv",index=False)
     summary.to_csv(a.output/"summary.csv",index=False)
     effects.to_csv(a.output/"effects.csv",index=False)
     (a.output/"protocol.json").write_text(json.dumps(dict(cal=CAL,roll=ROLL,
         scope="development CAL only; labels used only for diagnostics; TEST untouched by this audit"),indent=2))
-    print("TOP CAUSAL SCORES\n",summary.head(30).to_string(index=False),flush=True)
+    for role in ("ALL","IGW","SCP","SP","STP"):
+        q=summary[summary.role==role].head(15)
+        if len(q):print("TOP CAUSAL SCORES",role,"\n",q.to_string(index=False),flush=True)
     print("EFFECTS\n",effects.to_string(index=False),flush=True)
 
 if __name__=="__main__":main()
