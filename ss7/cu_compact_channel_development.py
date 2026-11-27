@@ -36,7 +36,12 @@ TRAIN=(21001,21002,21003)
 RANK=(21101,21102)
 CAL=(21201,21202)
 TEST=(21301,21302)
-DAYS=1.\n# Anti-overfit protocol: temporally thin highly autocorrelated windows before fitting.\n# Train/cal/test remain different simulator worlds; CAL is used only for diagnostics and thresholds.\nTRAIN_STRIDE=3\nTRAIN_NORMAL_PER_WORLD=12000\nKINDS=("sms_interception","location_tracking","signalling_dos","irsf","compromise")
+DAYS=1.
+# Anti-overfit protocol: temporally thin highly autocorrelated windows before fitting.
+# Train/cal/test remain different simulator worlds; CAL is used only for diagnostics and thresholds.
+TRAIN_STRIDE=3
+TRAIN_NORMAL_PER_WORLD=12000
+KINDS=("sms_interception","location_tracking","signalling_dos","irsf","compromise")
 CU=("cu_delivered","cu_rtt_delay","cu_req_delay","cu_resp_delay","cu_combined_loss_prob",
     "integrity_check","consecutive_cu_losses","cu_processing_delay","cu_response_time_jitter",
     "cu_staleness","cu_consistency_error")
