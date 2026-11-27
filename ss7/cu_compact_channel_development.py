@@ -880,6 +880,55 @@ def calibrate_hybrid_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
         channel_thresholds=thresholds,diagnostics=diagnostics)
 
 COMP_SOPH_CHANNELS=("comp_naive","comp_statistical","comp_adaptive")
+NAIVE_CUSUM_K=24
+NAIVE_CUSUM_Q=.50
+
+def bounded_margin_cusum(d,margin,k,valid_mask=None):
+    """Finite-memory positive CUSUM over causal same-node intervals."""
+    x=np.asarray(margin,float).copy()
+    if valid_mask is None:valid_mask=np.isfinite(x)
+    else:valid_mask=np.asarray(valid_mask,bool)&np.isfinite(x)
+    n=d.nid.to_numpy();t=d.t.to_numpy();N=len(x)
+    inc=np.clip(np.where(valid_mask,x,0.),-3.,3.)
+    boundary=np.r_[True,(n[1:]!=n[:-1])|(t[1:]!=t[:-1]+1)|(~valid_mask[1:])|(~valid_mask[:-1])]
+    group=np.cumsum(boundary)
+    best=np.where(valid_mask,np.maximum(inc,0.),-np.inf)
+    accum=inc.copy()
+    for lag in range(1,min(k,N)):
+        same=(group[lag:]==group[:-lag])&valid_mask[lag:]&valid_mask[:-lag]
+        accum[lag:]+=inc[:-lag]
+        cand=np.where(same,accum[lag:],-np.inf)
+        best[lag:]=np.maximum(best[lag:],cand)
+    return best/max(k,1)
+
+def fit_naive_cusum(frames,preds,raw=RAW_BUDGET):
+    drifts={}
+    roles=sorted(set(np.concatenate([d.ntype.astype(str).unique() for d in frames])))
+    for role in roles:
+        qs=[]
+        for d,p in zip(frames,preds):
+            mask=(d.label.to_numpy()==0)&(d.ntype.astype(str).to_numpy()==role)
+            if mask.any():qs.append(float(np.quantile(_logit(p["comp_naive_aug"][mask]),NAIVE_CUSUM_Q)))
+        if qs:drifts[role]=float(max(qs))
+    scores=[];anchors=[]
+    for d,p in zip(frames,preds):
+        drift=_threshold_vector(d,drifts)
+        margin=_logit(p["comp_naive_aug"])-drift
+        neg=d.label.to_numpy()==0
+        cs=bounded_margin_cusum(d,margin,NAIVE_CUSUM_K,valid_mask=neg)
+        finite=cs[np.isfinite(cs)]
+        anchors.append(threshold(finite,raw,elapsed(d)))
+        scores.append(cs)
+    anchor=float(max(anchors));scale=max(abs(anchor),.05)
+    return dict(k=NAIVE_CUSUM_K,q=NAIVE_CUSUM_Q,drifts=drifts,anchor=anchor,scale=scale)
+
+def naive_cusum_margin(d,p,rule,negative_only=False):
+    drift=_threshold_vector(d,rule["drifts"])
+    margin=_logit(p["comp_naive_aug"])-drift
+    valid=(d.label.to_numpy()==0) if negative_only else None
+    cs=bounded_margin_cusum(d,margin,rule["k"],valid_mask=valid)
+    return (cs-rule["anchor"])/rule["scale"]
+
 
 def soph_hybrid_channels(d,p,thresholds):
     out={"fallback":_logit(p["local_aug"])-_logit(_threshold_vector(d,thresholds["fallback"]))}
@@ -934,6 +983,39 @@ def calibrate_soph_hybrid(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
     return dict(kind="soph_hybrid",threshold=margin_cut,streak=int(chosen),
         channel_thresholds=thresholds,diagnostics=diagnostics)
 
+def soph_cusum_channels(d,p,thresholds,cusum_rule,negative_only=False):
+    out=soph_hybrid_channels(d,p,thresholds)
+    out["comp_naive_cusum"]=naive_cusum_margin(d,p,cusum_rule,negative_only=negative_only)
+    return out
+
+def calibrate_soph_cusum(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
+    base=calibrate_soph_hybrid(frames,preds,raw,notice)
+    thresholds=base["channel_thresholds"]
+    cusum_rule=fit_naive_cusum(frames,preds,raw)
+
+    prepared=[];cuts=[]
+    for d,p in zip(frames,preds):
+        ch=soph_cusum_channels(d,p,thresholds,cusum_rule,negative_only=True)
+        score,_=combined(d,ch,True,negative_only=True,streak_len=3)
+        cuts.append(threshold(score[np.isfinite(score)],raw,elapsed(d)))
+        prepared.append((d,p))
+    margin_cut=float(max(cuts))
+    diagnostics=[];chosen=None
+    for length in (3,5,7,9,12):
+        nr=[];wr=[]
+        for d,p in prepared:
+            ch=soph_cusum_channels(d,p,thresholds,cusum_rule,negative_only=True)
+            score,z=combined(d,ch,True,negative_only=True,streak_len=length)
+            wr.append(float((score>margin_cut).sum()/elapsed(d)))
+            nr.append(float(len(notify(d,z,margin_cut))/elapsed(d)))
+        diagnostics.append(dict(streak=length,worst_notifications_day=max(nr),
+            worst_windows_day=max(wr),rates=nr))
+        if max(nr)<=notice:
+            chosen=length;break
+    if chosen is None:chosen=12
+    return dict(kind="soph_cusum",threshold=margin_cut,streak=int(chosen),
+        channel_thresholds=thresholds,naive_cusum=cusum_rule,diagnostics=diagnostics)
+
 def policy_channels(d,p,ref,name,policy):
     if policy.get("kind")=="five_raw":
         return five_raw_channels(d,p,policy["channel_thresholds"],policy.get("model_suffix","")),True,float(policy["threshold"])
@@ -941,6 +1023,8 @@ def policy_channels(d,p,ref,name,policy):
         return hybrid_raw_channels(d,p,policy["channel_thresholds"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_hybrid":
         return soph_hybrid_channels(d,p,policy["channel_thresholds"]),True,float(policy["threshold"])
+    if policy.get("kind")=="soph_cusum":
+        return soph_cusum_channels(d,p,policy["channel_thresholds"],policy["naive_cusum"]),True,float(policy["threshold"])
     n="integrated_raw" if name=="integrated_half" else name
     ch,confirm=channels(d,p,ref,n)
     return ch,confirm,float(policy["threshold"])
@@ -961,6 +1045,7 @@ def evaluate(root,modelpath,out,arm):
             policies["hybrid_augmented"]=calibrate_hybrid_raw(cal,ps)
             if all((k+"_aug") in ps[0] for k in COMP_SOPH_CHANNELS):
                 policies["hybrid_soph_augmented"]=calibrate_soph_hybrid(cal,ps)
+                policies["hybrid_soph_cusum"]=calibrate_soph_cusum(cal,ps)
     policies["integrated_half"]=cut_policy(cal,ps,ref,"integrated_raw",RAW_BUDGET*.5,INCIDENT_BUDGET*.5)
 
     controls=[]
