@@ -607,6 +607,14 @@ def fit_compromise_soph(d,soph,mode,kind="hgb"):
     q=d.loc[keep].copy()
     return fit(q,mode,"comp",kind)
 
+def fit_compromise_role_soph(d,role,soph,mode,kind="hgb"):
+    # Role is an observable network property, not an attack label.
+    keep=(d.ntype.astype(str)==str(role))&(
+        (d.attack=="normal")|((d.attack=="compromise")&(d.sophistication==soph)))
+    q=d.loc[keep].copy()
+    if q.label.nunique()!=2:raise ValueError((role,soph,q.attack.value_counts().to_dict()))
+    return fit(q,mode,"comp",kind)
+
 
 OTHER=KINDS[:-1]
 COMMON_MODELS=("local","article_raw","integrated_raw","dual_tail","dual_tail_confirm","five_tail","five_role_tail")
@@ -659,6 +667,12 @@ def train(root,out,arm):
     }
     for n,(soph,mode,kind) in soph_spec.items():
         models[n]=fit_compromise_soph(aug,soph,mode,kind);print("FIT",arm,n,flush=True)
+    role_naive_spec={}
+    for role in F.NodeType:
+        name="comp_naive_role_"+role.value+"_aug"
+        role_naive_spec[name]=(role.value,"naive","role_action","hgb")
+        models[name]=fit_compromise_role_soph(aug,role.value,"naive","role_action","hgb")
+        print("FIT",arm,name,flush=True)
 
     cal=[]
     for seed in CAL:
@@ -689,6 +703,18 @@ def train(root,out,arm):
                 auc_roc=roc_auc_score(y,score) if len(np.unique(y))==2 else np.nan,
                 auc_pr=average_precision_score(y,score) if y.sum() else np.nan,
                 f1_at_05=f1_score(y,score>=.5,zero_division=0)))
+    for name,(role,soph,mode,kind) in role_naive_spec.items():
+        names,model=models[name]
+        for split,frame in (("train",aug),("cal",cal)):
+            keep=(frame.ntype.astype(str)==str(role))&(
+                (frame.attack=="normal")|((frame.attack=="compromise")&(frame.sophistication==soph)))
+            q=frame.loc[keep]
+            y=((q.attack=="compromise")&(q.sophistication==soph)).to_numpy(int)
+            score=model.predict_proba(matrix(q,names))[:,1]
+            diag.append(dict(model=name,split=split,n=len(q),positive=int(y.sum()),
+                auc_roc=roc_auc_score(y,score) if len(np.unique(y))==2 else np.nan,
+                auc_pr=average_precision_score(y,score) if y.sum() else np.nan,
+                f1_at_05=f1_score(y,score>=.5,zero_division=0)))
     dg=pd.DataFrame(diag)
     wide=dg.pivot(index="model",columns="split",values="auc_pr")
     gaps=(wide["train"]-wide["cal"]).sort_values(ascending=False)
@@ -708,6 +734,13 @@ def predict(d,models):
     s={n:m.predict_proba(matrix(d,c))[:,1] for n,(c,m) in models.items()}
     for n,v in s.items():assert np.isfinite(v).all(),n
     s["article_special"]=.5*(s["article_rf"]+s["article_gb"])
+    role_names={"comp_naive_role_"+r.value+"_aug":r.value for r in F.NodeType}
+    if all(k in s for k in role_names):
+        v=np.zeros(len(d),float);seen=np.zeros(len(d),bool);roles=d.ntype.astype(str).to_numpy()
+        for k,role in role_names.items():
+            mask=roles==role;v[mask]=s[k][mask];seen|=mask
+        assert seen.all()
+        s["comp_naive_role_aug"]=v
     return s
 
 CHANNELS=("general","invariant","behavior")+OTHER
@@ -1347,6 +1380,62 @@ def calibrate_soph_cusum(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
     return dict(kind="soph_cusum",threshold=margin_cut,streak=int(chosen),
         channel_thresholds=thresholds,naive_cusum=cusum_rule,diagnostics=diagnostics)
 
+def soph_role_channels(d,p,thresholds):
+    out={}
+    out["fallback"]=_logit(p["local_aug"])-_logit(_threshold_vector(d,thresholds["fallback"]))
+    for k in OTHER:
+        out[k]=_logit(p[k+"_aug"])-_logit(_threshold_vector(d,thresholds[k]))
+    out["comp_naive"]=_logit(p["comp_naive_role_aug"])-_logit(_threshold_vector(d,thresholds["comp_naive"]))
+    for k in ("comp_statistical","comp_adaptive"):
+        out[k]=_logit(p[k+"_aug"])-_logit(_threshold_vector(d,thresholds[k]))
+    return out
+
+def calibrate_soph_role(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET,weights=None):
+    keys=tuple(OTHER)+tuple(COMP_SOPH_CHANNELS)
+    if weights is None:weights={k:1.0 for k in keys}
+    total_w=sum(float(weights.get(k,1.0)) for k in keys)
+    shares={k:raw*float(weights.get(k,1.0))/max(total_w,1e-12) for k in keys}
+    thresholds={}
+    thresholds["fallback"]=float(max(
+        threshold(p["local_aug"][d.label.to_numpy()==0],raw,elapsed(d))
+        for d,p in zip(frames,preds)))
+    for k in OTHER:
+        thresholds[k]=float(max(
+            threshold(p[k+"_aug"][d.label.to_numpy()==0],shares[k],elapsed(d))
+            for d,p in zip(frames,preds)))
+    sources={"comp_naive":"comp_naive_role_aug",
+             "comp_statistical":"comp_statistical_aug",
+             "comp_adaptive":"comp_adaptive_aug"}
+    for k,src in sources.items():
+        by_role={}
+        for role in sorted(set(np.concatenate([d.ntype.astype(str).unique() for d in frames]))):
+            vals=[]
+            for d,p in zip(frames,preds):
+                mask=(d.label.to_numpy()==0)&(d.ntype.astype(str).to_numpy()==role)
+                if mask.any():vals.append(threshold(p[src][mask],shares[k],elapsed(d)))
+            if vals:by_role[role]=float(max(vals))
+        thresholds[k]=by_role
+    prepared=[];cuts=[]
+    for d,p in zip(frames,preds):
+        ch=soph_role_channels(d,p,thresholds)
+        score,_=combined(d,ch,True,negative_only=True,streak_len=3)
+        cuts.append(threshold(score[np.isfinite(score)],raw,elapsed(d)))
+        prepared.append((d,ch))
+    margin_cut=float(max(cuts));chosen=None;diagnostics=[]
+    for length in (3,5,7,9,12):
+        nr=[];wr=[]
+        for d,ch in prepared:
+            score,z=combined(d,ch,True,negative_only=True,streak_len=length)
+            wr.append(float((score>margin_cut).sum()/elapsed(d)))
+            nr.append(float(len(notify(d,z,margin_cut))/elapsed(d)))
+        diagnostics.append(dict(streak=length,worst_notifications_day=max(nr),
+            worst_windows_day=max(wr),rates=nr))
+        if max(nr)<=notice:chosen=length;break
+    if chosen is None:chosen=12
+    return dict(kind="soph_role",threshold=margin_cut,streak=int(chosen),
+        channel_thresholds=thresholds,budget_weights={k:float(weights.get(k,1.0)) for k in keys},
+        budget_shares=shares,diagnostics=diagnostics)
+
 def policy_channels(d,p,ref,name,policy):
     if policy.get("kind")=="five_raw":
         return five_raw_channels(d,p,policy["channel_thresholds"],policy.get("model_suffix","")),True,float(policy["threshold"])
@@ -1354,6 +1443,8 @@ def policy_channels(d,p,ref,name,policy):
         return hybrid_raw_channels(d,p,policy["channel_thresholds"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_hybrid":
         return soph_hybrid_channels(d,p,policy["channel_thresholds"]),True,float(policy["threshold"])
+    if policy.get("kind")=="soph_role":
+        return soph_role_channels(d,p,policy["channel_thresholds"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_cusum":
         return soph_cusum_channels(d,p,policy["channel_thresholds"],policy["naive_cusum"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_selfnorm":
@@ -1383,6 +1474,9 @@ def evaluate(root,modelpath,out,arm):
             if all((k+"_aug") in ps[0] for k in COMP_SOPH_CHANNELS):
                 policies["hybrid_soph_augmented"]=calibrate_soph_hybrid(cal,ps)
                 policies["hybrid_soph_weighted"]=calibrate_soph_hybrid(cal,ps,weights=SOPH_BUDGET_WEIGHTS)
+                if "comp_naive_role_aug" in ps[0]:
+                    policies["hybrid_soph_role"]=calibrate_soph_role(cal,ps)
+                    policies["hybrid_soph_role_weighted"]=calibrate_soph_role(cal,ps,weights=SOPH_BUDGET_WEIGHTS)
                 policies["hybrid_soph_cusum"]=calibrate_soph_cusum(cal,ps)
                 policies["hybrid_soph_selfnorm"]=calibrate_soph_selfnorm(cal,ps)
                 policies["hybrid_soph_selfnorm_weighted"]=calibrate_soph_selfnorm(cal,ps,weights=SOPH_BUDGET_WEIGHTS)
