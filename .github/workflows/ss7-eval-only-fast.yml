@@ -1,4 +1,5 @@
 name: SS7 eval-only frozen-model check
+# trigger: profile-divergence-v1
 on:
   push:
     branches: [ss7-anti-overfit-development]
