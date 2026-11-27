@@ -729,13 +729,20 @@ def _logit(x):
     x=np.clip(np.asarray(x,float),1e-8,1-1e-8)
     return np.log(x)-np.log1p(-x)
 
-def five_raw_channels(p,thresholds,suffix=""):
+def _threshold_vector(d,value):
+    if not isinstance(value,dict):return np.full(len(d),float(value))
+    role=d.ntype.to_numpy()
+    fallback=float(value.get("all",next(iter(value.values()))))
+    return np.array([float(value.get(str(r),fallback)) for r in role],dtype=float)
+
+def five_raw_channels(d,p,thresholds,suffix=""):
     # Four attack-specific experts plus the invariant compromise expert.
-    # Logical channel names stay unchanged; suffix selects the frozen model set.
+    # The compromise anchor may be role-specific because node type is directly
+    # observable by the coordinator and has different benign score baselines.
     out={}
     for k in FIVE_CHANNELS:
         src=k+suffix if suffix else k
-        out[k]=_logit(p[src])-_logit(thresholds[k])
+        out[k]=_logit(p[src])-_logit(_threshold_vector(d,thresholds[k]))
     return out
 
 def calibrate_five_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET,suffix=""):
@@ -748,15 +755,26 @@ def calibrate_five_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET,suffix
     """
     share=float(raw/len(FIVE_CHANNELS));thresholds={}
     for k in FIVE_CHANNELS:
-        thresholds[k]=float(max(
-            threshold(p[k+suffix if suffix else k][d.label.to_numpy()==0],share,elapsed(d))
-            for d,p in zip(frames,preds)
-        ))
+        src=k+suffix if suffix else k
+        if k=="invariant":
+            by_role={}
+            for role in sorted(set(np.concatenate([d.ntype.astype(str).unique() for d in frames]))):
+                vals=[]
+                for d,p in zip(frames,preds):
+                    mask=(d.label.to_numpy()==0)&(d.ntype.astype(str).to_numpy()==role)
+                    if mask.any():vals.append(threshold(p[src][mask],share,elapsed(d)))
+                if vals:by_role[role]=float(max(vals))
+            thresholds[k]=by_role
+        else:
+            thresholds[k]=float(max(
+                threshold(p[src][d.label.to_numpy()==0],share,elapsed(d))
+                for d,p in zip(frames,preds)
+            ))
 
     prepared=[]
     raw_cuts=[]
     for d,p in zip(frames,preds):
-        ch=five_raw_channels(p,thresholds,suffix)
+        ch=five_raw_channels(d,p,thresholds,suffix)
         s,_=combined(d,ch,True,negative_only=True,streak_len=3)
         raw_cuts.append(threshold(s[np.isfinite(s)],raw,elapsed(d)))
         prepared.append((d,ch))
@@ -777,10 +795,10 @@ def calibrate_five_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET,suffix
     return dict(kind="five_raw",threshold=margin_cut,streak=int(chosen),model_suffix=suffix,
         raw_budget_share=share,channel_thresholds=thresholds,diagnostics=diagnostics)
 
-def hybrid_raw_channels(p,thresholds):
-    out={"fallback":_logit(p["local_aug"])-_logit(thresholds["fallback"])}
+def hybrid_raw_channels(d,p,thresholds):
+    out={"fallback":_logit(p["local_aug"])-_logit(_threshold_vector(d,thresholds["fallback"]))}
     for k in FIVE_CHANNELS:
-        out[k]=_logit(p[k+"_aug"])-_logit(thresholds[k])
+        out[k]=_logit(p[k+"_aug"])-_logit(_threshold_vector(d,thresholds[k]))
     return out
 
 def calibrate_hybrid_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
@@ -793,13 +811,23 @@ def calibrate_hybrid_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
         for d,p in zip(frames,preds)))
     share=float(raw/len(FIVE_CHANNELS))
     for k in FIVE_CHANNELS:
-        thresholds[k]=float(max(
-            threshold(p[k+"_aug"][d.label.to_numpy()==0],share,elapsed(d))
-            for d,p in zip(frames,preds)))
+        if k=="invariant":
+            by_role={}
+            for role in sorted(set(np.concatenate([d.ntype.astype(str).unique() for d in frames]))):
+                vals=[]
+                for d,p in zip(frames,preds):
+                    mask=(d.label.to_numpy()==0)&(d.ntype.astype(str).to_numpy()==role)
+                    if mask.any():vals.append(threshold(p[k+"_aug"][mask],share,elapsed(d)))
+                if vals:by_role[role]=float(max(vals))
+            thresholds[k]=by_role
+        else:
+            thresholds[k]=float(max(
+                threshold(p[k+"_aug"][d.label.to_numpy()==0],share,elapsed(d))
+                for d,p in zip(frames,preds)))
 
     prepared=[];cuts=[]
     for d,p in zip(frames,preds):
-        ch=hybrid_raw_channels(p,thresholds)
+        ch=hybrid_raw_channels(d,p,thresholds)
         score,_=combined(d,ch,True,negative_only=True,streak_len=3)
         cuts.append(threshold(score[np.isfinite(score)],raw,elapsed(d)))
         prepared.append((d,ch))
@@ -822,9 +850,9 @@ def calibrate_hybrid_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
 
 def policy_channels(d,p,ref,name,policy):
     if policy.get("kind")=="five_raw":
-        return five_raw_channels(p,policy["channel_thresholds"],policy.get("model_suffix","")),True,float(policy["threshold"])
+        return five_raw_channels(d,p,policy["channel_thresholds"],policy.get("model_suffix","")),True,float(policy["threshold"])
     if policy.get("kind")=="hybrid_raw":
-        return hybrid_raw_channels(p,policy["channel_thresholds"]),True,float(policy["threshold"])
+        return hybrid_raw_channels(d,p,policy["channel_thresholds"]),True,float(policy["threshold"])
     n="integrated_raw" if name=="integrated_half" else name
     ch,confirm=channels(d,p,ref,n)
     return ch,confirm,float(policy["threshold"])
