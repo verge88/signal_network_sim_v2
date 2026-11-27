@@ -531,6 +531,15 @@ def fit(d,mode,target,kind):
     model=make_pipeline(SimpleImputer(strategy="median",keep_empty_features=True),est)
     model.fit(matrix(d,names),y,**{model.steps[-1][0]+"__sample_weight":w})
     return names,model
+def fit_compromise_soph(d,soph,mode,kind="hgb"):
+    # Train each evasion-mode expert against normal traffic only. Other attack
+    # modes are not negatives because firing on any attack is harmless for the
+    # binary anomaly decision; this prevents artificial inter-attack borders.
+    keep=(d.attack=="normal")|((d.attack=="compromise")&(d.sophistication==soph))
+    q=d.loc[keep].copy()
+    return fit(q,mode,"comp",kind)
+
+
 OTHER=KINDS[:-1]
 COMMON_MODELS=("local","article_raw","integrated_raw","dual_tail","dual_tail_confirm","five_tail","five_role_tail")
 MODELS=COMMON_MODELS+("five_calibrated","five_augmented")
@@ -572,6 +581,17 @@ def train(root,out,arm):
     for n,sp in aug_spec.items():
         models[n]=fit(aug,*sp);print("FIT",arm,n,flush=True)
 
+    # Evasion-mode experts. NAIVE exposes its true report, so its signal lives
+    # in local/base temporal and zone behaviour. STATISTICAL/ADAPTIVE actively
+    # falsify reports, so cross-node invariants are the appropriate evidence.
+    soph_spec={
+        "comp_naive_aug":("naive","base","hgb"),
+        "comp_statistical_aug":("statistical","invariant","hgb"),
+        "comp_adaptive_aug":("adaptive","invariant","hgb"),
+    }
+    for n,(soph,mode,kind) in soph_spec.items():
+        models[n]=fit_compromise_soph(aug,soph,mode,kind);print("FIT",arm,n,flush=True)
+
     cal=[]
     for seed in CAL:
         q,_,_=load(root,arm,seed)
@@ -587,6 +607,17 @@ def train(root,out,arm):
         for split,frame in (("train",train_frame),("cal",cal)):
             y=target_y(frame,target);score=model.predict_proba(matrix(frame,names))[:,1]
             diag.append(dict(model=name,split=split,n=len(frame),positive=int(y.sum()),
+                auc_roc=roc_auc_score(y,score) if len(np.unique(y))==2 else np.nan,
+                auc_pr=average_precision_score(y,score) if y.sum() else np.nan,
+                f1_at_05=f1_score(y,score>=.5,zero_division=0)))
+    for name,(soph,mode,kind) in soph_spec.items():
+        names,model=models[name]
+        for split,frame in (("train",aug),("cal",cal)):
+            keep=(frame.attack=="normal")|((frame.attack=="compromise")&(frame.sophistication==soph))
+            q=frame.loc[keep]
+            y=((q.attack=="compromise")&(q.sophistication==soph)).to_numpy(int)
+            score=model.predict_proba(matrix(q,names))[:,1]
+            diag.append(dict(model=name,split=split,n=len(q),positive=int(y.sum()),
                 auc_roc=roc_auc_score(y,score) if len(np.unique(y))==2 else np.nan,
                 auc_pr=average_precision_score(y,score) if y.sum() else np.nan,
                 f1_at_05=f1_score(y,score>=.5,zero_division=0)))
@@ -848,11 +879,68 @@ def calibrate_hybrid_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
     return dict(kind="hybrid_raw",threshold=margin_cut,streak=int(chosen),
         channel_thresholds=thresholds,diagnostics=diagnostics)
 
+COMP_SOPH_CHANNELS=("comp_naive","comp_statistical","comp_adaptive")
+
+def soph_hybrid_channels(d,p,thresholds):
+    out={"fallback":_logit(p["local_aug"])-_logit(_threshold_vector(d,thresholds["fallback"]))}
+    for k in OTHER:
+        out[k]=_logit(p[k+"_aug"])-_logit(_threshold_vector(d,thresholds[k]))
+    for k in COMP_SOPH_CHANNELS:
+        out[k]=_logit(p[k+"_aug"])-_logit(_threshold_vector(d,thresholds[k]))
+    return out
+
+def calibrate_soph_hybrid(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
+    """General fallback + attack experts + three compromise-evasion experts."""
+    thresholds={}
+    thresholds["fallback"]=float(max(
+        threshold(p["local_aug"][d.label.to_numpy()==0],raw,elapsed(d))
+        for d,p in zip(frames,preds)))
+    n_special=len(OTHER)+len(COMP_SOPH_CHANNELS)
+    share=float(raw/n_special)
+    for k in OTHER:
+        thresholds[k]=float(max(
+            threshold(p[k+"_aug"][d.label.to_numpy()==0],share,elapsed(d))
+            for d,p in zip(frames,preds)))
+    # Role-normalize each compromise expert; node role is observable at runtime.
+    for k in COMP_SOPH_CHANNELS:
+        by_role={}
+        for role in sorted(set(np.concatenate([d.ntype.astype(str).unique() for d in frames]))):
+            vals=[]
+            for d,p in zip(frames,preds):
+                mask=(d.label.to_numpy()==0)&(d.ntype.astype(str).to_numpy()==role)
+                if mask.any():vals.append(threshold(p[k+"_aug"][mask],share,elapsed(d)))
+            if vals:by_role[role]=float(max(vals))
+        thresholds[k]=by_role
+
+    prepared=[];cuts=[]
+    for d,p in zip(frames,preds):
+        ch=soph_hybrid_channels(d,p,thresholds)
+        score,_=combined(d,ch,True,negative_only=True,streak_len=3)
+        cuts.append(threshold(score[np.isfinite(score)],raw,elapsed(d)))
+        prepared.append((d,ch))
+    margin_cut=float(max(cuts))
+    diagnostics=[];chosen=None
+    for length in (3,5,7,9,12):
+        nr=[];wr=[]
+        for d,ch in prepared:
+            score,z=combined(d,ch,True,negative_only=True,streak_len=length)
+            wr.append(float((score>margin_cut).sum()/elapsed(d)))
+            nr.append(float(len(notify(d,z,margin_cut))/elapsed(d)))
+        diagnostics.append(dict(streak=length,worst_notifications_day=max(nr),
+            worst_windows_day=max(wr),rates=nr))
+        if max(nr)<=notice:
+            chosen=length;break
+    if chosen is None:chosen=12
+    return dict(kind="soph_hybrid",threshold=margin_cut,streak=int(chosen),
+        channel_thresholds=thresholds,diagnostics=diagnostics)
+
 def policy_channels(d,p,ref,name,policy):
     if policy.get("kind")=="five_raw":
         return five_raw_channels(d,p,policy["channel_thresholds"],policy.get("model_suffix","")),True,float(policy["threshold"])
     if policy.get("kind")=="hybrid_raw":
         return hybrid_raw_channels(d,p,policy["channel_thresholds"]),True,float(policy["threshold"])
+    if policy.get("kind")=="soph_hybrid":
+        return soph_hybrid_channels(d,p,policy["channel_thresholds"]),True,float(policy["threshold"])
     n="integrated_raw" if name=="integrated_half" else name
     ch,confirm=channels(d,p,ref,n)
     return ch,confirm,float(policy["threshold"])
@@ -871,6 +959,8 @@ def evaluate(root,modelpath,out,arm):
         policies["five_augmented"]=calibrate_five_raw(cal,ps,suffix="_aug")
         if "local_aug" in ps[0]:
             policies["hybrid_augmented"]=calibrate_hybrid_raw(cal,ps)
+            if all((k+"_aug") in ps[0] for k in COMP_SOPH_CHANNELS):
+                policies["hybrid_soph_augmented"]=calibrate_soph_hybrid(cal,ps)
     policies["integrated_half"]=cut_policy(cal,ps,ref,"integrated_raw",RAW_BUDGET*.5,INCIDENT_BUDGET*.5)
 
     controls=[]
