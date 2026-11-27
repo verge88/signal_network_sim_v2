@@ -14,7 +14,7 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score, average_precision_score
 from ss7 import fix as F
 from ss7.cu_compact_channel_development import (
-    MAP, JOINT_KIE, _causal_robust_z, _profile_js_rows, naive_self_score
+    MAP, KIE_DERIVED, _causal_robust_z, _profile_js_rows, naive_self_score
 )
 
 AUDIT_SEEDS=(21101,21102)
@@ -34,7 +34,7 @@ def candidates(d):
     # a transport-bypass ablation and is intentionally excluded here.
     raw=[c for c in F.OWN if c in d.columns]
     raw += [c for c in d.columns if c.startswith("obs_ratio_")]
-    raw += [c for c in JOINT_KIE if c in d.columns]
+    raw += [c for c in KIE_DERIVED if c in d.columns]
     for c in raw:
         x=d[c].to_numpy(float)
         z=_causal_robust_z(d,x)
