@@ -532,7 +532,9 @@ def fit(d,mode,target,kind):
     model.fit(matrix(d,names),y,**{model.steps[-1][0]+"__sample_weight":w})
     return names,model
 OTHER=KINDS[:-1]
-MODELS=("local","article_raw","integrated_raw","dual_tail","dual_tail_confirm","five_tail","five_role_tail")
+COMMON_MODELS=("local","article_raw","integrated_raw","dual_tail","dual_tail_confirm","five_tail","five_role_tail")
+MODELS=COMMON_MODELS+("five_calibrated",)
+FIVE_CHANNELS=OTHER+("invariant",)
 def load(root,arm,seed):
     return joblib.load(root/f"world-{arm}-{seed}"/"world.joblib")
 
@@ -708,6 +710,53 @@ def cut_policy(frames,preds,ref,mode,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
     return dict(threshold=float(thr),streak=int(chosen),diagnostics=diagnostics)
 
 
+def _logit(x):
+    x=np.clip(np.asarray(x,float),1e-8,1-1e-8)
+    return np.log(x)-np.log1p(-x)
+
+def five_raw_channels(p,thresholds):
+    # Four attack-specific experts plus the invariant compromise expert.
+    # Each channel is converted to a log-odds margin around its own frozen
+    # calibration threshold, so margin > 0 has the same decision meaning.
+    return {k:_logit(p[k])-_logit(thresholds[k]) for k in FIVE_CHANNELS}
+
+def calibrate_five_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
+    """Bonferroni-safe per-class raw calibration followed by persistence.
+
+    The raw false-window budget is split uniformly across the five attack
+    channels. Thresholds are chosen independently on each CAL world and the
+    conservative maximum is frozen. The shortest persistence that satisfies
+    the global notification budget on every CAL world is then selected.
+    """
+    share=float(raw/len(FIVE_CHANNELS));thresholds={}
+    for k in FIVE_CHANNELS:
+        thresholds[k]=float(max(
+            threshold(p[k][d.label.to_numpy()==0],share,elapsed(d))
+            for d,p in zip(frames,preds)
+        ))
+    diagnostics=[];chosen=None
+    for length in (3,5,7,9,12):
+        rates=[];raw_rates=[]
+        for d,p in zip(frames,preds):
+            ch=five_raw_channels(p,thresholds)
+            s,z=combined(d,ch,True,negative_only=True,streak_len=length)
+            raw_rates.append(float((s>0).sum()/elapsed(d)))
+            rates.append(float(len(notify(d,z,0.0))/elapsed(d)))
+        diagnostics.append(dict(streak=length,worst_notifications_day=max(rates),
+            worst_windows_day=max(raw_rates),rates=rates))
+        if max(rates)<=notice:
+            chosen=length;break
+    if chosen is None:chosen=12
+    return dict(kind="five_raw",threshold=0.0,streak=int(chosen),
+        raw_budget_share=share,channel_thresholds=thresholds,diagnostics=diagnostics)
+
+def policy_channels(d,p,ref,name,policy):
+    if policy.get("kind")=="five_raw":
+        return five_raw_channels(p,policy["channel_thresholds"]),True,float(policy["threshold"])
+    n="integrated_raw" if name=="integrated_half" else name
+    ch,confirm=channels(d,p,ref,n)
+    return ch,confirm,float(policy["threshold"])
+
 def class_name(k):
     return "compromise" if k in ("invariant","behavior","article_special") else k
 
@@ -716,19 +765,19 @@ def evaluate(root,modelpath,out,arm):
     ranks=[load(root,arm,s)[0] for s in RANK];ref=fit_tails(ranks,[predict(d,models) for d in ranks])
     del ranks
     cal=[load(root,arm,s)[0] for s in CAL];ps=[predict(d,models) for d in cal]
-    policies={n:cut_policy(cal,ps,ref,n) for n in MODELS}
+    policies={n:cut_policy(cal,ps,ref,n) for n in COMMON_MODELS}
+    policies["five_calibrated"]=calibrate_five_raw(cal,ps)
     policies["integrated_half"]=cut_policy(cal,ps,ref,"integrated_raw",RAW_BUDGET*.5,INCIDENT_BUDGET*.5)
 
     controls=[]
     for seed,d,p in zip(CAL,cal,ps):
         for name,policy in policies.items():
-            n="integrated_raw" if name=="integrated_half" else name
-            ch,confirm=channels(d,p,ref,n)
+            ch,confirm,thr=policy_channels(d,p,ref,name,policy)
             s,z=combined(d,ch,confirm,negative_only=True,streak_len=policy["streak"])
             controls.append(dict(seed=seed,arm=arm,model=name,
-                threshold=policy["threshold"],streak=policy["streak"],
-                false_windows_day=float((s>policy["threshold"]).sum()/elapsed(d)),
-                false_notifications_day=float(len(notify(d,z,policy["threshold"]))/elapsed(d))))
+                threshold=thr,streak=policy["streak"],
+                false_windows_day=float((s>thr).sum()/elapsed(d)),
+                false_notifications_day=float(len(notify(d,z,thr))/elapsed(d))))
     controls=pd.DataFrame(controls)
     controls.to_csv(out/"calibration_controls.csv",index=False)
     print("POLICIES",arm,json.dumps(policies,indent=2),flush=True)
@@ -740,9 +789,9 @@ def evaluate(root,modelpath,out,arm):
         d,eligible,cu=load(root,arm,seed);overhead.append(dict(seed=seed,**cu))
         p=predict(d,models)
         for name,policy in policies.items():
-            n="integrated_raw" if name=="integrated_half" else name
-            thr=policy["threshold"];streak_len=policy["streak"]
-            ch,confirm=channels(d,p,ref,n);s,z=combined(d,ch,confirm,streak_len=streak_len)
+            streak_len=policy["streak"]
+            ch,confirm,thr=policy_channels(d,p,ref,name,policy)
+            s,z=combined(d,ch,confirm,streak_len=streak_len)
             m,det=metrics(d,s,z,thr,eligible);fire=s>thr
             m.update(seed=seed,arm=arm,model=name,streak=streak_len,
                 window_f1=f1_score(d.label,fire,zero_division=0),
