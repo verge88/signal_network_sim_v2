@@ -1,5 +1,6 @@
 name: SS7 persistence calibration fast check
 # role-aware compromise calibration check
+# trigger: drift-profile-comparison-v1
 # reuses drift-enabled worlds from run 46063674571
 on:
   # Model training is now frozen; calibration experiments use eval-only workflow.
