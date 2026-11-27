@@ -1,0 +1,46 @@
+name: SS7 naive robust subset fast audit
+on:
+  push:
+    branches: [ss7-anti-overfit-robust-dev]
+    paths:
+      - ss7/naive_robust_subset_audit.py
+      - .github/workflows/ss7-naive-robust-subset-fast.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-naive-robust-subset-fast-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46068787511
+          pattern: dev-world-compact-210*
+          path: results/incoming-train
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46068851988
+          pattern: route-sketch-world-compact-211*
+          path: results/incoming-rank
+      - run: |
+          mkdir -p results/worlds
+          for seed in 21001 21002 21003; do mv results/incoming-train/dev-world-compact-${seed} results/worlds/world-compact-${seed}; done
+          for seed in 21101 21102; do mv results/incoming-rank/route-sketch-world-compact-${seed} results/worlds/world-compact-${seed}; done
+      - run: python -u -m ss7.naive_robust_subset_audit --root results/worlds --output results/audit
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-naive-robust-subset-audit
+          path: results/audit
+          retention-days: 7
