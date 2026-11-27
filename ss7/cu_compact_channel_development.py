@@ -1127,6 +1127,80 @@ def calibrate_soph_profile(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
     return dict(kind="soph_profile",threshold=margin_cut,streak=int(chosen),
         channel_thresholds=thresholds,naive_profile=profile_rule,diagnostics=diagnostics)
 
+NAIVE_ROUTING_WIN=60
+
+def naive_routing_score(d,win=NAIVE_ROUTING_WIN):
+    """Causal long-horizon drift in routing MAP procedures SRI/PRN."""
+    cols=[c for c in ("local_obs_ratio_SRI","local_obs_ratio_PRN") if c in d.columns]
+    if not cols:return np.zeros(len(d),float)
+    z=[]
+    for c in cols:
+        z.append(np.maximum(_causal_robust_z(d,d[c].to_numpy(float)),0.0))
+    base=np.mean(np.column_stack(z),axis=1)
+    out=np.full(len(d),0.0)
+    for _,g in d.groupby("nid",sort=False):
+        ix=g.index.to_numpy()
+        out[ix]=pd.Series(base[ix],index=ix).rolling(win,min_periods=max(10,win//3)).mean().fillna(0.0).to_numpy()
+    return out
+
+def fit_naive_routing(frames,raw=RAW_BUDGET):
+    roles=sorted(set(np.concatenate([d.ntype.astype(str).unique() for d in frames])))
+    cuts={};scales={}
+    # Do not pre-split the budget here; the fused margin calibration below
+    # enforces the final union budget across all channels.
+    for role in roles:
+        vals=[];allv=[]
+        for d in frames:
+            score=naive_routing_score(d)
+            mask=(d.label.to_numpy()==0)&(d.ntype.astype(str).to_numpy()==role)
+            a=score[mask]
+            if len(a):
+                vals.append(threshold(a,raw,elapsed(d)));allv.append(a)
+        if vals:
+            cuts[role]=float(max(vals))
+            q=np.concatenate(allv)
+            q25,q75=np.quantile(q,[.25,.75])
+            scales[role]=float(max((q75-q25)/1.349,.05))
+    return dict(window=NAIVE_ROUTING_WIN,thresholds=cuts,scales=scales)
+
+def naive_routing_margin(d,rule):
+    score=naive_routing_score(d,rule["window"])
+    cut=_threshold_vector(d,rule["thresholds"])
+    scale=_threshold_vector(d,rule["scales"])
+    return (score-cut)/np.maximum(scale,.05)
+
+def soph_routing_channels(d,p,thresholds,routing_rule):
+    out=soph_hybrid_channels(d,p,thresholds)
+    out["comp_naive_routing"]=naive_routing_margin(d,routing_rule)
+    return out
+
+def calibrate_soph_routing(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
+    base=calibrate_soph_hybrid(frames,preds,raw,notice)
+    thresholds=base["channel_thresholds"]
+    routing_rule=fit_naive_routing(frames,raw)
+    prepared=[];cuts=[]
+    for d,p in zip(frames,preds):
+        ch=soph_routing_channels(d,p,thresholds,routing_rule)
+        score,_=combined(d,ch,True,negative_only=True,streak_len=3)
+        cuts.append(threshold(score[np.isfinite(score)],raw,elapsed(d)))
+        prepared.append((d,p))
+    margin_cut=float(max(cuts))
+    diagnostics=[];chosen=None
+    for length in (3,5,7,9,12):
+        nr=[];wr=[]
+        for d,p in prepared:
+            ch=soph_routing_channels(d,p,thresholds,routing_rule)
+            score,z=combined(d,ch,True,negative_only=True,streak_len=length)
+            wr.append(float((score>margin_cut).sum()/elapsed(d)))
+            nr.append(float(len(notify(d,z,margin_cut))/elapsed(d)))
+        diagnostics.append(dict(streak=length,worst_notifications_day=max(nr),
+            worst_windows_day=max(wr),rates=nr))
+        if max(nr)<=notice:
+            chosen=length;break
+    if chosen is None:chosen=12
+    return dict(kind="soph_routing",threshold=margin_cut,streak=int(chosen),
+        channel_thresholds=thresholds,naive_routing=routing_rule,diagnostics=diagnostics)
+
 def soph_hybrid_channels(d,p,thresholds):
     out={"fallback":_logit(p["local_aug"])-_logit(_threshold_vector(d,thresholds["fallback"]))}
     for k in OTHER:
@@ -1226,6 +1300,8 @@ def policy_channels(d,p,ref,name,policy):
         return soph_selfnorm_channels(d,p,policy["channel_thresholds"],policy["naive_selfnorm"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_profile":
         return soph_profile_channels(d,p,policy["channel_thresholds"],policy["naive_profile"]),True,float(policy["threshold"])
+    if policy.get("kind")=="soph_routing":
+        return soph_routing_channels(d,p,policy["channel_thresholds"],policy["naive_routing"]),True,float(policy["threshold"])
     n="integrated_raw" if name=="integrated_half" else name
     ch,confirm=channels(d,p,ref,n)
     return ch,confirm,float(policy["threshold"])
@@ -1249,6 +1325,7 @@ def evaluate(root,modelpath,out,arm):
                 policies["hybrid_soph_cusum"]=calibrate_soph_cusum(cal,ps)
                 policies["hybrid_soph_selfnorm"]=calibrate_soph_selfnorm(cal,ps)
                 policies["hybrid_soph_profile"]=calibrate_soph_profile(cal,ps)
+                policies["hybrid_soph_routing"]=calibrate_soph_routing(cal,ps)
     policies["integrated_half"]=cut_policy(cal,ps,ref,"integrated_raw",RAW_BUDGET*.5,INCIDENT_BUDGET*.5)
 
     controls=[]
