@@ -943,6 +943,103 @@ def naive_cusum_margin(d,p,rule,negative_only=False):
     return (cs-rule["anchor"])/rule["scale"]
 
 
+NAIVE_SELF_WIN=60
+NAIVE_SELF_MIN=20
+
+def _causal_robust_z(d,values,window=NAIVE_SELF_WIN,min_periods=NAIVE_SELF_MIN):
+    """World-independent positive shift relative to each node's own past."""
+    x=np.asarray(values,float);out=np.full(len(d),np.nan)
+    for _,g in d.groupby("nid",sort=False):
+        ix=g.index.to_numpy()
+        v=pd.Series(x[ix],index=ix,dtype=float)
+        prev=v.shift(1)
+        med=prev.rolling(window,min_periods=min_periods).median()
+        q25=prev.rolling(window,min_periods=min_periods).quantile(.25)
+        q75=prev.rolling(window,min_periods=min_periods).quantile(.75)
+        scale=((q75-q25)/1.349).to_numpy(float)
+        center=med.to_numpy(float)
+        # Poisson-like floor for count-valued signals and a small absolute
+        # floor for ratios prevent unstable z-scores when the IQR collapses.
+        floor=np.where(np.nanmedian(np.abs(v.to_numpy(float)))>2.,
+                       np.sqrt(np.maximum(np.abs(center),1.0)),.01)
+        scale=np.maximum(np.nan_to_num(scale,nan=0.0),floor)
+        out[ix]=(v.to_numpy(float)-center)/scale
+    return np.nan_to_num(out,nan=0.0,posinf=0.0,neginf=0.0)
+
+def naive_self_score(d):
+    total=d["local_total_messages"].to_numpy(float)
+    map_share=d["local_map_share"].to_numpy(float)
+    sms_cols=[c for c in ("local_obs_ratio_SRI_SM","local_obs_ratio_MT_FSM","local_obs_ratio_MO_FSM") if c in d]
+    if sms_cols:
+        sms=np.nan_to_num(d[sms_cols].to_numpy(float),nan=0.0).sum(axis=1)
+    else:
+        sms=np.zeros(len(d),float)
+    z_total=np.maximum(_causal_robust_z(d,total),0.0)
+    z_map=np.maximum(_causal_robust_z(d,map_share),0.0)
+    z_sms=np.maximum(_causal_robust_z(d,sms),0.0)
+    # Naive compromise adds genuine SMS_MT traffic. Normal traffic multipliers
+    # mostly change volume without a persistent MAP/SMS composition shift.
+    return .15*z_total+.50*z_map+.35*z_sms
+
+def fit_naive_selfnorm(frames,raw=RAW_BUDGET):
+    roles=sorted(set(np.concatenate([d.ntype.astype(str).unique() for d in frames])))
+    cuts={};scales={}
+    share=float(raw/8.0)
+    for role in roles:
+        vals=[];role_scores=[]
+        for d in frames:
+            score=naive_self_score(d)
+            mask=(d.label.to_numpy()==0)&(d.ntype.astype(str).to_numpy()==role)
+            a=score[mask]
+            if len(a):
+                vals.append(threshold(a,share,elapsed(d)))
+                role_scores.append(a)
+        if vals:
+            cuts[role]=float(max(vals))
+            allv=np.concatenate(role_scores)
+            q25,q75=np.quantile(allv,[.25,.75])
+            scales[role]=float(max((q75-q25)/1.349,.25))
+    return dict(window=NAIVE_SELF_WIN,min_periods=NAIVE_SELF_MIN,
+                thresholds=cuts,scales=scales,raw_share=share)
+
+def naive_selfnorm_margin(d,rule):
+    score=naive_self_score(d)
+    cut=_threshold_vector(d,rule["thresholds"])
+    scale=_threshold_vector(d,rule["scales"])
+    return (score-cut)/np.maximum(scale,.25)
+
+def soph_selfnorm_channels(d,p,thresholds,self_rule):
+    out=soph_hybrid_channels(d,p,thresholds)
+    out["comp_naive_selfnorm"]=naive_selfnorm_margin(d,self_rule)
+    return out
+
+def calibrate_soph_selfnorm(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
+    base=calibrate_soph_hybrid(frames,preds,raw,notice)
+    thresholds=base["channel_thresholds"]
+    self_rule=fit_naive_selfnorm(frames,raw)
+    prepared=[];cuts=[]
+    for d,p in zip(frames,preds):
+        ch=soph_selfnorm_channels(d,p,thresholds,self_rule)
+        score,_=combined(d,ch,True,negative_only=True,streak_len=3)
+        cuts.append(threshold(score[np.isfinite(score)],raw,elapsed(d)))
+        prepared.append((d,p))
+    margin_cut=float(max(cuts))
+    diagnostics=[];chosen=None
+    for length in (3,5,7,9,12):
+        nr=[];wr=[]
+        for d,p in prepared:
+            ch=soph_selfnorm_channels(d,p,thresholds,self_rule)
+            score,z=combined(d,ch,True,negative_only=True,streak_len=length)
+            wr.append(float((score>margin_cut).sum()/elapsed(d)))
+            nr.append(float(len(notify(d,z,margin_cut))/elapsed(d)))
+        diagnostics.append(dict(streak=length,worst_notifications_day=max(nr),
+            worst_windows_day=max(wr),rates=nr))
+        if max(nr)<=notice:
+            chosen=length;break
+    if chosen is None:chosen=12
+    return dict(kind="soph_selfnorm",threshold=margin_cut,streak=int(chosen),
+        channel_thresholds=thresholds,naive_selfnorm=self_rule,diagnostics=diagnostics)
+
 def soph_hybrid_channels(d,p,thresholds):
     out={"fallback":_logit(p["local_aug"])-_logit(_threshold_vector(d,thresholds["fallback"]))}
     for k in OTHER:
@@ -1038,12 +1135,14 @@ def policy_channels(d,p,ref,name,policy):
         return soph_hybrid_channels(d,p,policy["channel_thresholds"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_cusum":
         return soph_cusum_channels(d,p,policy["channel_thresholds"],policy["naive_cusum"]),True,float(policy["threshold"])
+    if policy.get("kind")=="soph_selfnorm":
+        return soph_selfnorm_channels(d,p,policy["channel_thresholds"],policy["naive_selfnorm"]),True,float(policy["threshold"])
     n="integrated_raw" if name=="integrated_half" else name
     ch,confirm=channels(d,p,ref,n)
     return ch,confirm,float(policy["threshold"])
 
 def class_name(k):
-    return "compromise" if k in ("invariant","behavior","article_special") else k
+    return "compromise" if (k in ("invariant","behavior","article_special") or k.startswith("comp_")) else k
 
 def evaluate(root,modelpath,out,arm):
     models=joblib.load(modelpath/"models.joblib")
@@ -1059,6 +1158,7 @@ def evaluate(root,modelpath,out,arm):
             if all((k+"_aug") in ps[0] for k in COMP_SOPH_CHANNELS):
                 policies["hybrid_soph_augmented"]=calibrate_soph_hybrid(cal,ps)
                 policies["hybrid_soph_cusum"]=calibrate_soph_cusum(cal,ps)
+                policies["hybrid_soph_selfnorm"]=calibrate_soph_selfnorm(cal,ps)
     policies["integrated_half"]=cut_policy(cal,ps,ref,"integrated_raw",RAW_BUDGET*.5,INCIDENT_BUDGET*.5)
 
     controls=[]
