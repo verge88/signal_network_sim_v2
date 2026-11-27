@@ -51,6 +51,7 @@ TEMP=("cv_total","cv_entropy","cv_io","cv_dominance","ar1_total","integrity_fail
 DRIFT_SOURCE=("total_messages","map_share","isup_share","n_unique_dest","dest_entropy","dest_top1_ratio","in_out_ratio","dlg_closure_ratio","transit_share")+SUB
 ZONE_BASE=("total_messages","map_share","isup_share","in_out_ratio","integrity_fail_rate","cv_total","cu_delivered")
 ZONE=tuple("zone_dev_"+c for c in ZONE_BASE)+("zone_io_ratio_rank",)
+ROLE_CU=("obs_originated_share","obs_terminated_share","obs_transited_txn_share","obs_originated_rate")
 BASE=list(CU)+list(F.OWN)+list(SUB)+list(TEMP)+list(ZONE)+["node_type_enc"]
 SPECIAL=list(CU)+list(TEMP)+list(ZONE[:3])
 assert len(BASE)==50 and len(SPECIAL)==21
@@ -195,8 +196,50 @@ class IntegratedSim(O.CorrectedSim):
         fl=super()._build_flows(rng)
         # Legitimate location traffic, rather than a code seen only in attacks.
         for sp in (n for ns in self.topo.zone_sp.values() for n in ns):
-            for h in self.topo.hlr:fl.append(F.Flow(sp,h,Service.LOCATION,float(rng.gamma(1.5,.04))))
+            for h in self.topo.hlr:
+                fl.append(F.Flow(sp,h,Service.LOCATION,float(rng.gamma(1.5,.04))))
+        # Low-rate legitimate HLR-originated control activity. This prevents
+        # SCP compromise from degenerating into a trivial zero-vs-nonzero
+        # originated counter and makes the role feature a behavioural signal.
+        for z,h in enumerate(self.topo.hlr):
+            for sp in self.topo.zone_sp.get(z,()):
+                fl.append(F.Flow(h,sp,Service.MOBILITY,float(rng.gamma(1.2,.015))))
         return fl
+
+    def compromise_action(self,n,e,rng):
+        """Return a role-appropriate unauthorized signalling action.
+
+        Sophistication is deliberately NOT used here: it controls only report
+        masking later. Thus NAIVE/STATISTICAL/ADAPTIVE execute the same physical
+        action and differ solely in how much of it the compromised node hides.
+        """
+        topo=self.topo;typ=topo.nodes[n].ntype
+        def choose(seq,x):
+            seq=list(seq)
+            if not seq:return None
+            return seq[min(len(seq)-1,int(np.clip(float(x),0.,.999999)*len(seq)))]
+        if typ==F.NodeType.SP:
+            dst=choose(topo.hlr,e.params[1])
+            services=(Service.LOCATION,Service.AUTH,Service.MOBILITY,Service.SMS_MT)
+        elif typ==F.NodeType.SCP:
+            z=topo.nodes[n].zone
+            targets=topo.zone_sp.get(z,()) or tuple(x for xs in topo.zone_sp.values() for x in xs)
+            dst=choose(targets,e.params[1])
+            services=(Service.MOBILITY,Service.SMS_MT)
+        elif typ==F.NodeType.STP:
+            z=topo.nodes[n].zone
+            targets=list(topo.zone_sp.get(z,()))+list(topo.hlr)
+            dst=choose(targets,e.params[1])
+            services=(Service.LOCATION,Service.ROAM_SRI,Service.SMS_MT)
+        else:  # IGW: inject interconnect-like signalling into the domestic core.
+            dst=choose(topo.hlr,e.params[1])
+            services=(Service.ROAM_SRI,Service.SMS_MT,Service.LOCATION)
+        if dst is None or dst==n:return None
+        service=services[min(len(services)-1,int(np.clip(float(e.params[0]),0.,.999999)*len(services)))]
+        route=topo.route(n,dst)
+        if not route.paths:return None
+        path=tuple(route.paths[int(rng.integers(len(route.paths)))])
+        return F.Flow(n,dst,service,0.0),path
     def flows_for(self,t,episodes):
         """Synthetic service-volume profiles on the existing simulated graph."""
         active={e.nid:e for e in episodes if e.kind in KINDS[:-1] and e.t0<=t<=e.t1}
@@ -292,16 +335,20 @@ class IntegratedSim(O.CorrectedSim):
                     offered[k] = offered.get(k, 0.0) + cnt * bits / dt
 
 
-        # Hidden events use a separate RNG, explicit provenance and legal
-        # shortest paths. No artificial detours through endpoint nodes.
+        # Compromise executes an unauthorized action attributable to the
+        # compromised node itself. Sophistication only controls later masking.
+        # This fixes the former semantics where SCP/STP/IGW could merely be a
+        # destination/relay of extra legitimate traffic and hence NAIVE had no
+        # identifiable compromised-node behaviour.
         arng=extra_rng(self.cfg.seed,1,t)
         active={e.nid:e for e in episodes if e.kind=="compromise" and e.t0<=t<=e.t1}
         for n,e in active.items():
             h=int(arng.poisson(max(e.hidden_rate*dt,0.)))
             if h<=0:continue
-            opts=self.candidates(n)
-            if not opts:continue
-            f,path=opts[int(arng.integers(len(opts)))]
+            action=self.compromise_action(n,e,arng)
+            if action is None:continue
+            f,path=action
+            assert path[0]==n and f.src==n
             if any(tuple(sorted((u,v))) in failed_links for u,v in zip(path[:-1],path[1:])):continue
             pending.append((f,path,h,n))
             bits=8.*sum(F.MSG_BYTES[m]*c for m,c in F.SERVICE_TEMPLATE[f.service].items())
@@ -454,10 +501,16 @@ def generate(seed,days=DAYS,arm="compact"):
                 if arm=="compact":profiles[n]=z
             r=last.get(n)
             if r is not None:assert (r.t==t) if valid else (r.t<t)
-            vals={c:np.nan for c in F.OWN+list(SUB)}
+            vals={c:np.nan for c in F.OWN+list(SUB)+list(ROLE_CU)}
             if r is not None:
                 vals.update(r.feats);st0=r.state;ms=sum(st0.mtype[5:])
                 vals.update({"obs_ratio_"+m:float(st0.mtype[F.MT_IDX[m]])/max(ms,1) for m in MAP})
+                txn=st0.originated+st0.terminated+st0.transited
+                vals.update(dict(
+                    obs_originated_share=float(st0.originated)/max(txn,1),
+                    obs_terminated_share=float(st0.terminated)/max(txn,1),
+                    obs_transited_txn_share=float(st0.transited)/max(txn,1),
+                    obs_originated_rate=float(st0.originated)/cfg.interval_s))
             err=(abs(r.state.total()-sum(r.state.link_in.values())-sum(r.state.link_out.values()))
                  /max(r.state.total(),1) if r is not None else np.nan)
             vals.update(dict(cu_delivered=float(delivered),cu_rtt_delay=req+resp+proc if delivered else np.nan,
@@ -509,6 +562,7 @@ def cols(d,mode):
     if mode=="invariant":return BASE+[c for c in d.columns if any(c==b or c.startswith(b+"__") for b in list(NEW)+list(O.EXTRA))]
     if mode=="behavior":return list(F.OWN)+list(D.BEHAVIOR)+[c for c in d if c.startswith("hist_")]+list(CU)
     if mode=="naive_drift":return list(F.OWN)+list(SUB)+[c for c in d if c.startswith("drift_")]+["node_type_enc"]
+    if mode=="role_action":return BASE+list(ROLE_CU)
     raise ValueError(mode)
 
 def matrix(d,names):
@@ -599,7 +653,7 @@ def train(root,out,arm):
     # in local/base temporal and zone behaviour. STATISTICAL/ADAPTIVE actively
     # falsify reports, so cross-node invariants are the appropriate evidence.
     soph_spec={
-        "comp_naive_aug":("naive","naive_drift","hgb"),
+        "comp_naive_aug":("naive","role_action","hgb"),
         "comp_statistical_aug":("statistical","invariant","hgb"),
         "comp_adaptive_aug":("adaptive","invariant","hgb"),
     }
@@ -1435,12 +1489,12 @@ def main():
     p=argparse.ArgumentParser();p.add_argument("mode",choices=("selftest","generate","train","evaluate","aggregate"))
     p.add_argument("--seed",type=int);p.add_argument("--arm",choices=ARMS,default="compact")
     p.add_argument("--output",default="results");p.add_argument("--root",default="results/worlds")
-    p.add_argument("--models",default="results/trained")
+    p.add_argument("--models",default="results/trained");p.add_argument("--days",type=float,default=DAYS)
     a=p.parse_args();out=Path(a.output);out.mkdir(parents=True,exist_ok=True)
     if a.mode=="selftest":selftest()
     elif a.mode=="generate":
         assert a.seed in TRAIN+RANK+CAL+TEST
-        d,e,cu=generate(a.seed,arm=a.arm);joblib.dump((d,e,cu),out/"world.joblib",compress=2)
+        d,e,cu=generate(a.seed,days=a.days,arm=a.arm);joblib.dump((d,e,cu),out/"world.joblib",compress=2)
         print("WORLD",a.arm,a.seed,len(d),d.attack.value_counts().to_dict(),cu,flush=True)
     elif a.mode=="train":train(Path(a.root),out,a.arm)
     elif a.mode=="evaluate":evaluate(Path(a.root),Path(a.models),out,a.arm)
