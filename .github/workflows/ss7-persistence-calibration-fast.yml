@@ -2,11 +2,7 @@ name: SS7 persistence calibration fast check
 # role-aware compromise calibration check
 # reuses frozen worlds from run 46035508077
 on:
-  push:
-    branches: [ss7-anti-overfit-development]
-    paths:
-      - ss7/cu_compact_channel_development.py
-      - .github/workflows/ss7-persistence-calibration-fast.yml
+  # Model training is now frozen; calibration experiments use eval-only workflow.
   workflow_dispatch:
 permissions:
   contents: read
