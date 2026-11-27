@@ -33,14 +33,15 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: 46035508077
-          pattern: world-compact-21[123]*
+          pattern: world-compact-210*
           path: results/worlds
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: 46035508077
-          name: regularized-compact-models
-          path: results/trained
+          pattern: world-compact-21[123]*
+          path: results/worlds
+      - run: python -u -m ss7.cu_compact_channel_development train --arm compact --root results/worlds --output results/trained
       - run: python -u -m ss7.cu_compact_channel_development evaluate --arm compact --root results/worlds --models results/trained --output results/eval
       - uses: actions/upload-artifact@v4
         with:
