@@ -1,0 +1,80 @@
+name: SS7 integrated CU five-class pilot
+on:
+  push:
+    branches: [ss7-cu-integrated-pilot]
+    paths: [.github/workflows/ss7-cu-integrated-pilot.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ss7-cu-integrated-pilot-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  worlds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        seed: [16001,16002,16101,16102,16201,16202]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/cu_integrated_pilot.py
+      - run: python -u -m ss7.cu_integrated_pilot selftest
+      - run: python -u -m ss7.cu_integrated_pilot generate --seed ${{ matrix.seed }} --output results/world
+      - uses: actions/upload-artifact@v4
+        with:
+          name: world-${{ matrix.seed }}
+          path: results/world
+          retention-days: 30
+  train:
+    needs: worlds
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: world-160*
+          path: results/worlds
+      - run: python -u -m ss7.cu_integrated_pilot train --root results/worlds --output results/trained
+      - uses: actions/upload-artifact@v4
+        with:
+          name: integrated-cu-models
+          path: results/trained
+  evaluate:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: world-16[12]*
+          path: results/worlds
+      - uses: actions/download-artifact@v4
+        with:
+          name: integrated-cu-models
+          path: results/trained
+      - run: python -u -m ss7.cu_integrated_pilot evaluate --root results/worlds --models results/trained --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: integrated-cu-pilot-summary
+          path: results/summary
