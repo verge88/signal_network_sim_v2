@@ -1,4 +1,5 @@
 name: SS7 role-specific naive train and CAL
+# trigger: role-naive-cal-v1
 on:
   push:
     branches: [ss7-role-action-compromise-development]
