@@ -4,6 +4,7 @@ on:
     branches: [ss7-anti-overfit-robust-dev]
     paths:
       - .github/workflows/ss7-final-policy-calibration-smoke.yml
+      - ss7/cu_compact_channel_development.py
   workflow_dispatch:
 permissions:
   contents: read
