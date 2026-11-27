@@ -948,6 +948,8 @@ def calibrate_hybrid_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
         channel_thresholds=thresholds,diagnostics=diagnostics)
 
 COMP_SOPH_CHANNELS=("comp_naive","comp_statistical","comp_adaptive")
+SOPH_BUDGET_WEIGHTS={"sms_interception":1.0,"location_tracking":1.0,"signalling_dos":1.0,"irsf":1.0,
+    "comp_naive":3.0,"comp_statistical":2.0,"comp_adaptive":1.0}
 NAIVE_CUSUM_K=24
 NAIVE_CUSUM_Q=.50
 
@@ -1068,8 +1070,8 @@ def soph_selfnorm_channels(d,p,thresholds,self_rule):
     out["comp_naive_selfnorm"]=naive_selfnorm_margin(d,self_rule)
     return out
 
-def calibrate_soph_selfnorm(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
-    base=calibrate_soph_hybrid(frames,preds,raw,notice)
+def calibrate_soph_selfnorm(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET,weights=None):
+    base=calibrate_soph_hybrid(frames,preds,raw,notice,weights=weights)
     thresholds=base["channel_thresholds"]
     self_rule=fit_naive_selfnorm(frames,raw)
     prepared=[];cuts=[]
@@ -1263,21 +1265,24 @@ def soph_hybrid_channels(d,p,thresholds):
         out[k]=_logit(p[k+"_aug"])-_logit(_threshold_vector(d,thresholds[k]))
     return out
 
-def calibrate_soph_hybrid(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
+def calibrate_soph_hybrid(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET,weights=None):
     """General fallback + attack experts + three compromise-evasion experts."""
     thresholds={}
     thresholds["fallback"]=float(max(
         threshold(p["local_aug"][d.label.to_numpy()==0],raw,elapsed(d))
         for d,p in zip(frames,preds)))
-    n_special=len(OTHER)+len(COMP_SOPH_CHANNELS)
-    share=float(raw/n_special)
+    keys=tuple(OTHER)+tuple(COMP_SOPH_CHANNELS)
+    if weights is None:weights={k:1.0 for k in keys}
+    total_w=sum(float(weights.get(k,1.0)) for k in keys)
+    shares={k:raw*float(weights.get(k,1.0))/max(total_w,1e-12) for k in keys}
     for k in OTHER:
+        share=shares[k]
         thresholds[k]=float(max(
             threshold(p[k+"_aug"][d.label.to_numpy()==0],share,elapsed(d))
             for d,p in zip(frames,preds)))
     # Role-normalize each compromise expert; node role is observable at runtime.
     for k in COMP_SOPH_CHANNELS:
-        by_role={}
+        share=shares[k];by_role={}
         for role in sorted(set(np.concatenate([d.ntype.astype(str).unique() for d in frames]))):
             vals=[]
             for d,p in zip(frames,preds):
@@ -1306,7 +1311,8 @@ def calibrate_soph_hybrid(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
             chosen=length;break
     if chosen is None:chosen=12
     return dict(kind="soph_hybrid",threshold=margin_cut,streak=int(chosen),
-        channel_thresholds=thresholds,diagnostics=diagnostics)
+        channel_thresholds=thresholds,budget_weights={k:float(weights.get(k,1.0)) for k in keys},
+        budget_shares=shares,diagnostics=diagnostics)
 
 def soph_cusum_channels(d,p,thresholds,cusum_rule,negative_only=False):
     out=soph_hybrid_channels(d,p,thresholds)
@@ -1376,8 +1382,10 @@ def evaluate(root,modelpath,out,arm):
             policies["hybrid_augmented"]=calibrate_hybrid_raw(cal,ps)
             if all((k+"_aug") in ps[0] for k in COMP_SOPH_CHANNELS):
                 policies["hybrid_soph_augmented"]=calibrate_soph_hybrid(cal,ps)
+                policies["hybrid_soph_weighted"]=calibrate_soph_hybrid(cal,ps,weights=SOPH_BUDGET_WEIGHTS)
                 policies["hybrid_soph_cusum"]=calibrate_soph_cusum(cal,ps)
                 policies["hybrid_soph_selfnorm"]=calibrate_soph_selfnorm(cal,ps)
+                policies["hybrid_soph_selfnorm_weighted"]=calibrate_soph_selfnorm(cal,ps,weights=SOPH_BUDGET_WEIGHTS)
                 policies["hybrid_soph_profile"]=calibrate_soph_profile(cal,ps)
                 policies["hybrid_soph_routing"]=calibrate_soph_routing(cal,ps)
     policies["integrated_half"]=cut_policy(cal,ps,ref,"integrated_raw",RAW_BUDGET*.5,INCIDENT_BUDGET*.5)
