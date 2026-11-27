@@ -28,8 +28,11 @@ def rolling_mean(d, x, win):
 
 def candidates(d):
     out={}
-    raw=["local_"+c for c in F.OWN if "local_"+c in d.columns]
-    raw += [c for c in d.columns if c.startswith("local_obs_ratio_")]
+    # Final-detector candidates must be coordinator-observable: values from
+    # the latest successfully delivered KIE/CU report. The local_* namespace is
+    # a transport-bypass ablation and is intentionally excluded here.
+    raw=[c for c in F.OWN if c in d.columns]
+    raw += [c for c in d.columns if c.startswith("obs_ratio_")]
     for c in raw:
         x=d[c].to_numpy(float)
         z=_causal_robust_z(d,x)
@@ -81,8 +84,8 @@ def evaluate(seed, d):
                 positive=int(yy.sum()),negative=int((yy==0).sum())))
     # Effect sizes for the most interpretable raw observables.
     effects=[]
-    for c in ["local_total_messages","local_map_share","local_isup_share","local_mtype_entropy",
-              "local_dest_entropy","local_n_unique_dest","local_dest_top1_ratio","local_in_out_ratio"]:
+    for c in ["total_messages","map_share","isup_share","mtype_entropy",
+              "dest_entropy","n_unique_dest","dest_top1_ratio","in_out_ratio"]:
         if c not in d:continue
         x=d[c].to_numpy(float)
         for role in sorted(d.ntype.astype(str).unique()):
@@ -96,8 +99,8 @@ def evaluate(seed, d):
     # Rate-stratified naive summaries for a small fixed score family.
     rates=[]
     fixed={k:v for k,v in C.items() if k in (
-        "posz:local_total_messages","absz:local_total_messages",
-        "mean30:posz:local_total_messages","profile_js","mean30:profile_js","selfnorm_legacy")}
+        "posz:total_messages","absz:total_messages",
+        "mean30:posz:total_messages","profile_js","mean30:profile_js")}
     for rate in sorted(d.loc[naive,"rate"].unique()) if "rate" in d.columns else []:
         pass
     return pd.DataFrame(rows),pd.DataFrame(effects)
