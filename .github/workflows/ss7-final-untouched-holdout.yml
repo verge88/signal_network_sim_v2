@@ -1,6 +1,10 @@
 name: SS7 final untouched holdout
 on:
   workflow_dispatch:
+  push:
+    branches: [ss7-anti-overfit-robust-dev]
+    paths:
+      - ss7/.final-holdout-trigger
 permissions:
   contents: read
 concurrency:
