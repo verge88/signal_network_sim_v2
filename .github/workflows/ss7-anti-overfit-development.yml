@@ -1,10 +1,7 @@
 name: SS7 anti-overfit compact validation
 on:
-  push:
-    branches: [ss7-anti-overfit-development]
-    paths:
-      - ss7/cu_compact_channel_development.py
-      - .github/workflows/ss7-anti-overfit-development.yml
+  # Full regeneration is confirmatory and intentionally manual during development.
+  # Fast frozen-world checks run automatically on code changes.
   workflow_dispatch:
 permissions:
   contents: read
