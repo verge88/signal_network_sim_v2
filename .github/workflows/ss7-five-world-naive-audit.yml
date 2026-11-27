@@ -1,0 +1,74 @@
+name: SS7 five-world naive development audit
+on:
+  push:
+    branches: [ss7-anti-overfit-development]
+    paths:
+      - ss7/naive_observability_diagnostic.py
+      - .github/workflows/ss7-five-world-naive-audit.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-five-world-naive-audit-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  train_worlds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        seed: [21001,21002,21003]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/cu_compact_channel_development.py ss7/naive_observability_diagnostic.py
+      - run: python -u -m ss7.cu_compact_channel_development generate --arm compact --seed ${{ matrix.seed }} --output results/world
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dev-world-compact-${{ matrix.seed }}
+          path: results/world
+          retention-days: 7
+
+  audit:
+    needs: train_worlds
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dev-world-compact-*
+          path: results/incoming-train
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46067578844
+          pattern: joint-kie-world-compact-*
+          path: results/incoming-rank
+      - run: |
+          mkdir -p results/worlds
+          mv results/incoming-train/dev-world-compact-21001 results/worlds/world-compact-21001
+          mv results/incoming-train/dev-world-compact-21002 results/worlds/world-compact-21002
+          mv results/incoming-train/dev-world-compact-21003 results/worlds/world-compact-21003
+          mv results/incoming-rank/joint-kie-world-compact-21101 results/worlds/world-compact-21101
+          mv results/incoming-rank/joint-kie-world-compact-21102 results/worlds/world-compact-21102
+      - run: python -u -m ss7.naive_observability_diagnostic --root results/worlds --output results/audit --seeds 21001 21002 21003 21101 21102
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-five-world-naive-audit
+          path: results/audit
+          retention-days: 7
