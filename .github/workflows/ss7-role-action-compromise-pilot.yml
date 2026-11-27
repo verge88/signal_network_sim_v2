@@ -1,4 +1,5 @@
 name: SS7 role-action compromise pilot
+# trigger: role-action-v1
 on:
   push:
     branches: [ss7-role-action-compromise-development]
