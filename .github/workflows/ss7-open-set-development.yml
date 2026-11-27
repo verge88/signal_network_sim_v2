@@ -1,0 +1,177 @@
+name: SS7 open set unknown attack detection
+on:
+  push:
+    branches: [ss7-open-set-development]
+    paths: [.github/workflows/ss7-open-set-development.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-open-set-development-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  normal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - name: Smoke test VAE, benign-only features and withheld scenario exclusion
+        run: |
+          python - <<'PY'
+          import numpy as np
+          import ss7.open_set_development as O
+          import pandas as pd
+          F=O.F
+          assert len(set(O.NORMAL_TRAIN+O.TRAIN+O.VAL+O.TEST))==18
+          assert not set(O.NORMAL_TRAIN+O.TRAIN+O.VAL+O.TEST)&{s+j for s in O.VAL+O.TEST for j in (10000,20000,40000)}
+          assert all(set(O.known(f)).isdisjoint(O.novel(f)) for f in O.FOLDS)
+          x=np.random.default_rng(42).normal(size=(512,20)).astype(np.float32)
+          P=O.vae_fit(x,42);s=O.vae_score(x,P)
+          assert s.shape==(512,) and np.isfinite(s).all()
+          assert np.mean(O.vae_score(x+5,P))>np.mean(s)
+          cfg=F.SimConfig(seed=18000,days=3.)
+          sim=O.I.IntegratedSim(cfg,F.RngBook(18000))
+          for n in sim.topo.slaves:
+              if sim.topo.nodes[n].ntype.value=="SCP":
+                  for k in O.NOVEL: assert O.paths(sim,k,n)
+          O.I.DAYS=.03
+          d,sim,eps,tr=O.generate(18000,"new_profiles","normal",False)
+          assert not d.label.any() and all(e.kind!="ext_attack" for e in eps)
+          assert not set(O.S.cols(d,True))&{"label","attack","episode_id","hidden_msgs","audit_visible","nid","t"}
+          print("VAE finite scores, novelty path support, normal-only simulation and feature exclusion passed")
+          PY
+      - run: python -u -m ss7.open_set_development normal --output results/normal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-open-set-normal
+          path: results/normal
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        fold: [compromise, sms_intercept, location_track, signaling_dos, irsf, new_profiles]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -u -m ss7.open_set_development train --fold ${{ matrix.fold }} --output results/known
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-open-set-known-${{ matrix.fold }}
+          path: results/known
+  validate:
+    needs: [normal, train]
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        fold: [compromise, sms_intercept, location_track, signaling_dos, irsf, new_profiles]
+        seed: [18201,18202]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-open-set-normal
+          path: results/normal
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-open-set-known-${{ matrix.fold }}
+          path: results/known
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed
+          python -u -m ss7.open_set_development validate --fold ${{ matrix.fold }} --seed ${{ matrix.seed }} --normal results/normal/normal.joblib --models results/known/known.joblib --output results/seed 2>&1 | tee results/seed/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: open-validate-${{ matrix.fold }}-${{ matrix.seed }}
+          path: results/seed
+  aggregate-validate:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: open-validate-*
+          path: results/collected
+      - run: python -u -m ss7.open_set_development aggregate --phase validate --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-open-set-validate-summary
+          path: results/summary
+  test:
+    needs: aggregate-validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        fold: [compromise, sms_intercept, location_track, signaling_dos, irsf, new_profiles]
+        seed: [18301,18302,18303,18304,18305,18306,18307,18308]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-open-set-normal
+          path: results/normal
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-open-set-known-${{ matrix.fold }}
+          path: results/known
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed
+          python -u -m ss7.open_set_development test --fold ${{ matrix.fold }} --seed ${{ matrix.seed }} --normal results/normal/normal.joblib --models results/known/known.joblib --output results/seed 2>&1 | tee results/seed/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: open-test-${{ matrix.fold }}-${{ matrix.seed }}
+          path: results/seed
+  aggregate-test:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: open-test-*
+          path: results/collected
+      - run: python -u -m ss7.open_set_development aggregate --phase test --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-open-set-test-summary
+          path: results/summary
