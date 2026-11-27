@@ -1,5 +1,5 @@
 name: SS7 eval-only frozen-model check
-# trigger: routing-drift-v1
+# trigger: service-independent-load-shift-v1
 on:
   push:
     branches: [ss7-anti-overfit-development]
@@ -31,13 +31,13 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: 46035508077
+          run-id: 46063674571
           pattern: world-compact-21[123]*
           path: results/worlds
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: 46063752470
+          run-id: 46064895855
           name: anti-overfit-trained-models
           path: results/trained
       - run: python -u -m ss7.cu_compact_channel_development evaluate --arm compact --root results/worlds --models results/trained --output results/eval
