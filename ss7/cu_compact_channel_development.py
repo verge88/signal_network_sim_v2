@@ -599,7 +599,7 @@ def train(root,out,arm):
     # in local/base temporal and zone behaviour. STATISTICAL/ADAPTIVE actively
     # falsify reports, so cross-node invariants are the appropriate evidence.
     soph_spec={
-        "comp_naive_aug":("naive","naive_drift","hgb"),
+        "comp_naive_aug":("naive","base","hgb"),
         "comp_statistical_aug":("statistical","invariant","hgb"),
         "comp_adaptive_aug":("adaptive","invariant","hgb"),
     }
@@ -1041,6 +1041,92 @@ def calibrate_soph_selfnorm(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
     return dict(kind="soph_selfnorm",threshold=margin_cut,streak=int(chosen),
         channel_thresholds=thresholds,naive_selfnorm=self_rule,diagnostics=diagnostics)
 
+def _profile_js_rows(d, recent=5, baseline=60, gap=5):
+    """Causal Jensen-Shannon divergence of recent traffic mix from own history."""
+    map_cols=[c for c in ("local_obs_ratio_"+m for m in MAP) if c in d.columns]
+    out=np.zeros(len(d),float)
+    for _,g in d.groupby("nid",sort=False):
+        ix=g.index.to_numpy()
+        map_share=np.nan_to_num(g["local_map_share"].to_numpy(float),nan=0.0)
+        isup=np.nan_to_num(g["local_isup_share"].to_numpy(float),nan=0.0)
+        parts=[]
+        for c in map_cols:
+            parts.append(map_share*np.nan_to_num(g[c].to_numpy(float),nan=0.0))
+        parts.append(isup)
+        used=isup.copy()
+        if parts[:-1]:
+            used+=np.sum(np.column_stack(parts[:-1]),axis=1)
+        parts.append(np.clip(1.0-used,0.0,1.0))
+        X=np.column_stack(parts)
+        X=np.maximum(X,0.0)
+        X/=np.maximum(X.sum(axis=1,keepdims=True),1e-12)
+
+        frame=pd.DataFrame(X,index=ix)
+        r=frame.rolling(recent,min_periods=max(2,recent//2)).mean()
+        b=frame.shift(gap).rolling(baseline,min_periods=max(10,baseline//4)).mean()
+        P=r.to_numpy(float);Q=b.to_numpy(float)
+        P/=np.maximum(np.nansum(P,axis=1,keepdims=True),1e-12)
+        Q/=np.maximum(np.nansum(Q,axis=1,keepdims=True),1e-12)
+        M=.5*(P+Q)
+        eps=1e-12
+        kl1=np.nansum(np.where(P>0,P*np.log((P+eps)/(M+eps)),0.0),axis=1)
+        kl2=np.nansum(np.where(Q>0,Q*np.log((Q+eps)/(M+eps)),0.0),axis=1)
+        z=.5*(kl1+kl2)
+        z[~np.isfinite(P).all(axis=1)|~np.isfinite(Q).all(axis=1)]=0.0
+        out[ix]=z
+    return out
+
+def fit_naive_profile(frames,raw=RAW_BUDGET):
+    roles=sorted(set(np.concatenate([d.ntype.astype(str).unique() for d in frames])))
+    cuts={}
+    share=float(raw/8.0)
+    for role in roles:
+        vals=[]
+        for d in frames:
+            score=_profile_js_rows(d)
+            mask=(d.label.to_numpy()==0)&(d.ntype.astype(str).to_numpy()==role)
+            if mask.any():vals.append(threshold(score[mask],share,elapsed(d)))
+        if vals:cuts[role]=float(max(vals))
+    return dict(thresholds=cuts,raw_share=share,recent=5,baseline=60,gap=5)
+
+def naive_profile_margin(d,rule):
+    score=_profile_js_rows(d,rule["recent"],rule["baseline"],rule["gap"])
+    cut=_threshold_vector(d,rule["thresholds"])
+    scale=np.maximum(cut,.005)
+    return (score-cut)/scale
+
+def soph_profile_channels(d,p,thresholds,profile_rule):
+    out=soph_hybrid_channels(d,p,thresholds)
+    out["comp_naive_profile"]=naive_profile_margin(d,profile_rule)
+    return out
+
+def calibrate_soph_profile(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
+    base=calibrate_soph_hybrid(frames,preds,raw,notice)
+    thresholds=base["channel_thresholds"]
+    profile_rule=fit_naive_profile(frames,raw)
+    prepared=[];cuts=[]
+    for d,p in zip(frames,preds):
+        ch=soph_profile_channels(d,p,thresholds,profile_rule)
+        score,_=combined(d,ch,True,negative_only=True,streak_len=3)
+        cuts.append(threshold(score[np.isfinite(score)],raw,elapsed(d)))
+        prepared.append((d,p))
+    margin_cut=float(max(cuts))
+    diagnostics=[];chosen=None
+    for length in (3,5,7,9,12):
+        nr=[];wr=[]
+        for d,p in prepared:
+            ch=soph_profile_channels(d,p,thresholds,profile_rule)
+            score,z=combined(d,ch,True,negative_only=True,streak_len=length)
+            wr.append(float((score>margin_cut).sum()/elapsed(d)))
+            nr.append(float(len(notify(d,z,margin_cut))/elapsed(d)))
+        diagnostics.append(dict(streak=length,worst_notifications_day=max(nr),
+            worst_windows_day=max(wr),rates=nr))
+        if max(nr)<=notice:
+            chosen=length;break
+    if chosen is None:chosen=12
+    return dict(kind="soph_profile",threshold=margin_cut,streak=int(chosen),
+        channel_thresholds=thresholds,naive_profile=profile_rule,diagnostics=diagnostics)
+
 def soph_hybrid_channels(d,p,thresholds):
     out={"fallback":_logit(p["local_aug"])-_logit(_threshold_vector(d,thresholds["fallback"]))}
     for k in OTHER:
@@ -1138,6 +1224,8 @@ def policy_channels(d,p,ref,name,policy):
         return soph_cusum_channels(d,p,policy["channel_thresholds"],policy["naive_cusum"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_selfnorm":
         return soph_selfnorm_channels(d,p,policy["channel_thresholds"],policy["naive_selfnorm"]),True,float(policy["threshold"])
+    if policy.get("kind")=="soph_profile":
+        return soph_profile_channels(d,p,policy["channel_thresholds"],policy["naive_profile"]),True,float(policy["threshold"])
     n="integrated_raw" if name=="integrated_half" else name
     ch,confirm=channels(d,p,ref,n)
     return ch,confirm,float(policy["threshold"])
@@ -1160,6 +1248,7 @@ def evaluate(root,modelpath,out,arm):
                 policies["hybrid_soph_augmented"]=calibrate_soph_hybrid(cal,ps)
                 policies["hybrid_soph_cusum"]=calibrate_soph_cusum(cal,ps)
                 policies["hybrid_soph_selfnorm"]=calibrate_soph_selfnorm(cal,ps)
+                policies["hybrid_soph_profile"]=calibrate_soph_profile(cal,ps)
     policies["integrated_half"]=cut_policy(cal,ps,ref,"integrated_raw",RAW_BUDGET*.5,INCIDENT_BUDGET*.5)
 
     controls=[]
