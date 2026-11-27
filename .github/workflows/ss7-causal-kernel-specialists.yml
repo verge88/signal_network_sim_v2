@@ -1,0 +1,96 @@
+name: SS7 causal convolutional specialists for five-class CU detection
+on:
+  push:
+    branches: [ss7-causal-kernel-specialists]
+    paths: [.github/workflows/ss7-causal-kernel-specialists.yml, ss7/kernel_specialists.py]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-causal-kernel-specialists-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - name: Check history boundaries and prefix invariance
+        run: |
+          python - <<'PY'
+          from ss7.kernel_specialists import *
+          d = pd.DataFrame(dict(nid=[1]*70+[2]*30,t=[*range(40),*range(45,75),*range(30)]))
+          x = np.random.default_rng(1).normal(size=(100,len(CHANNELS))).astype("float32")
+          bank = kernels()
+          z = temporal(d,x,bank)
+          assert np.isfinite(z).all() and np.any(z!=0)
+          assert not z[[0,40,70]].any()
+          for end in (39,52,88):
+              np.testing.assert_allclose(temporal(d.iloc[:end],x[:end],bank),z[:end],atol=1e-6)
+          PY
+      - run: python -u -m ss7.kernel_specialists train --output results/trained
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-causal-kernel-specialists-trained
+          path: results/trained
+  test:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        seed: [21101,21102,21103,21104,21105,21106,21107,21108]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-five-specialist-trained
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45956489605
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-causal-kernel-specialists-trained
+          path: results/trained
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed
+          python -u -m ss7.kernel_specialists test --seed ${{ matrix.seed }} --frozen results/frozen/models.joblib --models results/trained/aux.joblib --output results/seed 2>&1 | tee results/seed/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel-test-seed-${{ matrix.seed }}
+          path: results/seed
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kernel-test-seed-*
+          path: results/collected
+      - run: python -u -m ss7.kernel_specialists aggregate --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-causal-kernel-specialists-summary
+          path: results/summary
