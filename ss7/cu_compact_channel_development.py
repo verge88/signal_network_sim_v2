@@ -47,7 +47,8 @@ CU=("cu_delivered","cu_rtt_delay","cu_req_delay","cu_resp_delay","cu_combined_lo
     "cu_staleness","cu_consistency_error")
 MAP=tuple(m for m in F.MSG_TYPES if F.MT_IDX[m]>=5)
 SUB=tuple("obs_ratio_"+m for m in MAP)
-TEMP=("cv_total","cv_entropy","cv_io","cv_dominance","ar1_total","integrity_fail_rate","cv_dest")\nDRIFT_SOURCE=("total_messages","map_share","isup_share","n_unique_dest","dest_entropy","dest_top1_ratio","in_out_ratio","dlg_closure_ratio","transit_share")+SUB
+TEMP=("cv_total","cv_entropy","cv_io","cv_dominance","ar1_total","integrity_fail_rate","cv_dest")
+DRIFT_SOURCE=("total_messages","map_share","isup_share","n_unique_dest","dest_entropy","dest_top1_ratio","in_out_ratio","dlg_closure_ratio","transit_share")+SUB
 ZONE_BASE=("total_messages","map_share","isup_share","in_out_ratio","integrity_fail_rate","cv_total","cu_delivered")
 ZONE=tuple("zone_dev_"+c for c in ZONE_BASE)+("zone_io_ratio_rank",)
 BASE=list(CU)+list(F.OWN)+list(SUB)+list(TEMP)+list(ZONE)+["node_type_enc"]
