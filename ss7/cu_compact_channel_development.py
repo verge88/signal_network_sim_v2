@@ -533,14 +533,14 @@ def fit(d,mode,target,kind):
     return names,model
 OTHER=KINDS[:-1]
 COMMON_MODELS=("local","article_raw","integrated_raw","dual_tail","dual_tail_confirm","five_tail","five_role_tail")
-MODELS=COMMON_MODELS+("five_calibrated",)
+MODELS=COMMON_MODELS+("five_calibrated","five_augmented")
 FIVE_CHANNELS=OTHER+("invariant",)
 def load(root,arm,seed):
     return joblib.load(root/f"world-{arm}-{seed}"/"world.joblib")
 
-def train(root,out,arm):
+def _training_frame(root,arm,seeds):
     data=[]
-    for seed in TRAIN:
+    for seed in seeds:
         d,e,cu=load(root,arm,seed)
         d["uid"]=str(seed)+":"+d.episode_id.astype(str)
         d["world_node"]=str(seed)+":"+d.nid.astype(str)
@@ -550,7 +550,10 @@ def train(root,out,arm):
         neg=np.flatnonzero((d.label.to_numpy()==0)&thin)
         neg=np.random.default_rng(seed).choice(neg,min(TRAIN_NORMAL_PER_WORLD,len(neg)),replace=False)
         ix=np.sort(np.r_[pos,neg]);data.append(d.iloc[ix])
-    d=pd.concat(data,ignore_index=True)
+    return pd.concat(data,ignore_index=True)
+
+def train(root,out,arm):
+    d=_training_frame(root,arm,TRAIN)
     spec={"local":("local","all","rf"),"general":("base","all","rf"),
           "article_rf":("special","comp","rf"),"article_gb":("special","comp","gb"),
           "invariant":("invariant","comp","hgb"),"behavior":("behavior","comp","hgb")}
@@ -559,7 +562,15 @@ def train(root,out,arm):
     for n,sp in spec.items():
         models[n]=fit(d,*sp);print("FIT",arm,n,flush=True)
 
-    # Train-vs-independent-CAL diagnostics. TEST is never loaded here.
+    # New anti-overfit specialists see five independent development worlds.
+    # RANK remains untouched by the original comparators; only *_aug models
+    # consume it, so the baseline/tail models are still directly comparable.
+    aug=_training_frame(root,arm,TRAIN+RANK)
+    aug_spec={k+"_aug":("base",k,"hgb") for k in OTHER}
+    aug_spec["invariant_aug"]=("invariant","comp","hgb")
+    for n,sp in aug_spec.items():
+        models[n]=fit(aug,*sp);print("FIT",arm,n,flush=True)
+
     cal=[]
     for seed in CAL:
         q,_,_=load(root,arm,seed)
@@ -568,9 +579,11 @@ def train(root,out,arm):
         cal.append(q)
     cal=pd.concat(cal,ignore_index=True)
     diag=[]
-    for name,(mode,target,kind) in spec.items():
+    all_spec=dict(spec);all_spec.update(aug_spec)
+    for name,(mode,target,kind) in all_spec.items():
         names,model=models[name]
-        for split,frame in (("train",d),("cal",cal)):
+        train_frame=aug if name.endswith("_aug") else d
+        for split,frame in (("train",train_frame),("cal",cal)):
             y=target_y(frame,target);score=model.predict_proba(matrix(frame,names))[:,1]
             diag.append(dict(model=name,split=split,n=len(frame),positive=int(y.sum()),
                 auc_roc=roc_auc_score(y,score) if len(np.unique(y))==2 else np.nan,
@@ -584,12 +597,13 @@ def train(root,out,arm):
     dg.to_csv(out/"generalization.csv",index=False)
     joblib.dump(models,out/"models.joblib")
     (out/"features.json").write_text(json.dumps({n:v[0] for n,v in models.items()},indent=2))
-    (out/"anti_overfit.json").write_text(json.dumps(dict(train_stride=TRAIN_STRIDE,
-        normal_per_world=TRAIN_NORMAL_PER_WORLD,
+    (out/"anti_overfit.json").write_text(json.dumps(dict(train=TRAIN,augmented_train=TRAIN+RANK,
+        train_stride=TRAIN_STRIDE,normal_per_world=TRAIN_NORMAL_PER_WORLD,
         rf=dict(max_depth=10,min_samples_leaf=20,max_features="sqrt",max_samples=.70),
         gb=dict(max_depth=1,min_samples_leaf=30,learning_rate=.04,subsample=.65),
         hgb=dict(max_leaf_nodes=7,min_samples_leaf=50,learning_rate=.05,l2_regularization=2.0)),indent=2))
     print("TRAIN",arm,len(d),d.attack.value_counts().to_dict(),flush=True)
+    print("TRAIN_AUG",arm,len(aug),aug.attack.value_counts().to_dict(),flush=True)
 def predict(d,models):
     s={n:m.predict_proba(matrix(d,c))[:,1] for n,(c,m) in models.items()}
     for n,v in s.items():assert np.isfinite(v).all(),n
@@ -714,13 +728,16 @@ def _logit(x):
     x=np.clip(np.asarray(x,float),1e-8,1-1e-8)
     return np.log(x)-np.log1p(-x)
 
-def five_raw_channels(p,thresholds):
+def five_raw_channels(p,thresholds,suffix=""):
     # Four attack-specific experts plus the invariant compromise expert.
-    # Each channel is converted to a log-odds margin around its own frozen
-    # calibration threshold, so margin > 0 has the same decision meaning.
-    return {k:_logit(p[k])-_logit(thresholds[k]) for k in FIVE_CHANNELS}
+    # Logical channel names stay unchanged; suffix selects the frozen model set.
+    out={}
+    for k in FIVE_CHANNELS:
+        src=k+suffix if suffix else k
+        out[k]=_logit(p[src])-_logit(thresholds[k])
+    return out
 
-def calibrate_five_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
+def calibrate_five_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET,suffix=""):
     """Per-class calibration with a shared margin cut using the full FPR budget.
 
     First obtain conservative class-specific anchors. Then calibrate one common
@@ -731,14 +748,14 @@ def calibrate_five_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
     share=float(raw/len(FIVE_CHANNELS));thresholds={}
     for k in FIVE_CHANNELS:
         thresholds[k]=float(max(
-            threshold(p[k][d.label.to_numpy()==0],share,elapsed(d))
+            threshold(p[k+suffix if suffix else k][d.label.to_numpy()==0],share,elapsed(d))
             for d,p in zip(frames,preds)
         ))
 
     prepared=[]
     raw_cuts=[]
     for d,p in zip(frames,preds):
-        ch=five_raw_channels(p,thresholds)
+        ch=five_raw_channels(p,thresholds,suffix)
         s,_=combined(d,ch,True,negative_only=True,streak_len=3)
         raw_cuts.append(threshold(s[np.isfinite(s)],raw,elapsed(d)))
         prepared.append((d,ch))
@@ -756,12 +773,12 @@ def calibrate_five_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
         if max(rates)<=notice:
             chosen=length;break
     if chosen is None:chosen=12
-    return dict(kind="five_raw",threshold=margin_cut,streak=int(chosen),
+    return dict(kind="five_raw",threshold=margin_cut,streak=int(chosen),model_suffix=suffix,
         raw_budget_share=share,channel_thresholds=thresholds,diagnostics=diagnostics)
 
 def policy_channels(d,p,ref,name,policy):
     if policy.get("kind")=="five_raw":
-        return five_raw_channels(p,policy["channel_thresholds"]),True,float(policy["threshold"])
+        return five_raw_channels(p,policy["channel_thresholds"],policy.get("model_suffix","")),True,float(policy["threshold"])
     n="integrated_raw" if name=="integrated_half" else name
     ch,confirm=channels(d,p,ref,n)
     return ch,confirm,float(policy["threshold"])
@@ -776,6 +793,8 @@ def evaluate(root,modelpath,out,arm):
     cal=[load(root,arm,s)[0] for s in CAL];ps=[predict(d,models) for d in cal]
     policies={n:cut_policy(cal,ps,ref,n) for n in COMMON_MODELS}
     policies["five_calibrated"]=calibrate_five_raw(cal,ps)
+    if all((k+"_aug") in ps[0] for k in FIVE_CHANNELS):
+        policies["five_augmented"]=calibrate_five_raw(cal,ps,suffix="_aug")
     policies["integrated_half"]=cut_policy(cal,ps,ref,"integrated_raw",RAW_BUDGET*.5,INCIDENT_BUDGET*.5)
 
     controls=[]
