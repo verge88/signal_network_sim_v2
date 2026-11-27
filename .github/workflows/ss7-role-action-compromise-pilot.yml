@@ -1,0 +1,93 @@
+name: SS7 role-action compromise pilot
+on:
+  push:
+    branches: [ss7-role-action-compromise-development]
+    paths:
+      - .github/workflows/ss7-role-action-compromise-pilot.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ss7-role-action-compromise-pilot-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  worlds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      max-parallel: 9
+      matrix:
+        seed: [21001,21002,21003,21101,21102,21201,21202,21301,21302]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/cu_compact_channel_development.py
+      - run: python -u -m ss7.cu_compact_channel_development selftest
+      - run: python -u -m ss7.cu_compact_channel_development generate --arm compact --days 0.5 --seed ${{ matrix.seed }} --output results/world
+      - uses: actions/upload-artifact@v4
+        with:
+          name: role-world-${{ matrix.seed }}
+          path: results/world
+          retention-days: 7
+
+  train:
+    needs: worlds
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: role-world-21[012]*
+          path: results/worlds
+      - run: |
+          for d in results/worlds/role-world-*; do
+            b=$(basename "$d"); s=${b#role-world-}; mv "$d" "results/worlds/world-compact-$s"
+          done
+      - run: python -u -m ss7.cu_compact_channel_development train --arm compact --root results/worlds --output results/trained
+      - uses: actions/upload-artifact@v4
+        with:
+          name: role-action-models
+          path: results/trained
+          retention-days: 7
+
+  evaluate:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: role-world-21[123]*
+          path: results/worlds
+      - run: |
+          for d in results/worlds/role-world-*; do
+            b=$(basename "$d"); s=${b#role-world-}; mv "$d" "results/worlds/world-compact-$s"
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          name: role-action-models
+          path: results/trained
+      - run: python -u -m ss7.cu_compact_channel_development evaluate --arm compact --root results/worlds --models results/trained --output results/eval
+      - uses: actions/upload-artifact@v4
+        with:
+          name: role-action-eval
+          path: results/eval
+          retention-days: 7
