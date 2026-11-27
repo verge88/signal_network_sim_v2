@@ -1,4 +1,5 @@
 name: SS7 persistence calibration fast check
+# role-aware compromise calibration check
 # reuses frozen worlds from run 46035508077
 on:
   push:
