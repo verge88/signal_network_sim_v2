@@ -48,7 +48,8 @@ CU=("cu_delivered","cu_rtt_delay","cu_req_delay","cu_resp_delay","cu_combined_lo
 MAP=tuple(m for m in F.MSG_TYPES if F.MT_IDX[m]>=5)
 SUB=tuple("obs_ratio_"+m for m in MAP)
 TEMP=("cv_total","cv_entropy","cv_io","cv_dominance","ar1_total","integrity_fail_rate","cv_dest")
-DRIFT_SOURCE=("total_messages","map_share","isup_share","n_unique_dest","dest_entropy","dest_top1_ratio","in_out_ratio","dlg_closure_ratio","transit_share")+SUB
+JOINT_KIE=("kie_typed_nmi","kie_typed_max_loglift","kie_matrix_nmi","kie_matrix_max_loglift")
+DRIFT_SOURCE=("total_messages","map_share","isup_share","n_unique_dest","dest_entropy","dest_top1_ratio","in_out_ratio","dlg_closure_ratio","transit_share")+SUB+JOINT_KIE
 ZONE_BASE=("total_messages","map_share","isup_share","in_out_ratio","integrity_fail_rate","cv_total","cu_delivered")
 ZONE=tuple("zone_dev_"+c for c in ZONE_BASE)+("zone_io_ratio_rank",)
 BASE=list(CU)+list(F.OWN)+list(SUB)+list(TEMP)+list(ZONE)+["node_type_enc"]
@@ -69,9 +70,10 @@ def payload_bytes(topo,n,compact):
     relay=topo.nodes[n].ntype in (F.NodeType.STP,F.NodeType.IGW)
     if not compact:return 50+8*(m+2*d+N+8+2*d*m+d*d*m)
     # Fixed-layout envelope. Base state, four-group directional counts,
-    # four-group matrix marginals for relays, two eight-float64 profiles.
-    # uint32 counters checked before forwarding; no omitted matrix cells are read.
-    return 50+4*(m+2*d+N+8+2*d*len(GROUPS)+(2*d*len(GROUPS) if relay else 0))+16*8
+    # four-group matrix marginals for relays, two eight-float64 profiles,
+    # plus four scalar route/service joint invariants (32 B).
+    # No dense link×message matrix is transmitted.
+    return 50+4*(m+2*d+N+8+2*d*len(GROUPS)+(2*d*len(GROUPS) if relay else 0))+(16+len(JOINT_KIE))*8
 
 def group_counts(a):
     out=defaultdict(int)
@@ -84,6 +86,33 @@ def marginals(b):
         out[(0,ki,GROUP[j])]+=int(v);out[(1,ko,GROUP[j])]+=int(v)
     return dict(out)
 
+def joint_association(counts):
+    """Compact association fingerprint for route/message joint counts.
+
+    Returns normalized mutual information and the largest absolute log-lift
+    from the independence model. Both are scale-insensitive scalars and use
+    only locally observed aggregate counters.
+    """
+    cells={}
+    for k,v in counts.items():
+        x=max(float(v),0.0)
+        if x>0:cells[(k[:-1],k[-1])]=cells.get((k[:-1],k[-1]),0.0)+x
+    total=sum(cells.values())
+    if total<=0:return 0.0,0.0
+    rs=defaultdict(float);cs=defaultdict(float)
+    for (r,c),v in cells.items():rs[r]+=v;cs[c]+=v
+    pr={r:v/total for r,v in rs.items()};pc={c:v/total for c,v in cs.items()}
+    hr=-sum(x*math.log(x) for x in pr.values() if x>0)
+    hc=-sum(x*math.log(x) for x in pc.values() if x>0)
+    mi=0.0;lift=0.0
+    for (r,c),v in cells.items():
+        p=v/total;expected=rs[r]*cs[c]/total
+        if p>0 and pr[r]>0 and pc[c]>0:
+            mi+=p*math.log(p/(pr[r]*pc[c]))
+        lift=max(lift,abs(math.log((v+.5)/(expected+.5))))
+    nmi=mi/max(min(hr,hc),1e-12) if hr>0 and hc>0 else 0.0
+    return float(np.clip(nmi,0.0,1.0)),float(lift)
+
 def encode_compact(rep,a,b):
     # The slave computes these summaries locally; only their transmitted
     # representation is used by the coordinator. No claim of cell recovery.
@@ -92,6 +121,9 @@ def encode_compact(rep,a,b):
     for v in list(x.values())+list(y.values())+list(st.mtype)+list(st.dest.values())+list(st.link_in.values())+list(st.link_out.values())+[st.originated,st.terminated,st.transited,st.dlg_begin,st.dlg_end]:
         assert 0<=int(v)<2**32,"compact counter overflow"
     z={"beh_"+kind+"_"+k:v for kind,c in (("typed",a),("matrix",b)) for k,v in zip(D.PROFILE,D.profile(c))}
+    tn,tl=joint_association(a);mn,ml=joint_association(b)
+    z.update(kie_typed_nmi=tn,kie_typed_max_loglift=tl,
+             kie_matrix_nmi=mn,kie_matrix_max_loglift=ml)
     return x,y,z
 
 def compact_telemetry(reps,typed,mat,sensors,topo):
@@ -484,7 +516,7 @@ def generate(seed,days=DAYS,arm="compact"):
             for n in fresh:behavior[n].update(profiles[n])
         for n,vals in obs.items():
             nd=sim.topo.nodes[n];e=active.get(n)
-            row={c:np.nan for c in list(NEW)+list(O.EXTRA)+list(D.BEHAVIOR)}
+            row={c:np.nan for c in list(NEW)+list(O.EXTRA)+list(D.BEHAVIOR)+list(JOINT_KIE)}
             row.update(inv.get(n,{}));row.update(extra.get(n,{}));row.update(behavior.get(n,{}))
             # Independent boundary sensor remains observable even when CU lost.
             if n in sensors and n not in fresh:
