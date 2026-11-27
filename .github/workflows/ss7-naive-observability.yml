@@ -1,0 +1,33 @@
+name: SS7 naive compromise observability audit
+on:
+  push:
+    branches: [ss7-anti-overfit-development]
+    paths:
+      - .github/workflows/ss7-naive-observability.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/naive_observability_diagnostic.py ss7/cu_compact_channel_development.py
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46035508077
+          pattern: world-compact-212*
+          path: results/worlds
+      - run: python -u -m ss7.naive_observability_diagnostic --root results/worlds --output results/audit
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-naive-observability-audit
+          path: results/audit
+          retention-days: 7
