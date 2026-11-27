@@ -1,5 +1,5 @@
 name: SS7 eval-only frozen-model check
-# trigger: service-independent-load-shift-v1
+# trigger: rank-frozen-role-naive-v1
 on:
   push:
     branches: [ss7-anti-overfit-development]
