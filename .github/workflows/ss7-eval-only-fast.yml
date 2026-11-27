@@ -1,5 +1,5 @@
 name: SS7 eval-only frozen-model check
-# trigger: rank-frozen-role-naive-v1
+# trigger: residual-budget-role-naive-v1
 on:
   push:
     branches: [ss7-anti-overfit-development]
