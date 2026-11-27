@@ -1,8 +1,9 @@
 """Development-only observability audit for unmasked (NAIVE) SS7 compromise.
 
-Uses CAL worlds only. Scores are causal functions of observable telemetry and do
-not use labels in their construction. Labels are used only to measure ranking
-quality and effect size. Do not select a final detector on TEST from this file.
+By default uses the dedicated RANK worlds, but an explicit development seed set
+may be supplied by CI. Scores are causal functions of observable telemetry and
+do not use labels in their construction. Labels are used only to measure ranking
+quality/effect size. CAL is reserved for thresholds and TEST remains untouched.
 """
 from __future__ import annotations
 import argparse, json
@@ -107,10 +108,15 @@ def evaluate(seed, d):
     return pd.DataFrame(rows),pd.DataFrame(effects)
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument("--root",type=Path,required=True);p.add_argument("--output",type=Path,required=True)
+    p=argparse.ArgumentParser()
+    p.add_argument("--root",type=Path,required=True)
+    p.add_argument("--output",type=Path,required=True)
+    p.add_argument("--seeds",type=int,nargs="+",default=list(AUDIT_SEEDS))
     a=p.parse_args();a.output.mkdir(parents=True,exist_ok=True)
+    seeds=tuple(a.seeds)
+    if len(set(seeds))!=len(seeds):raise ValueError("duplicate audit seed")
     tabs=[];eff=[]
-    for seed in AUDIT_SEEDS:
+    for seed in seeds:
         d,e,cu=joblib.load(a.root/f"world-compact-{seed}"/"world.joblib")
         r,x=evaluate(seed,d);tabs.append(r);eff.append(x)
     scores=pd.concat(tabs,ignore_index=True)
@@ -121,8 +127,8 @@ def main():
     scores.to_csv(a.output/"scores.csv",index=False)
     summary.to_csv(a.output/"summary.csv",index=False)
     effects.to_csv(a.output/"effects.csv",index=False)
-    (a.output/"protocol.json").write_text(json.dumps(dict(audit_seeds=AUDIT_SEEDS,roll=ROLL,
-        scope="RANK development worlds only; labels select role-specific causal features; CAL reserved for thresholds; TEST untouched"),indent=2))
+    (a.output/"protocol.json").write_text(json.dumps(dict(audit_seeds=seeds,roll=ROLL,
+        scope="explicit development worlds only; labels rank causal features; CAL reserved for thresholds; TEST untouched"),indent=2))
     for role in ("ALL","IGW","SCP","SP","STP"):
         q=summary[summary.role==role].head(15)
         if len(q):print("TOP CAUSAL SCORES",role,"\n",q.to_string(index=False),flush=True)
