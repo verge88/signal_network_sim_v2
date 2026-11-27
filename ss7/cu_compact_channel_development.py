@@ -599,7 +599,7 @@ def train(root,out,arm):
     # in local/base temporal and zone behaviour. STATISTICAL/ADAPTIVE actively
     # falsify reports, so cross-node invariants are the appropriate evidence.
     soph_spec={
-        "comp_naive_aug":("naive","base","hgb"),
+        "comp_naive_aug":("naive","naive_drift","hgb"),
         "comp_statistical_aug":("statistical","invariant","hgb"),
         "comp_adaptive_aug":("adaptive","invariant","hgb"),
     }

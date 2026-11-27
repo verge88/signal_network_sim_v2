@@ -1,6 +1,6 @@
 name: SS7 persistence calibration fast check
 # role-aware compromise calibration check
-# reuses frozen worlds from run 46035508077
+# reuses drift-enabled worlds from run 46063674571
 on:
   # Model training is now frozen; calibration experiments use eval-only workflow.
   workflow_dispatch:
@@ -29,13 +29,13 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: 46035508077
+          run-id: 46063674571
           pattern: world-compact-210*
           path: results/worlds
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: 46035508077
+          run-id: 46063674571
           pattern: world-compact-21[123]*
           path: results/worlds
       - run: python -u -m ss7.cu_compact_channel_development train --arm compact --root results/worlds --output results/trained
