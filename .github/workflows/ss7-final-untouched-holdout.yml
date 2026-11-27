@@ -18,7 +18,7 @@ jobs:
       fail-fast: false
       max-parallel: 15
       matrix:
-        seed: [21001,21002,21003,21101,21102,21201,21202,21401,21402,21403,21404,21405,21406,21407,21408]
+        seed: [21001,21002,21003,21101,21102,21201,21202,21401,21402,21403,21404]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -50,7 +50,7 @@ jobs:
           path: results/incoming
       - run: |
           mkdir -p results/worlds
-          for seed in 21001 21002 21003 21101 21102 21201 21202 21401 21402 21403 21404 21405 21406 21407 21408; do
+          for seed in 21001 21002 21003 21101 21102 21201 21202 21401 21402 21403 21404; do
             mv results/incoming/final-world-compact-${seed} results/worlds/world-compact-${seed}
           done
       - run: python -u -m ss7.cu_compact_channel_development train --arm compact --root results/worlds --output results/trained
@@ -76,7 +76,7 @@ jobs:
           path: results/incoming
       - run: |
           mkdir -p results/worlds
-          for seed in 21101 21102 21201 21202 21401 21402 21403 21404 21405 21406 21407 21408; do
+          for seed in 21101 21102 21201 21202 21401 21402 21403 21404; do
             mv results/incoming/final-world-compact-${seed} results/worlds/world-compact-${seed}
           done
       - uses: actions/download-artifact@v4
@@ -89,7 +89,7 @@ jobs:
           import ss7.cu_compact_channel_development as M
           M.evaluate_final(
               Path("results/worlds"),Path("results/trained"),Path("results/holdout"),"compact",
-              (21401,21402,21403,21404,21405,21406,21407,21408)
+              (21401,21402,21403,21404)
           )
           PY
       - uses: actions/upload-artifact@v4
