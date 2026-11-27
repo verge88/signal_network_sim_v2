@@ -641,15 +641,18 @@ def channels(d,p,ref,mode):
 def streak_score(d,s,length=3):
     """Minimum score across a causal same-node run of *length* windows."""
     if length<1:raise ValueError("length must be positive")
-    n=d.nid.to_numpy();t=d.t.to_numpy()
-    z=np.full(len(d),-np.inf)
-    if length==1:
-        z[:]=s;return z
-    for j in range(length-1,len(d)):
-        a=j-length+1
-        if n[a]!=n[j] or t[j]-t[a]!=length-1:continue
-        if np.all(n[a:j+1]==n[j]) and np.all(np.diff(t[a:j+1])==1):
-            z[j]=float(np.min(s[a:j+1]))
+    s=np.asarray(s,float);n=d.nid.to_numpy();t=d.t.to_numpy();N=len(s)
+    if length==1:return s.copy()
+    # Vectorized causal rolling minimum. A candidate is valid only when every
+    # shifted element belongs to the same node and has the exact time offset.
+    z=s.copy();valid=np.ones(N,dtype=bool);valid[:length-1]=False
+    for k in range(1,length):
+        shifted=np.full(N,np.inf);shifted[k:]=s[:-k]
+        z=np.minimum(z,shifted)
+        ok=np.zeros(N,dtype=bool)
+        ok[k:]=(n[k:]==n[:-k])&(t[k:]==t[:-k]+k)
+        valid&=ok
+    z[~valid]=-np.inf
     return z
 
 def combined(d,ch,confirm,negative_only=False,streak_len=3):
