@@ -568,6 +568,7 @@ def train(root,out,arm):
     aug=_training_frame(root,arm,TRAIN+RANK)
     aug_spec={k+"_aug":("base",k,"hgb") for k in OTHER}
     aug_spec["invariant_aug"]=("invariant","comp","hgb")
+    aug_spec["local_aug"]=("local","all","rf")
     for n,sp in aug_spec.items():
         models[n]=fit(aug,*sp);print("FIT",arm,n,flush=True)
 
@@ -776,9 +777,54 @@ def calibrate_five_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET,suffix
     return dict(kind="five_raw",threshold=margin_cut,streak=int(chosen),model_suffix=suffix,
         raw_budget_share=share,channel_thresholds=thresholds,diagnostics=diagnostics)
 
+def hybrid_raw_channels(p,thresholds):
+    out={"fallback":_logit(p["local_aug"])-_logit(thresholds["fallback"])}
+    for k in FIVE_CHANNELS:
+        out[k]=_logit(p[k+"_aug"])-_logit(thresholds[k])
+    return out
+
+def calibrate_hybrid_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
+    """Fallback local detector plus five augmented experts under one budget."""
+    thresholds={}
+    # Let the fallback use the full budget as an anchor; the subsequent fused
+    # margin calibration enforces the actual union budget across all channels.
+    thresholds["fallback"]=float(max(
+        threshold(p["local_aug"][d.label.to_numpy()==0],raw,elapsed(d))
+        for d,p in zip(frames,preds)))
+    share=float(raw/len(FIVE_CHANNELS))
+    for k in FIVE_CHANNELS:
+        thresholds[k]=float(max(
+            threshold(p[k+"_aug"][d.label.to_numpy()==0],share,elapsed(d))
+            for d,p in zip(frames,preds)))
+
+    prepared=[];cuts=[]
+    for d,p in zip(frames,preds):
+        ch=hybrid_raw_channels(p,thresholds)
+        score,_=combined(d,ch,True,negative_only=True,streak_len=3)
+        cuts.append(threshold(score[np.isfinite(score)],raw,elapsed(d)))
+        prepared.append((d,ch))
+    margin_cut=float(max(cuts))
+
+    diagnostics=[];chosen=None
+    for length in (3,5,7,9,12):
+        nr=[];wr=[]
+        for d,ch in prepared:
+            score,z=combined(d,ch,True,negative_only=True,streak_len=length)
+            wr.append(float((score>margin_cut).sum()/elapsed(d)))
+            nr.append(float(len(notify(d,z,margin_cut))/elapsed(d)))
+        diagnostics.append(dict(streak=length,worst_notifications_day=max(nr),
+            worst_windows_day=max(wr),rates=nr))
+        if max(nr)<=notice:
+            chosen=length;break
+    if chosen is None:chosen=12
+    return dict(kind="hybrid_raw",threshold=margin_cut,streak=int(chosen),
+        channel_thresholds=thresholds,diagnostics=diagnostics)
+
 def policy_channels(d,p,ref,name,policy):
     if policy.get("kind")=="five_raw":
         return five_raw_channels(p,policy["channel_thresholds"],policy.get("model_suffix","")),True,float(policy["threshold"])
+    if policy.get("kind")=="hybrid_raw":
+        return hybrid_raw_channels(p,policy["channel_thresholds"]),True,float(policy["threshold"])
     n="integrated_raw" if name=="integrated_half" else name
     ch,confirm=channels(d,p,ref,n)
     return ch,confirm,float(policy["threshold"])
@@ -795,6 +841,8 @@ def evaluate(root,modelpath,out,arm):
     policies["five_calibrated"]=calibrate_five_raw(cal,ps)
     if all((k+"_aug") in ps[0] for k in FIVE_CHANNELS):
         policies["five_augmented"]=calibrate_five_raw(cal,ps,suffix="_aug")
+        if "local_aug" in ps[0]:
+            policies["hybrid_augmented"]=calibrate_hybrid_raw(cal,ps)
     policies["integrated_half"]=cut_policy(cal,ps,ref,"integrated_raw",RAW_BUDGET*.5,INCIDENT_BUDGET*.5)
 
     controls=[]
