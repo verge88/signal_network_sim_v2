@@ -12,6 +12,8 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, HistGradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import RobustScaler
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import precision_score, recall_score, f1_score, average_precision_score, roc_auc_score
@@ -566,6 +568,7 @@ def cols(d,mode):
     if mode=="invariant":return BASE+[c for c in d.columns if any(c==b or c.startswith(b+"__") for b in list(NEW)+list(O.EXTRA))]
     if mode=="behavior":return list(F.OWN)+list(D.BEHAVIOR)+[c for c in d if c.startswith("hist_")]+list(CU)
     if mode=="naive_drift":return list(F.OWN)+list(SUB)+[c for c in d if c.startswith("drift_")]+["node_type_enc"]
+    if mode=="naive_linear":return [c for c in d if c.startswith("drift_") and c.endswith("_z")]+["node_type_enc"]
     raise ValueError(mode)
 
 def matrix(d,names):
@@ -596,10 +599,16 @@ def fit(d,mode,target,kind):
     elif kind=="gb":
         est=GradientBoostingClassifier(n_estimators=80,learning_rate=.04,max_depth=1,
             min_samples_leaf=30,subsample=.65,max_features="sqrt",random_state=42)
+    elif kind=="lr":
+        est=LogisticRegression(C=.08,solver="lbfgs",max_iter=1000,random_state=42)
     else:
         est=HistGradientBoostingClassifier(max_iter=70,learning_rate=.05,max_leaf_nodes=7,
             min_samples_leaf=50,l2_regularization=2.0,early_stopping=False,random_state=42)
-    model=make_pipeline(SimpleImputer(strategy="median",keep_empty_features=True),est)
+    if kind=="lr":
+        model=make_pipeline(SimpleImputer(strategy="median",keep_empty_features=True),
+            RobustScaler(quantile_range=(10.,90.)),est)
+    else:
+        model=make_pipeline(SimpleImputer(strategy="median",keep_empty_features=True),est)
     model.fit(matrix(d,names),y,**{model.steps[-1][0]+"__sample_weight":w})
     return names,model
 def fit_compromise_soph(d,soph,mode,kind="hgb"):
@@ -657,6 +666,7 @@ def train(root,out,arm):
     # falsify reports, so cross-node invariants are the appropriate evidence.
     soph_spec={
         "comp_naive_aug":("naive","naive_drift","hgb"),
+        "comp_naive_lr_aug":("naive","naive_linear","lr"),
         "comp_statistical_aug":("statistical","invariant","hgb"),
         "comp_adaptive_aug":("adaptive","invariant","hgb"),
     }
@@ -1538,6 +1548,67 @@ def calibrate_soph_hybrid(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
     return dict(kind="soph_hybrid",threshold=margin_cut,streak=int(chosen),
         channel_thresholds=thresholds,diagnostics=diagnostics)
 
+def soph_linear_naive_channels(d,p,thresholds):
+    out={"fallback":_logit(p["local_aug"])-_logit(_threshold_vector(d,thresholds["fallback"]))}
+    for k in OTHER:
+        out[k]=_logit(p[k+"_aug"])-_logit(_threshold_vector(d,thresholds[k]))
+    src={"comp_naive_lr":"comp_naive_lr_aug",
+         "comp_statistical":"comp_statistical_aug",
+         "comp_adaptive":"comp_adaptive_aug"}
+    for k,m in src.items():
+        out[k]=_logit(p[m])-_logit(_threshold_vector(d,thresholds[k]))
+    return out
+
+def calibrate_soph_linear_naive(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
+    """Same cascade as soph_hybrid, but the naive branch is a strongly
+    regularized linear model over causal drift-z features only."""
+    thresholds={}
+    thresholds["fallback"]=float(max(
+        threshold(p["local_aug"][d.label.to_numpy()==0],raw,elapsed(d))
+        for d,p in zip(frames,preds)))
+    comp_src={"comp_naive_lr":"comp_naive_lr_aug",
+              "comp_statistical":"comp_statistical_aug",
+              "comp_adaptive":"comp_adaptive_aug"}
+    n_special=len(OTHER)+len(comp_src)
+    share=float(raw/n_special)
+    for k in OTHER:
+        thresholds[k]=float(max(
+            threshold(p[k+"_aug"][d.label.to_numpy()==0],share,elapsed(d))
+            for d,p in zip(frames,preds)))
+    roles=sorted(set(np.concatenate([d.ntype.astype(str).unique() for d in frames])))
+    for k,src in comp_src.items():
+        by_role={}
+        for role in roles:
+            vals=[]
+            for d,p in zip(frames,preds):
+                mask=(d.label.to_numpy()==0)&(d.ntype.astype(str).to_numpy()==role)
+                if mask.any():vals.append(threshold(p[src][mask],share,elapsed(d)))
+            if vals:by_role[role]=float(max(vals))
+        thresholds[k]=by_role
+
+    prepared=[];cuts=[]
+    for d,p in zip(frames,preds):
+        ch=soph_linear_naive_channels(d,p,thresholds)
+        score,_=combined(d,ch,True,negative_only=True,streak_len=3)
+        cuts.append(threshold(score[np.isfinite(score)],raw,elapsed(d)))
+        prepared.append((d,ch))
+    margin_cut=float(max(cuts))
+    diagnostics=[];chosen=None
+    for length in (3,5,7,9,12):
+        nr=[];wr=[]
+        for d,ch in prepared:
+            score,z=combined(d,ch,True,negative_only=True,streak_len=length)
+            wr.append(float((score>margin_cut).sum()/elapsed(d)))
+            nr.append(float(len(notify(d,z,margin_cut))/elapsed(d)))
+        diagnostics.append(dict(streak=length,worst_notifications_day=max(nr),
+            worst_windows_day=max(wr),rates=nr))
+        if max(nr)<=notice:
+            chosen=length;break
+    if chosen is None:chosen=12
+    return dict(kind="soph_linear_naive",threshold=margin_cut,streak=int(chosen),
+        channel_thresholds=thresholds,diagnostics=diagnostics)
+
+
 def soph_cusum_channels(d,p,thresholds,cusum_rule,negative_only=False):
     out=soph_hybrid_channels(d,p,thresholds)
     out["comp_naive_cusum"]=naive_cusum_margin(d,p,cusum_rule,negative_only=negative_only)
@@ -1578,6 +1649,8 @@ def policy_channels(d,p,ref,name,policy):
         return hybrid_raw_channels(d,p,policy["channel_thresholds"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_hybrid":
         return soph_hybrid_channels(d,p,policy["channel_thresholds"]),True,float(policy["threshold"])
+    if policy.get("kind")=="soph_linear_naive":
+        return soph_linear_naive_channels(d,p,policy["channel_thresholds"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_cusum":
         return soph_cusum_channels(d,p,policy["channel_thresholds"],policy["naive_cusum"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_selfnorm":
@@ -1612,6 +1685,8 @@ def evaluate(root,modelpath,out,arm):
             policies["hybrid_augmented"]=calibrate_hybrid_raw(cal,ps)
             if all((k+"_aug") in ps[0] for k in COMP_SOPH_CHANNELS):
                 policies["hybrid_soph_augmented"]=calibrate_soph_hybrid(cal,ps)
+                if "comp_naive_lr_aug" in ps[0]:
+                    policies["hybrid_soph_linear_naive"]=calibrate_soph_linear_naive(cal,ps)
                 policies["hybrid_soph_cusum"]=calibrate_soph_cusum(cal,ps)
                 policies["hybrid_soph_selfnorm"]=calibrate_soph_selfnorm(cal,ps)
                 policies["hybrid_soph_load_total"]=calibrate_soph_load_shift(cal,ps,"total")
