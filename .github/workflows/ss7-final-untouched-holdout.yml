@@ -87,8 +87,10 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           import ss7.cu_compact_channel_development as M
-          M.TEST=(21401,21402,21403,21404,21405,21406,21407,21408)
-          M.evaluate(Path("results/worlds"),Path("results/trained"),Path("results/holdout"),"compact")
+          M.evaluate_final(
+              Path("results/worlds"),Path("results/trained"),Path("results/holdout"),"compact",
+              (21401,21402,21403,21404,21405,21406,21407,21408)
+          )
           PY
       - uses: actions/upload-artifact@v4
         with:
