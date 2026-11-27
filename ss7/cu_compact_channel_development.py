@@ -1119,6 +1119,88 @@ def calibrate_soph_load_shift(frames,preds,variant,raw=RAW_BUDGET,notice=INCIDEN
     return dict(kind="soph_load_shift",threshold=margin_cut,streak=int(chosen),
         channel_thresholds=thresholds,naive_load_shift=rule,diagnostics=diagnostics)
 
+ROLE_NAIVE_SPEC={
+    "IGW":("obs_ratio_MT_FSM",60,"pos"),
+    "SCP":("obs_ratio_ATI",30,"abs"),
+    "SP":("obs_ratio_ATI",60,"pos"),
+    "STP":("obs_ratio_ISD",60,"pos"),
+}
+
+def _node_roll_mean(d,x,win):
+    x=np.asarray(x,float);out=np.zeros(len(d),float)
+    for _,g in d.groupby("nid",sort=False):
+        ix=g.index.to_numpy()
+        out[ix]=pd.Series(x[ix],index=ix).rolling(win,min_periods=max(10,win//3)).mean().fillna(0.0).to_numpy()
+    return out
+
+def naive_role_score(d):
+    """Frozen RANK-selected causal score using delivered KIE features only."""
+    roles=d.ntype.astype(str).to_numpy()
+    out=np.zeros(len(d),float)
+    for role,(feature,win,direction) in ROLE_NAIVE_SPEC.items():
+        mask=roles==role
+        if not mask.any() or feature not in d.columns:continue
+        z=_causal_robust_z(d,d[feature].to_numpy(float))
+        base=np.abs(z) if direction=="abs" else np.maximum(z,0.0)
+        rolled=_node_roll_mean(d,base,win)
+        out[mask]=rolled[mask]
+    return out
+
+def fit_naive_role(frames,raw=RAW_BUDGET):
+    roles=sorted(ROLE_NAIVE_SPEC)
+    cuts={};scales={}
+    for role in roles:
+        vals=[];allv=[]
+        for d in frames:
+            score=naive_role_score(d)
+            mask=(d.label.to_numpy()==0)&(d.ntype.astype(str).to_numpy()==role)
+            a=score[mask]
+            if len(a):
+                vals.append(threshold(a,raw,elapsed(d)));allv.append(a)
+        if vals:
+            cuts[role]=float(max(vals))
+            q=np.concatenate(allv);q25,q75=np.quantile(q,[.25,.75])
+            scales[role]=float(max((q75-q25)/1.349,.05))
+    return dict(spec=ROLE_NAIVE_SPEC,thresholds=cuts,scales=scales)
+
+def naive_role_margin(d,rule):
+    score=naive_role_score(d)
+    cut=_threshold_vector(d,rule["thresholds"])
+    scale=_threshold_vector(d,rule["scales"])
+    return (score-cut)/np.maximum(scale,.05)
+
+def soph_role_channels(d,p,thresholds,rule):
+    out=soph_hybrid_channels(d,p,thresholds)
+    out["comp_naive_role"]=naive_role_margin(d,rule)
+    return out
+
+def calibrate_soph_role(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
+    base=calibrate_soph_hybrid(frames,preds,raw,notice)
+    thresholds=base["channel_thresholds"]
+    rule=fit_naive_role(frames,raw)
+    prepared=[];cuts=[]
+    for d,p in zip(frames,preds):
+        ch=soph_role_channels(d,p,thresholds,rule)
+        score,_=combined(d,ch,True,negative_only=True,streak_len=3)
+        cuts.append(threshold(score[np.isfinite(score)],raw,elapsed(d)))
+        prepared.append((d,p))
+    margin_cut=float(max(cuts))
+    diagnostics=[];chosen=None
+    for length in (3,5,7,9,12):
+        nr=[];wr=[]
+        for d,p in prepared:
+            ch=soph_role_channels(d,p,thresholds,rule)
+            score,z=combined(d,ch,True,negative_only=True,streak_len=length)
+            wr.append(float((score>margin_cut).sum()/elapsed(d)))
+            nr.append(float(len(notify(d,z,margin_cut))/elapsed(d)))
+        diagnostics.append(dict(streak=length,worst_notifications_day=max(nr),
+            worst_windows_day=max(wr),rates=nr))
+        if max(nr)<=notice:
+            chosen=length;break
+    if chosen is None:chosen=12
+    return dict(kind="soph_role_naive",threshold=margin_cut,streak=int(chosen),
+        channel_thresholds=thresholds,naive_role=rule,diagnostics=diagnostics)
+
 def _profile_js_rows(d, recent=5, baseline=60, gap=5):
     """Causal Jensen-Shannon divergence of recent traffic mix from own history."""
     map_cols=[c for c in ("local_obs_ratio_"+m for m in MAP) if c in d.columns]
@@ -1378,6 +1460,8 @@ def policy_channels(d,p,ref,name,policy):
         return soph_selfnorm_channels(d,p,policy["channel_thresholds"],policy["naive_selfnorm"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_load_shift":
         return soph_load_shift_channels(d,p,policy["channel_thresholds"],policy["naive_load_shift"]),True,float(policy["threshold"])
+    if policy.get("kind")=="soph_role_naive":
+        return soph_role_channels(d,p,policy["channel_thresholds"],policy["naive_role"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_profile":
         return soph_profile_channels(d,p,policy["channel_thresholds"],policy["naive_profile"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_routing":
@@ -1406,6 +1490,7 @@ def evaluate(root,modelpath,out,arm):
                 policies["hybrid_soph_selfnorm"]=calibrate_soph_selfnorm(cal,ps)
                 policies["hybrid_soph_load_total"]=calibrate_soph_load_shift(cal,ps,"total")
                 policies["hybrid_soph_load_mix"]=calibrate_soph_load_shift(cal,ps,"total_mix")
+                policies["hybrid_soph_role_naive"]=calibrate_soph_role(cal,ps)
                 policies["hybrid_soph_profile"]=calibrate_soph_profile(cal,ps)
                 policies["hybrid_soph_routing"]=calibrate_soph_routing(cal,ps)
     policies["integrated_half"]=cut_policy(cal,ps,ref,"integrated_raw",RAW_BUDGET*.5,INCIDENT_BUDGET*.5)
