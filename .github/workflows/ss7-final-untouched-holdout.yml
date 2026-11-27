@@ -46,11 +46,19 @@ jobs:
       - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
       - uses: actions/download-artifact@v4
         with:
-          pattern: final-world-compact-21*
+          pattern: final-world-compact-210*
+          path: results/incoming
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: final-world-compact-211*
+          path: results/incoming
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: final-world-compact-212*
           path: results/incoming
       - run: |
           mkdir -p results/worlds
-          for seed in 21001 21002 21003 21101 21102 21201 21202 21401 21402 21403 21404; do
+          for seed in 21001 21002 21003 21101 21102 21201 21202; do
             mv results/incoming/final-world-compact-${seed} results/worlds/world-compact-${seed}
           done
       - run: python -u -m ss7.cu_compact_channel_development train --arm compact --root results/worlds --output results/trained
@@ -72,11 +80,15 @@ jobs:
       - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
       - uses: actions/download-artifact@v4
         with:
-          pattern: final-world-compact-21*
+          pattern: final-world-compact-212*
+          path: results/incoming
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: final-world-compact-214*
           path: results/incoming
       - run: |
           mkdir -p results/worlds
-          for seed in 21101 21102 21201 21202 21401 21402 21403 21404; do
+          for seed in 21201 21202 21401 21402 21403 21404; do
             mv results/incoming/final-world-compact-${seed} results/worlds/world-compact-${seed}
           done
       - uses: actions/download-artifact@v4
