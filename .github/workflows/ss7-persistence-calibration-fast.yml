@@ -43,6 +43,11 @@ jobs:
           pattern: world-compact-21[123]*
           path: results/worlds
       - run: python -u -m ss7.cu_compact_channel_development train --arm compact --root results/worlds --output results/trained
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anti-overfit-trained-models
+          path: results/trained
+          retention-days: 7
       - run: python -u -m ss7.cu_compact_channel_development evaluate --arm compact --root results/worlds --models results/trained --output results/eval
       - uses: actions/upload-artifact@v4
         with:
