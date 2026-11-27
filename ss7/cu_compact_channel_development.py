@@ -50,9 +50,10 @@ CU=("cu_delivered","cu_rtt_delay","cu_req_delay","cu_resp_delay","cu_combined_lo
 MAP=tuple(m for m in F.MSG_TYPES if F.MT_IDX[m]>=5)
 SUB=tuple("obs_ratio_"+m for m in MAP)
 TEMP=("cv_total","cv_entropy","cv_io","cv_dominance","ar1_total","integrity_fail_rate","cv_dest")
-KIE_SKETCH_BINS=16
-KIE_SKETCH=tuple(f"kie_route_sketch_{i}" for i in range(KIE_SKETCH_BINS))
-KIE_DERIVED=("kie_route_js","kie_route_maxshift")
+# The experimental 16-bin route/service sketch failed the five-world
+# robustness gate and is intentionally not transmitted by the final design.
+# Keep an empty compatibility tuple for development diagnostics.
+KIE_DERIVED=()
 DRIFT_SOURCE=("total_messages","map_share","isup_share","n_unique_dest","dest_entropy","dest_top1_ratio","in_out_ratio","dlg_closure_ratio","transit_share")+SUB
 ZONE_BASE=("total_messages","map_share","isup_share","in_out_ratio","integrity_fail_rate","cv_total","cu_delivered")
 ZONE=tuple("zone_dev_"+c for c in ZONE_BASE)+("zone_io_ratio_rank",)
@@ -74,10 +75,9 @@ def payload_bytes(topo,n,compact):
     relay=topo.nodes[n].ntype in (F.NodeType.STP,F.NodeType.IGW)
     if not compact:return 50+8*(m+2*d+N+8+2*d*m+d*d*m)
     # Fixed-layout envelope. Base state, four-group directional counts,
-    # four-group matrix marginals for relays, two eight-float64 profiles,
-    # plus a 16-bin uint32 route-service sketch (64 B).
-    # No dense link×message matrix is transmitted.
-    return 50+4*(m+2*d+N+8+2*d*len(GROUPS)+(2*d*len(GROUPS) if relay else 0)+KIE_SKETCH_BINS)+16*8
+    # four-group matrix marginals for relays and two eight-float64 profiles.
+    # No dense link×message matrix and no rejected experimental sketch are sent.
+    return 50+4*(m+2*d+N+8+2*d*len(GROUPS)+(2*d*len(GROUPS) if relay else 0))+16*8
 
 def group_counts(a):
     out=defaultdict(int)
@@ -90,32 +90,6 @@ def marginals(b):
         out[(0,ki,GROUP[j])]+=int(v);out[(1,ko,GROUP[j])]+=int(v)
     return dict(out)
 
-def _sketch_bin(parts):
-    # Stable arithmetic mixer; never use process-randomized Python hash().
-    h=2166136261
-    for x in parts:
-        h=((h^int(x))*16777619)&0xffffffff
-    return int(h%KIE_SKETCH_BINS)
-
-def route_service_sketch(typed,matrix):
-    """Fixed-size sketch of route/message dependence from local aggregates.
-
-    Typed cells preserve direction×adjacent-link×message identity; relay
-    matrix cells additionally preserve input-link×output-link×message identity.
-    The coordinator receives only 16 uint32 bins, never the dense source maps.
-    """
-    bins=np.zeros(KIE_SKETCH_BINS,dtype=np.uint64)
-    for (direction,k,j),v in typed.items():
-        x=int(max(v,0))
-        if x:
-            bins[_sketch_bin((1,direction,k[0],k[1],j))]+=x
-    for (ki,ko,j),v in matrix.items():
-        x=int(max(v,0))
-        if x:
-            bins[_sketch_bin((2,ki[0],ki[1],ko[0],ko[1],j))]+=x
-    if np.any(bins>=2**32):raise OverflowError("route-service sketch counter overflow")
-    return bins.astype(np.uint32)
-
 def encode_compact(rep,a,b):
     # The slave computes these summaries locally; only their transmitted
     # representation is used by the coordinator. No claim of cell recovery.
@@ -124,8 +98,6 @@ def encode_compact(rep,a,b):
     for v in list(x.values())+list(y.values())+list(st.mtype)+list(st.dest.values())+list(st.link_in.values())+list(st.link_out.values())+[st.originated,st.terminated,st.transited,st.dlg_begin,st.dlg_end]:
         assert 0<=int(v)<2**32,"compact counter overflow"
     z={"beh_"+kind+"_"+k:v for kind,c in (("typed",a),("matrix",b)) for k,v in zip(D.PROFILE,D.profile(c))}
-    sketch=route_service_sketch(a,b)
-    z.update({name:int(v) for name,v in zip(KIE_SKETCH,sketch)})
     return x,y,z
 
 def compact_telemetry(reps,typed,mat,sensors,topo):
@@ -435,31 +407,6 @@ def features(d):
             delta=recent-base
             d.loc[g.index,"drift_"+c+"_rel"]=(delta/(base.abs()+1e-3)).clip(-20,20).to_numpy()
             d.loc[g.index,"drift_"+c+"_z"]=(delta/(sd+.05*base.abs()+1e-3)).clip(-20,20).to_numpy()
-    # Route-service sketch is transmitted only in compact KIE. Convert it
-    # at the coordinator into causal composition drift against the node's own
-    # earlier baseline. Missing current KIE => derived sketch evidence missing.
-    for name in KIE_DERIVED:d[name]=np.nan
-    if all(c in d.columns for c in KIE_SKETCH):
-        for _,g in d.groupby("nid",sort=False):
-            ix=g.index.to_numpy()
-            frame=g[list(KIE_SKETCH)].astype(float)
-            recent=frame.rolling(10,min_periods=4).mean()
-            baseline=frame.shift(10).rolling(60,min_periods=15).mean()
-            P=recent.to_numpy(float);Q=baseline.to_numpy(float)
-            ps=np.nansum(P,axis=1,keepdims=True);qs=np.nansum(Q,axis=1,keepdims=True)
-            valid=(np.isfinite(P).all(axis=1)&np.isfinite(Q).all(axis=1)&
-                   (ps[:,0]>0)&(qs[:,0]>0)&(g.cu_delivered.to_numpy(float)>0))
-            P=np.divide(P,ps,out=np.zeros_like(P),where=ps>0)
-            Q=np.divide(Q,qs,out=np.zeros_like(Q),where=qs>0)
-            M=.5*(P+Q);eps=1e-12
-            klp=np.sum(np.where(P>0,P*np.log((P+eps)/(M+eps)),0.0),axis=1)
-            klq=np.sum(np.where(Q>0,Q*np.log((Q+eps)/(M+eps)),0.0),axis=1)
-            js=.5*(klp+klq)
-            shift=np.max(np.abs(P-Q),axis=1)
-            js[~valid]=np.nan;shift[~valid]=np.nan
-            d.loc[ix,"kie_route_js"]=js
-            d.loc[ix,"kie_route_maxshift"]=shift
-
     for c in ZONE_BASE:
         # Contemporaneous zone peer median is observable at the coordinator.
         d["zone_dev_"+c]=d[c]-d.groupby(["zone","t"])[c].transform("median")
@@ -543,7 +490,7 @@ def generate(seed,days=DAYS,arm="compact"):
             for n in fresh:behavior[n].update(profiles[n])
         for n,vals in obs.items():
             nd=sim.topo.nodes[n];e=active.get(n)
-            row={c:np.nan for c in list(NEW)+list(O.EXTRA)+list(D.BEHAVIOR)+list(KIE_SKETCH)}
+            row={c:np.nan for c in list(NEW)+list(O.EXTRA)+list(D.BEHAVIOR)}
             row.update(inv.get(n,{}));row.update(extra.get(n,{}));row.update(behavior.get(n,{}))
             # Independent boundary sensor remains observable even when CU lost.
             if n in sensors and n not in fresh:
