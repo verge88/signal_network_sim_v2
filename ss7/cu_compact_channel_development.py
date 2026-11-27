@@ -1041,6 +1041,84 @@ def calibrate_soph_selfnorm(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
     return dict(kind="soph_selfnorm",threshold=margin_cut,streak=int(chosen),
         channel_thresholds=thresholds,naive_selfnorm=self_rule,diagnostics=diagnostics)
 
+def naive_load_shift_score(d,variant="total"):
+    """Causal level-shift score for NAIVE compromise.
+
+    Corrected compromise injects extra legitimate traffic chosen from the
+    node's legal flow support. Therefore the only invariant observable for an
+    unmasked (NAIVE) attacker is a sustained excess above the node's own past,
+    optionally accompanied by a service/direction mix shift.
+    """
+    total=np.nan_to_num(d.get("drift_total_messages_z",pd.Series(np.zeros(len(d)))).to_numpy(float),nan=0.0)
+    level=np.maximum(total,0.0)
+    if variant=="total":
+        return level
+    cols=("drift_map_share_z","drift_isup_share_z","drift_n_unique_dest_z",
+          "drift_dest_entropy_z","drift_dest_top1_ratio_z","drift_in_out_ratio_z",
+          "drift_dlg_closure_ratio_z","drift_transit_share_z")
+    mix=[np.abs(np.nan_to_num(d[c].to_numpy(float),nan=0.0)) for c in cols if c in d.columns]
+    mix_score=np.maximum.reduce(mix) if mix else np.zeros(len(d),float)
+    if variant=="total_mix":
+        return .70*level+.30*mix_score
+    raise ValueError(variant)
+
+def fit_naive_load_shift(frames,variant,raw=RAW_BUDGET):
+    roles=sorted(set(np.concatenate([d.ntype.astype(str).unique() for d in frames])))
+    cuts={};scales={}
+    # The final fused margin is calibrated again below, so this channel can use
+    # the full raw budget without a Bonferroni penalty.
+    for role in roles:
+        vals=[];allv=[]
+        for d in frames:
+            score=naive_load_shift_score(d,variant)
+            mask=(d.label.to_numpy()==0)&(d.ntype.astype(str).to_numpy()==role)
+            a=score[mask]
+            if len(a):
+                vals.append(threshold(a,raw,elapsed(d)));allv.append(a)
+        if vals:
+            cuts[role]=float(max(vals))
+            q=np.concatenate(allv);q25,q75=np.quantile(q,[.25,.75])
+            scales[role]=float(max((q75-q25)/1.349,.25))
+    return dict(variant=variant,thresholds=cuts,scales=scales)
+
+def naive_load_shift_margin(d,rule):
+    score=naive_load_shift_score(d,rule["variant"])
+    cut=_threshold_vector(d,rule["thresholds"])
+    scale=_threshold_vector(d,rule["scales"])
+    return (score-cut)/np.maximum(scale,.25)
+
+def soph_load_shift_channels(d,p,thresholds,rule):
+    out=soph_hybrid_channels(d,p,thresholds)
+    out["comp_naive_load_"+rule["variant"]]=naive_load_shift_margin(d,rule)
+    return out
+
+def calibrate_soph_load_shift(frames,preds,variant,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
+    base=calibrate_soph_hybrid(frames,preds,raw,notice)
+    thresholds=base["channel_thresholds"]
+    rule=fit_naive_load_shift(frames,variant,raw)
+    prepared=[];cuts=[]
+    for d,p in zip(frames,preds):
+        ch=soph_load_shift_channels(d,p,thresholds,rule)
+        score,_=combined(d,ch,True,negative_only=True,streak_len=3)
+        cuts.append(threshold(score[np.isfinite(score)],raw,elapsed(d)))
+        prepared.append((d,p))
+    margin_cut=float(max(cuts))
+    diagnostics=[];chosen=None
+    for length in (3,5,7,9,12):
+        nr=[];wr=[]
+        for d,p in prepared:
+            ch=soph_load_shift_channels(d,p,thresholds,rule)
+            score,z=combined(d,ch,True,negative_only=True,streak_len=length)
+            wr.append(float((score>margin_cut).sum()/elapsed(d)))
+            nr.append(float(len(notify(d,z,margin_cut))/elapsed(d)))
+        diagnostics.append(dict(streak=length,worst_notifications_day=max(nr),
+            worst_windows_day=max(wr),rates=nr))
+        if max(nr)<=notice:
+            chosen=length;break
+    if chosen is None:chosen=12
+    return dict(kind="soph_load_shift",threshold=margin_cut,streak=int(chosen),
+        channel_thresholds=thresholds,naive_load_shift=rule,diagnostics=diagnostics)
+
 def _profile_js_rows(d, recent=5, baseline=60, gap=5):
     """Causal Jensen-Shannon divergence of recent traffic mix from own history."""
     map_cols=[c for c in ("local_obs_ratio_"+m for m in MAP) if c in d.columns]
@@ -1298,6 +1376,8 @@ def policy_channels(d,p,ref,name,policy):
         return soph_cusum_channels(d,p,policy["channel_thresholds"],policy["naive_cusum"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_selfnorm":
         return soph_selfnorm_channels(d,p,policy["channel_thresholds"],policy["naive_selfnorm"]),True,float(policy["threshold"])
+    if policy.get("kind")=="soph_load_shift":
+        return soph_load_shift_channels(d,p,policy["channel_thresholds"],policy["naive_load_shift"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_profile":
         return soph_profile_channels(d,p,policy["channel_thresholds"],policy["naive_profile"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_routing":
@@ -1324,6 +1404,8 @@ def evaluate(root,modelpath,out,arm):
                 policies["hybrid_soph_augmented"]=calibrate_soph_hybrid(cal,ps)
                 policies["hybrid_soph_cusum"]=calibrate_soph_cusum(cal,ps)
                 policies["hybrid_soph_selfnorm"]=calibrate_soph_selfnorm(cal,ps)
+                policies["hybrid_soph_load_total"]=calibrate_soph_load_shift(cal,ps,"total")
+                policies["hybrid_soph_load_mix"]=calibrate_soph_load_shift(cal,ps,"total_mix")
                 policies["hybrid_soph_profile"]=calibrate_soph_profile(cal,ps)
                 policies["hybrid_soph_routing"]=calibrate_soph_routing(cal,ps)
     policies["integrated_half"]=cut_policy(cal,ps,ref,"integrated_raw",RAW_BUDGET*.5,INCIDENT_BUDGET*.5)
