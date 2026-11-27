@@ -1201,6 +1201,73 @@ def calibrate_soph_role(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
     return dict(kind="soph_role_naive",threshold=margin_cut,streak=int(chosen),
         channel_thresholds=thresholds,naive_role=rule,diagnostics=diagnostics)
 
+def _count_threshold(x,allowed):
+    """Strict threshold permitting at most *allowed* exceedances."""
+    a=np.sort(np.asarray(x,float)[np.isfinite(x)])[::-1]
+    if allowed<0:return float("inf")
+    if not len(a):return float("inf")
+    if allowed>=len(a):return float("-inf")
+    return float(a[int(allowed)])
+
+def _supplement_bucket_peaks(d,z,exclude):
+    """Role-score peaks in node/buckets not already notified by base rule."""
+    x=pd.DataFrame(dict(nid=d.nid.to_numpy(),bucket=d.t.to_numpy()//60,z=z))
+    q=x.groupby(["nid","bucket"],sort=False).z.max().reset_index()
+    if exclude:
+        keep=np.array([(int(n),int(b)) not in exclude for n,b in zip(q.nid,q.bucket)],bool)
+        q=q.loc[keep]
+    return q.z.to_numpy(float)
+
+def soph_role_supplement_channels(d,p,policy):
+    base=soph_hybrid_channels(d,p,policy["channel_thresholds"])
+    out={k:v-float(policy["base_threshold"]) for k,v in base.items()}
+    out["comp_naive_role"]=naive_role_margin(d,policy["naive_role"])-float(policy["supplement_threshold"])
+    return out
+
+def calibrate_soph_role_supplement(frames,preds,base_raw,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
+    """Preserve the base detector and spend only its unused false-alarm budget.
+
+    Feature selection is already frozen on RANK. CAL supplies thresholds only.
+    The role branch is calibrated against negative windows/buckets not already
+    consumed by the base branch, so it cannot raise the common base threshold.
+    """
+    base=calibrate_soph_hybrid(frames,preds,raw=float(base_raw),notice=notice)
+    role_rule=fit_naive_role(frames,raw=raw)
+    world_cuts=[];diagnostics=[]
+    for d,p in zip(frames,preds):
+        neg=d.label.to_numpy()==0
+        base_ch=soph_hybrid_channels(d,p,base["channel_thresholds"])
+        shifted={k:v-float(base["threshold"]) for k,v in base_ch.items()}
+        bs,bz=combined(d,shifted,True,negative_only=True,streak_len=base["streak"])
+        role=naive_role_margin(d,role_rule)
+        rneg=np.where(neg,role,-np.inf)
+        rz=streak_score(d,rneg,base["streak"])
+        days=elapsed(d)
+
+        raw_cap=int(np.floor(raw*days))
+        base_raw_count=int((bs>0).sum())
+        raw_left=max(0,raw_cap-base_raw_count)
+        raw_extra=role[neg&(bs<=0)]
+        raw_cut=_count_threshold(raw_extra,raw_left)
+
+        bix=notify(d,bz,0.0)
+        base_buckets={(int(d.nid.iloc[j]),int(d.t.iloc[j]//60)) for j in bix}
+        notice_cap=int(np.floor(notice*days))
+        notice_left=max(0,notice_cap-len(base_buckets))
+        peaks=_supplement_bucket_peaks(d,rz,base_buckets)
+        notice_cut=_count_threshold(peaks,notice_left)
+        cut=max(raw_cut,notice_cut)
+        world_cuts.append(cut)
+        diagnostics.append(dict(base_raw_budget=float(base_raw),base_raw_count=base_raw_count,
+            raw_cap=raw_cap,raw_left=raw_left,base_notifications=len(base_buckets),
+            notice_cap=notice_cap,notice_left=notice_left,raw_cut=raw_cut,
+            notice_cut=notice_cut,world_cut=cut))
+    supp=float(max(world_cuts))
+    return dict(kind="soph_role_supplement",threshold=0.0,streak=int(base["streak"]),
+        base_raw_budget=float(base_raw),base_threshold=float(base["threshold"]),
+        channel_thresholds=base["channel_thresholds"],naive_role=role_rule,
+        supplement_threshold=supp,diagnostics=diagnostics)
+
 def _profile_js_rows(d, recent=5, baseline=60, gap=5):
     """Causal Jensen-Shannon divergence of recent traffic mix from own history."""
     map_cols=[c for c in ("local_obs_ratio_"+m for m in MAP) if c in d.columns]
@@ -1462,6 +1529,8 @@ def policy_channels(d,p,ref,name,policy):
         return soph_load_shift_channels(d,p,policy["channel_thresholds"],policy["naive_load_shift"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_role_naive":
         return soph_role_channels(d,p,policy["channel_thresholds"],policy["naive_role"]),True,float(policy["threshold"])
+    if policy.get("kind")=="soph_role_supplement":
+        return soph_role_supplement_channels(d,p,policy),True,0.0
     if policy.get("kind")=="soph_profile":
         return soph_profile_channels(d,p,policy["channel_thresholds"],policy["naive_profile"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_routing":
@@ -1491,6 +1560,8 @@ def evaluate(root,modelpath,out,arm):
                 policies["hybrid_soph_load_total"]=calibrate_soph_load_shift(cal,ps,"total")
                 policies["hybrid_soph_load_mix"]=calibrate_soph_load_shift(cal,ps,"total_mix")
                 policies["hybrid_soph_role_naive"]=calibrate_soph_role(cal,ps)
+                for base_raw in (20.,18.,16.):
+                    policies[f"hybrid_soph_role_supp_{int(base_raw)}"]=calibrate_soph_role_supplement(cal,ps,base_raw)
                 policies["hybrid_soph_profile"]=calibrate_soph_profile(cal,ps)
                 policies["hybrid_soph_routing"]=calibrate_soph_routing(cal,ps)
     policies["integrated_half"]=cut_policy(cal,ps,ref,"integrated_raw",RAW_BUDGET*.5,INCIDENT_BUDGET*.5)
