@@ -721,12 +721,12 @@ def five_raw_channels(p,thresholds):
     return {k:_logit(p[k])-_logit(thresholds[k]) for k in FIVE_CHANNELS}
 
 def calibrate_five_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
-    """Bonferroni-safe per-class raw calibration followed by persistence.
+    """Per-class calibration with a shared margin cut using the full FPR budget.
 
-    The raw false-window budget is split uniformly across the five attack
-    channels. Thresholds are chosen independently on each CAL world and the
-    conservative maximum is frozen. The shortest persistence that satisfies
-    the global notification budget on every CAL world is then selected.
+    First obtain conservative class-specific anchors. Then calibrate one common
+    log-odds margin threshold on the fused negative score so the union, rather
+    than each channel separately, can use the full raw-window budget. Finally
+    choose persistence using only CAL worlds to satisfy the notification budget.
     """
     share=float(raw/len(FIVE_CHANNELS));thresholds={}
     for k in FIVE_CHANNELS:
@@ -734,20 +734,29 @@ def calibrate_five_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
             threshold(p[k][d.label.to_numpy()==0],share,elapsed(d))
             for d,p in zip(frames,preds)
         ))
+
+    prepared=[]
+    raw_cuts=[]
+    for d,p in zip(frames,preds):
+        ch=five_raw_channels(p,thresholds)
+        s,_=combined(d,ch,True,negative_only=True,streak_len=3)
+        raw_cuts.append(threshold(s[np.isfinite(s)],raw,elapsed(d)))
+        prepared.append((d,ch))
+    margin_cut=float(max(raw_cuts))
+
     diagnostics=[];chosen=None
     for length in (3,5,7,9,12):
         rates=[];raw_rates=[]
-        for d,p in zip(frames,preds):
-            ch=five_raw_channels(p,thresholds)
+        for d,ch in prepared:
             s,z=combined(d,ch,True,negative_only=True,streak_len=length)
-            raw_rates.append(float((s>0).sum()/elapsed(d)))
-            rates.append(float(len(notify(d,z,0.0))/elapsed(d)))
+            raw_rates.append(float((s>margin_cut).sum()/elapsed(d)))
+            rates.append(float(len(notify(d,z,margin_cut))/elapsed(d)))
         diagnostics.append(dict(streak=length,worst_notifications_day=max(rates),
             worst_windows_day=max(raw_rates),rates=rates))
         if max(rates)<=notice:
             chosen=length;break
     if chosen is None:chosen=12
-    return dict(kind="five_raw",threshold=0.0,streak=int(chosen),
+    return dict(kind="five_raw",threshold=margin_cut,streak=int(chosen),
         raw_budget_share=share,channel_thresholds=thresholds,diagnostics=diagnostics)
 
 def policy_channels(d,p,ref,name,policy):
