@@ -1064,7 +1064,7 @@ def _profile_js_rows(d, recent=5, baseline=60, gap=5):
         frame=pd.DataFrame(X,index=ix)
         r=frame.rolling(recent,min_periods=max(2,recent//2)).mean()
         b=frame.shift(gap).rolling(baseline,min_periods=max(10,baseline//4)).mean()
-        P=r.to_numpy(float);Q=b.to_numpy(float)
+        P=r.to_numpy(float).copy();Q=b.to_numpy(float).copy()
         P/=np.maximum(np.nansum(P,axis=1,keepdims=True),1e-12)
         Q/=np.maximum(np.nansum(Q,axis=1,keepdims=True),1e-12)
         M=.5*(P+Q)
