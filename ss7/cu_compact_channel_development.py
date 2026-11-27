@@ -47,7 +47,7 @@ CU=("cu_delivered","cu_rtt_delay","cu_req_delay","cu_resp_delay","cu_combined_lo
     "cu_staleness","cu_consistency_error")
 MAP=tuple(m for m in F.MSG_TYPES if F.MT_IDX[m]>=5)
 SUB=tuple("obs_ratio_"+m for m in MAP)
-TEMP=("cv_total","cv_entropy","cv_io","cv_dominance","ar1_total","integrity_fail_rate","cv_dest")
+TEMP=("cv_total","cv_entropy","cv_io","cv_dominance","ar1_total","integrity_fail_rate","cv_dest")\nDRIFT_SOURCE=("total_messages","map_share","isup_share","n_unique_dest","dest_entropy","dest_top1_ratio","in_out_ratio","dlg_closure_ratio","transit_share")+SUB
 ZONE_BASE=("total_messages","map_share","isup_share","in_out_ratio","integrity_fail_rate","cv_total","cu_delivered")
 ZONE=tuple("zone_dev_"+c for c in ZONE_BASE)+("zone_io_ratio_rank",)
 BASE=list(CU)+list(F.OWN)+list(SUB)+list(TEMP)+list(ZONE)+["node_type_enc"]
@@ -388,6 +388,18 @@ def features(d):
         d.loc[g.index,"ar1_total"]=g.total_messages.rolling(30,min_periods=5).corr(g.total_messages.shift(1)).to_numpy()
         d.loc[g.index,"local_ar1_total"]=g.local_total_messages.rolling(30,min_periods=5).corr(g.local_total_messages.shift(1)).to_numpy()
         d.loc[g.index,"integrity_fail_rate"]=(1-g.integrity_check).rolling(30,min_periods=5).mean().to_numpy()
+        # Sustained-level drift: recent 5 min versus an earlier 30 min baseline.
+        # Baseline ends 5 min before the recent window, so the current shift
+        # cannot immediately contaminate its own reference distribution.
+        for c in DRIFT_SOURCE:
+            x=g[c].astype(float)
+            recent=x.rolling(10,min_periods=4).mean()
+            past=x.shift(10)
+            base=past.rolling(60,min_periods=15).mean()
+            sd=past.rolling(60,min_periods=15).std()
+            delta=recent-base
+            d.loc[g.index,"drift_"+c+"_rel"]=(delta/(base.abs()+1e-3)).clip(-20,20).to_numpy()
+            d.loc[g.index,"drift_"+c+"_z"]=(delta/(sd+.05*base.abs()+1e-3)).clip(-20,20).to_numpy()
     for c in ZONE_BASE:
         # Contemporaneous zone peer median is observable at the coordinator.
         d["zone_dev_"+c]=d[c]-d.groupby(["zone","t"])[c].transform("median")
@@ -495,6 +507,7 @@ def cols(d,mode):
     if mode=="special":return SPECIAL
     if mode=="invariant":return BASE+[c for c in d.columns if any(c==b or c.startswith(b+"__") for b in list(NEW)+list(O.EXTRA))]
     if mode=="behavior":return list(F.OWN)+list(D.BEHAVIOR)+[c for c in d if c.startswith("hist_")]+list(CU)
+    if mode=="naive_drift":return list(F.OWN)+list(SUB)+[c for c in d if c.startswith("drift_")]+["node_type_enc"]
     raise ValueError(mode)
 
 def matrix(d,names):
@@ -585,7 +598,7 @@ def train(root,out,arm):
     # in local/base temporal and zone behaviour. STATISTICAL/ADAPTIVE actively
     # falsify reports, so cross-node invariants are the appropriate evidence.
     soph_spec={
-        "comp_naive_aug":("naive","behavior","hgb"),
+        "comp_naive_aug":("naive","naive_drift","hgb"),
         "comp_statistical_aug":("statistical","invariant","hgb"),
         "comp_adaptive_aug":("adaptive","invariant","hgb"),
     }
