@@ -1804,7 +1804,8 @@ def evaluate(root,modelpath,out,arm):
 
 def evaluate_final(root,modelpath,out,arm,test_seeds):
     """Evaluate exactly one frozen final policy on an explicit untouched seed set."""
-    models=joblib.load(modelpath/"models.joblib")
+    out=Path(out);out.mkdir(parents=True,exist_ok=True)
+    models=joblib.load(Path(modelpath)/"models.joblib")
     cal=[load(root,arm,s)[0] for s in CAL];ps=[predict(d,models) for d in cal]
     policy=calibrate_linear_scp_supplement(cal,ps)
     controls=[]
