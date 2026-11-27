@@ -129,26 +129,38 @@ class IntegratedSim(O.CorrectedSim):
         super().__init__(cfg,book)
         self.cu=CUExchange(self,extended)
     def flows_for(self,t,episodes):
-        """Abstract synthetic service-mix perturbations, not protocol exploits.
-        Keep normal routing and background process; generate no live packets."""
+        """Synthetic service-volume profiles on the existing simulated graph."""
         active={e.nid:e for e in episodes if e.kind in KINDS[:-1] and e.t0<=t<=e.t1}
+        if not active:
+            yield from self.flows
+            return
+        grouped=defaultdict(list)
         for f in self.flows:
-            e=active.get(f.src)
-            if e is None:yield f;continue
-            # Reweight aggregate service volumes within the simulated traffic.
-            # Total volume and class mix are not guaranteed article-identical.
-            k=e.kind
-            if k=="signalling_dos":mult=e.mult
-            elif k=="sms_interception":mult=e.mult if f.service==Service.SMS_MT else 1.
-            elif k=="irsf":mult=e.mult if f.service==Service.VOICE_INT else 1.
-            else:mult=1.
-            yield F.Flow(f.src,f.dst,f.service,f.rate*mult)
-        for n,e in active.items():
-            if e.kind=="location_tracking":
-                # Aggregate LOCATION category absent in normal flow generator.
-                # Add a small synthetic rate to a pre-existing endpoint pair.
-                dst=self.topo.hlr[0]
-                yield F.Flow(n,dst,Service.LOCATION,e.mult)
+            if f.src not in active:yield f
+            else:grouped[f.src].append(f)
+        for n,fs in grouped.items():
+            e=active[n];kind=e.kind
+            weight=lambda f: f.rate*sum(F.SERVICE_TEMPLATE[f.service].values())
+            total=sum(weight(f) for f in fs);target=total*e.mult
+            if kind=="signalling_dos":
+                for f in fs:yield F.Flow(f.src,f.dst,f.service,f.rate*e.mult)
+                continue
+            if kind=="location_tracking":
+                mix=.6+.15*float(e.params[0])
+                for f in fs:yield F.Flow(f.src,f.dst,f.service,f.rate*e.mult*(1-mix))
+                dst=self.topo.hlr[min(len(self.topo.hlr)-1,int(float(e.params[1])*len(self.topo.hlr)))]
+                yield F.Flow(n,dst,Service.LOCATION,target*mix/sum(F.SERVICE_TEMPLATE[Service.LOCATION].values()))
+                continue
+            # Reweight service-category totals, without protocol-level attack scripts.
+            group=(Service.SMS_MT,Service.MOBILITY) if kind=="sms_interception" else (Service.VOICE_INT,)
+            mix=(.65+.15*float(e.params[0])) if kind=="sms_interception" else (.35+.40*float(e.params[0]))
+            high=sum(weight(f) for f in fs if f.service in group);low=total-high
+            if high<=0 or low<=0:
+                for f in fs:yield F.Flow(f.src,f.dst,f.service,f.rate*e.mult)
+                continue
+            for f in fs:
+                scale=target*mix/high if f.service in group else target*(1-mix)/low
+                yield F.Flow(f.src,f.dst,f.service,f.rate*scale)
 
     def step_true(self, t: int, episodes: List[Episode]
                   ) -> Tuple[Dict[int, NodeState], Dict[int, Dict], Dict]:
@@ -282,7 +294,7 @@ def schedule(sim,rng):
         for _ in range(4):
             mult={"sms_interception":(2.,2.5),"location_tracking":(1.5,1.8),
                   "signalling_dos":(30.,40.),"irsf":(3.,4.)}[k]
-            place(sp,k,int(rng.integers(30,61)),mult=float(rng.uniform(*mult)))
+            place(sp,k,int(rng.integers(30,61)),mult=float(rng.uniform(*mult)),params=rng.random(2))
     for role in F.NodeType:
         nodes=[n for n in sim.topo.slaves if sim.topo.nodes[n].ntype==role]
         for soph in F.Sophistication:
@@ -295,12 +307,17 @@ def schedule(sim,rng):
 def features(d):
     d=d.sort_values(["nid","t"]).reset_index(drop=True)
     for name in TEMP:d[name]=np.nan
+    local_temp=[x for x in TEMP if x!="integrity_fail_rate"]
+    for name in local_temp:d["local_"+name]=np.nan
     for _,g in d.groupby("nid",sort=False):
         for base,name in zip(("total_messages","mtype_entropy","in_out_ratio","dest_top1_ratio","n_unique_dest"),
                             ("cv_total","cv_entropy","cv_io","cv_dominance","cv_dest")):
             rr=g[base].rolling(30,min_periods=5)
             d.loc[g.index,name]=(rr.std()/(rr.mean().abs()+1e-9)).to_numpy()
+            lr=g["local_"+base].rolling(30,min_periods=5)
+            d.loc[g.index,"local_"+name]=(lr.std()/(lr.mean().abs()+1e-9)).to_numpy()
         d.loc[g.index,"ar1_total"]=g.total_messages.rolling(30,min_periods=5).corr(g.total_messages.shift(1)).to_numpy()
+        d.loc[g.index,"local_ar1_total"]=g.local_total_messages.rolling(30,min_periods=5).corr(g.local_total_messages.shift(1)).to_numpy()
         d.loc[g.index,"integrity_fail_rate"]=(1-g.integrity_check).rolling(30,min_periods=5).mean().to_numpy()
     for c in ZONE_BASE:
         # Contemporaneous zone peer median is observable at the coordinator.
@@ -350,6 +367,7 @@ def generate(seed,days=DAYS,extended=True):
             if valid:
                 last[n]=rep;fresh[n]=rep;tc[n]=a;mc[n]=b
             r=last.get(n)
+            if r is not None:assert (r.t==t) if valid else (r.t<t)
             vals={c:np.nan for c in F.OWN+list(SUB)}
             if r is not None:
                 vals.update(r.feats);st0=r.state;ms=sum(st0.mtype[5:])
@@ -362,6 +380,10 @@ def generate(seed,days=DAYS,extended=True):
                 consecutive_cu_losses=losses[n],cu_processing_delay=proc if delivered else np.nan,
                 cu_response_time_jitter=float(np.std(jitter[n])) if len(jitter[n])>=3 else np.nan,
                 cu_staleness=age[n],cu_consistency_error=err))
+            # Local ablation receives the pre-transport claimed counters only.
+            vals.update({"local_"+c:v for c,v in rep.feats.items()})
+            lm=sum(rep.state.mtype[5:])
+            vals.update({"local_obs_ratio_"+m:float(rep.state.mtype[F.MT_IDX[m]])/max(lm,1) for m in MAP})
             obs[n]=vals
         # Compare only current authenticated observations. Missing report != zero.
         inv=report_only(fresh,sim.topo);extra=O.telemetry(fresh,tc,mc,sensors,sim.topo)
@@ -387,7 +409,7 @@ def generate(seed,days=DAYS,extended=True):
     return d,eligible,sim.cu.report()
 
 def cols(d,mode):
-    if mode=="local":return list(F.OWN)+list(SUB)+[x for x in TEMP if x!="integrity_fail_rate"]+["node_type_enc"]
+    if mode=="local":return ["local_"+x for x in list(F.OWN)+list(SUB)+[x for x in TEMP if x!="integrity_fail_rate"]]+["node_type_enc"]
     if mode=="base":return BASE
     if mode=="special":return SPECIAL
     if mode=="invariant":return BASE+[c for c in d.columns if any(c==b or c.startswith(b+"__") for b in list(NEW)+list(O.EXTRA))]
