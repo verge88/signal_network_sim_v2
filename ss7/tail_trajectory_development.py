@@ -69,7 +69,7 @@ def cols(d,cls):
        "irsf":tuple(c for c in CONTEXT if any(k in c.lower() for k in ("iam","voice","external","dest","peer","acm","anm","rel","rlc")))
     }[cls]
     selected=set(COMMON+INV+extra)
-    base=list(dict.fromkeys(list(I.ARTICLE)+list(I.F.OWN)+list(selected)+["role_"+r for r in ROLES]))
+    base=list(dict.fromkeys(list(I.ARTICLE)+list(I.F.OWN)+sorted(selected)+["role_"+r for r in ROLES]))
     names=[c for c in base if c in d]+[c for c in d if c.startswith("traj_") and any(c.startswith("traj_"+b+"_") for b in selected)]
     return list(dict.fromkeys(names))
 
@@ -111,9 +111,9 @@ def sample(d,seed,hard_models=None):
             top=neg[np.argsort(-s[neg],kind="stable")[:6000]]
             # Retain hard window neighbors within the same node/contiguous segment
             # to train on both onset and sustained normal bursts.
-            g=groups(d);near=np.unique(np.clip(top[:,None]+np.arange(-2,3)[None,:],0,len(d)-1))
-            same=np.isin(g[near],g[top])
-            near=near[same & (d.label.to_numpy()[near]==0)]
+            g=groups(d);near=np.clip(top[:,None]+np.arange(-2,3)[None,:],0,len(d)-1)
+            same=g[near]==g[top,None]
+            near=np.unique(near[same & (d.label.to_numpy()[near]==0)])
             hard[cls]=np.unique(np.r_[top,near])
     ix=np.unique(np.concatenate([random]+list(hard.values())))
     names=list(dict.fromkeys(sum([cols(d,c) for c in CLASSES],[])+["label","attack","episode_id"]))
