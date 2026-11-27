@@ -1,5 +1,5 @@
 name: SS7 naive compromise observability audit
-# trigger: rank-role-feature-selection-v1
+# trigger: rank-central-kie-role-selection-v1
 on:
   push:
     branches: [ss7-anti-overfit-development]
