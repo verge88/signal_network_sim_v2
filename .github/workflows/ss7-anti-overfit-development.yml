@@ -56,6 +56,10 @@ jobs:
           path: results/worlds
       - uses: actions/download-artifact@v4
         with:
+          pattern: world-compact-211*
+          path: results/worlds
+      - uses: actions/download-artifact@v4
+        with:
           pattern: world-compact-212*
           path: results/worlds
       - run: python -u -m ss7.cu_compact_channel_development train --arm compact --root results/worlds --output results/trained
