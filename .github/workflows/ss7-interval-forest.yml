@@ -1,0 +1,98 @@
+name: SS7 interval forest on five-class CU telemetry
+on:
+  push:
+    branches: [ss7-interval-forest]
+    paths: [.github/workflows/ss7-interval-forest.yml, ss7/interval_forest.py]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-interval-forest-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - name: Check history boundaries and prefix invariance
+        run: |
+          python - <<'PY'
+          from ss7.interval_forest import *
+          d = pd.DataFrame({c: np.arange(18, dtype=float) for c in CHANNELS})
+          d["nid"] = [0]*12+[1]*6
+          d["t"] = list(range(6))+list(range(8,14))+list(range(6))
+          x = interval_features(d)
+          c = CHANNELS[0]
+          assert x[c+"_mean4"].iloc[3] == 1.5
+          assert x[c+"_trend4"].iloc[3] == 1
+          assert x[c+"_mean4"].iloc[[0,6,12]].isna().all()
+          for stop in (4,10,15):
+              pd.testing.assert_frame_equal(x.iloc[:stop], interval_features(d.iloc[:stop]))
+          PY
+      - run: python -u -m ss7.interval_forest train --output results/trained
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-interval-forest-trained
+          path: results/trained
+  test:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        seed: [19201,19202,19203,19204,19205,19206,19207,19208]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-integrated-cu-trained
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45887176159
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-interval-forest-trained
+          path: results/trained
+      - run: |
+          set -o pipefail
+          mkdir -p results/seed
+          python -u -m ss7.interval_forest test --seed ${{ matrix.seed }} --frozen results/frozen/models.joblib --models results/trained/models.joblib --output results/seed 2>&1 | tee results/seed/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: interval-test-seed-${{ matrix.seed }}
+          path: results/seed
+  aggregate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: interval-test-seed-*
+          path: results/collected
+      - run: python -u -m ss7.interval_forest aggregate --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-interval-forest-summary
+          path: results/summary
