@@ -1,0 +1,118 @@
+name: SS7 final frozen-development holdout
+on:
+  push:
+    branches: [ss7-anti-overfit-robust-dev]
+    paths:
+      - ss7/.final-frozen-dev-trigger
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-final-frozen-development-holdout
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+
+jobs:
+  holdout_worlds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        seed: [21401,21402,21403,21404]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/cu_compact_channel_development.py
+      - run: python -u -m ss7.cu_compact_channel_development selftest
+      - run: python -u -m ss7.cu_compact_channel_development generate --arm compact --seed ${{ matrix.seed }} --output results/world
+      - uses: actions/upload-artifact@v4
+        with:
+          name: primary-holdout-world-compact-${{ matrix.seed }}
+          path: results/world
+          retention-days: 30
+
+  train_frozen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46063674571
+          pattern: world-compact-210*
+          path: results/worlds
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46063674571
+          pattern: world-compact-211*
+          path: results/worlds
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46063674571
+          pattern: world-compact-212*
+          path: results/worlds
+      - run: python -u -m ss7.cu_compact_channel_development train --arm compact --root results/worlds --output results/trained
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final-frozen-development-models
+          path: results/trained
+          retention-days: 30
+
+  evaluate_primary:
+    needs: [holdout_worlds, train_frozen]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46063674571
+          pattern: world-compact-212*
+          path: results/worlds
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: primary-holdout-world-compact-*
+          path: results/incoming
+      - run: |
+          for seed in 21401 21402 21403 21404; do
+            mv results/incoming/primary-holdout-world-compact-${seed} results/worlds/world-compact-${seed}
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          name: final-frozen-development-models
+          path: results/trained
+      - run: |
+          python - <<'PY'
+          from pathlib import Path
+          import ss7.cu_compact_channel_development as M
+          M.evaluate_final(
+              Path("results/worlds"), Path("results/trained"), Path("results/holdout"), "compact",
+              (21401,21402,21403,21404)
+          )
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-primary-untouched-holdout-results
+          path: results/holdout
+          retention-days: 30
