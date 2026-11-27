@@ -38,6 +38,7 @@ TRAIN=(21001,21002,21003)
 RANK=(21101,21102)
 CAL=(21201,21202)
 TEST=(21301,21302)
+HOLDOUT=(21401,21402,21403,21404,21405,21406,21407,21408)
 DAYS=1.
 # Anti-overfit protocol: temporally thin highly autocorrelated windows before fitting.
 # Train/cal/test remain different simulator worlds; CAL is used only for diagnostics and thresholds.
@@ -1828,7 +1829,7 @@ def aggregate(root,out):
         cu[["seed","arm","delivery","max_mean_link_fraction","response_bytes_min","response_bytes_max","wire_bytes"]].to_string(index=False),flush=True)
 
 def selftest():
-    assert len(set(TRAIN+RANK+CAL+TEST))==len(TRAIN+RANK+CAL+TEST)
+    assert len(set(TRAIN+RANK+CAL+TEST+HOLDOUT))==len(TRAIN+RANK+CAL+TEST+HOLDOUT)
     cfg=F.SimConfig(seed=TRAIN[0],days=DAYS)
     for arm in ARMS:
         sim=IntegratedSim(cfg,F.RngBook(cfg.seed),arm)
@@ -1860,7 +1861,7 @@ def main():
     a=p.parse_args();out=Path(a.output);out.mkdir(parents=True,exist_ok=True)
     if a.mode=="selftest":selftest()
     elif a.mode=="generate":
-        assert a.seed in TRAIN+RANK+CAL+TEST
+        assert a.seed in TRAIN+RANK+CAL+TEST+HOLDOUT
         d,e,cu=generate(a.seed,arm=a.arm);joblib.dump((d,e,cu),out/"world.joblib",compress=2)
         print("WORLD",a.arm,a.seed,len(d),d.attack.value_counts().to_dict(),cu,flush=True)
     elif a.mode=="train":train(Path(a.root),out,a.arm)
