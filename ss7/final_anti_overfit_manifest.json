@@ -1,0 +1,68 @@
+{
+  "protocol_version": "ss7-final-anti-overfit-v1",
+  "architecture": "hierarchical compact-CU KIE detector with calibrated specialist cascade",
+  "selection": {
+    "train": [
+      21001,
+      21002,
+      21003
+    ],
+    "rank": [
+      21101,
+      21102
+    ],
+    "calibration": [
+      21201,
+      21202
+    ],
+    "previously_exploratory_test": [
+      21301,
+      21302
+    ],
+    "primary_untouched_holdout": [
+      21401,
+      21402,
+      21403,
+      21404
+    ],
+    "reserve_untouched_confirmation": [
+      21405,
+      21406,
+      21407,
+      21408
+    ]
+  },
+  "final_policy": {
+    "name": "final_linear_scp",
+    "naive_base": {
+      "estimator": "LogisticRegression",
+      "C": 0.08,
+      "scaler": "RobustScaler(10,90)",
+      "features": "causal drift_*_z plus node_type_enc",
+      "reason": "lower TRAIN->CAL generalization gap than nonlinear HGB naive expert"
+    },
+    "robust_supplement": {
+      "role": "SCP",
+      "feature": "obs_ratio_ATI",
+      "transform": "absolute causal robust-z, 60-window rolling mean",
+      "selection_gate": "minimum AUC across TRAIN+RANK worlds >= 0.70",
+      "observed_min_auc": 0.776026
+    },
+    "budgets": {
+      "raw_false_windows_per_day_total": 20,
+      "raw_false_windows_per_day_base": 16,
+      "raw_budget_reserved_for_scp_supplement": 4,
+      "false_notifications_per_day": 2
+    }
+  },
+  "rejected": {
+    "route_service_sketch": "rejected: failed five-world robustness gate; removed from final CU payload",
+    "unstable_role_specialists": [
+      "IGW",
+      "SP",
+      "STP"
+    ],
+    "empirical_tail_fusion": "rejected: finite-sample saturation caused unreachable thresholds"
+  },
+  "holdout_rule": "Primary holdout is evaluated exactly once with evaluate_final; no model/feature/threshold selection from 21401-21404. Seeds 21405-21408 remain reserved for unchanged-policy confirmation."
+}
