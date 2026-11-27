@@ -14,7 +14,7 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline
-from sklearn.metrics import precision_score, recall_score, f1_score
+from sklearn.metrics import precision_score, recall_score, f1_score, average_precision_score, roc_auc_score
 from ss7 import fix as F
 from ss7 import observability_audit_development as O
 from ss7 import dual_channel_behavior_development as D
@@ -36,8 +36,7 @@ TRAIN=(21001,21002,21003)
 RANK=(21101,21102)
 CAL=(21201,21202)
 TEST=(21301,21302)
-DAYS=1.
-KINDS=("sms_interception","location_tracking","signalling_dos","irsf","compromise")
+DAYS=1.\n# Anti-overfit protocol: temporally thin highly autocorrelated windows before fitting.\n# Train/cal/test remain different simulator worlds; CAL is used only for diagnostics and thresholds.\nTRAIN_STRIDE=3\nTRAIN_NORMAL_PER_WORLD=12000\nKINDS=("sms_interception","location_tracking","signalling_dos","irsf","compromise")
 CU=("cu_delivered","cu_rtt_delay","cu_req_delay","cu_resp_delay","cu_combined_loss_prob",
     "integrity_check","consecutive_cu_losses","cu_processing_delay","cu_response_time_jitter",
     "cu_staleness","cu_consistency_error")
@@ -494,22 +493,39 @@ def cols(d,mode):
     raise ValueError(mode)
 
 def matrix(d,names):
-    forbidden={"label","episode_id","attack","sophistication","nid","t","zone","ntype","uid"}
+    forbidden={"label","episode_id","attack","sophistication","nid","t","zone","ntype","uid","world_node"}
     assert not forbidden.intersection(names) and not any(c.startswith(("audit_","hidden_","true_","gt_")) for c in names)
     return d[names].to_numpy(float)
 
+def target_y(d,target):
+    return (d.attack==("compromise" if target=="comp" else target)).to_numpy(int) if target!="all" else d.label.to_numpy(int)
+
 def fit(d,mode,target,kind):
-    names=cols(d,mode);y=(d.attack==("compromise" if target=="comp" else target)).to_numpy(int) if target!="all" else d.label.to_numpy(int)
-    w=np.ones(len(d));p=y==1;counts=d.loc[p,"uid"].value_counts()
-    w[p]=1/d.loc[p,"uid"].map(counts).to_numpy()
-    for k in (0,1):w[y==k]*=len(y)/(2*w[y==k].sum())
-    if kind=="rf":est=RandomForestClassifier(n_estimators=80,min_samples_leaf=4,n_jobs=2,random_state=42)
-    elif kind=="gb":est=GradientBoostingClassifier(n_estimators=60,max_depth=2,random_state=42)
-    else:est=HistGradientBoostingClassifier(max_iter=80,max_leaf_nodes=15,min_samples_leaf=25,early_stopping=False,random_state=42)
+    names=cols(d,mode);y=target_y(d,target)
+    # Weight independent causal units rather than every highly correlated row.
+    w=np.ones(len(d));p=y==1;n=~p
+    if p.any():
+        g=d.loc[p,"uid"];counts=g.value_counts()
+        w[p]=1/g.map(counts).to_numpy()
+    if n.any():
+        g=d.loc[n,"uid"].where(d.loc[n,"label"].astype(bool),d.loc[n,"world_node"])
+        counts=g.value_counts();w[n]=1/g.map(counts).to_numpy()
+    for k in (0,1):
+        m=y==k
+        if m.any():w[m]*=len(y)/(2*w[m].sum())
+    # Lower-capacity learners reduce memorization of simulator-world details.
+    if kind=="rf":
+        est=RandomForestClassifier(n_estimators=120,max_depth=10,min_samples_leaf=20,
+            max_features="sqrt",bootstrap=True,max_samples=.70,n_jobs=2,random_state=42)
+    elif kind=="gb":
+        est=GradientBoostingClassifier(n_estimators=80,learning_rate=.04,max_depth=1,
+            min_samples_leaf=30,subsample=.65,max_features="sqrt",random_state=42)
+    else:
+        est=HistGradientBoostingClassifier(max_iter=70,learning_rate=.05,max_leaf_nodes=7,
+            min_samples_leaf=50,l2_regularization=2.0,early_stopping=False,random_state=42)
     model=make_pipeline(SimpleImputer(strategy="median",keep_empty_features=True),est)
     model.fit(matrix(d,names),y,**{model.steps[-1][0]+"__sample_weight":w})
     return names,model
-
 OTHER=KINDS[:-1]
 MODELS=("local","article_raw","integrated_raw","dual_tail","dual_tail_confirm","five_tail","five_role_tail")
 def load(root,arm,seed):
@@ -518,22 +534,55 @@ def load(root,arm,seed):
 def train(root,out,arm):
     data=[]
     for seed in TRAIN:
-        d,e,cu=load(root,arm,seed);d["uid"]=str(seed)+":"+d.episode_id.astype(str)
-        pos=np.flatnonzero(d.label.to_numpy()==1);neg=np.flatnonzero(d.label.to_numpy()==0)
-        ix=np.sort(np.r_[pos,np.random.default_rng(seed).choice(neg,min(18000,len(neg)),replace=False)])
-        data.append(d.iloc[ix])
+        d,e,cu=load(root,arm,seed)
+        d["uid"]=str(seed)+":"+d.episode_id.astype(str)
+        d["world_node"]=str(seed)+":"+d.nid.astype(str)
+        phase=seed%TRAIN_STRIDE
+        thin=(d.t.to_numpy()%TRAIN_STRIDE)==phase
+        pos=np.flatnonzero((d.label.to_numpy()==1)&thin)
+        neg=np.flatnonzero((d.label.to_numpy()==0)&thin)
+        neg=np.random.default_rng(seed).choice(neg,min(TRAIN_NORMAL_PER_WORLD,len(neg)),replace=False)
+        ix=np.sort(np.r_[pos,neg]);data.append(d.iloc[ix])
     d=pd.concat(data,ignore_index=True)
     spec={"local":("local","all","rf"),"general":("base","all","rf"),
           "article_rf":("special","comp","rf"),"article_gb":("special","comp","gb"),
           "invariant":("invariant","comp","hgb"),"behavior":("behavior","comp","hgb")}
     spec.update({k:("base",k,"hgb") for k in OTHER})
     models={}
-    for n,s in spec.items():
-        models[n]=fit(d,*s);print("FIT",arm,n,flush=True)
+    for n,sp in spec.items():
+        models[n]=fit(d,*sp);print("FIT",arm,n,flush=True)
+
+    # Train-vs-independent-CAL diagnostics. TEST is never loaded here.
+    cal=[]
+    for seed in CAL:
+        q,_,_=load(root,arm,seed)
+        q["uid"]=str(seed)+":"+q.episode_id.astype(str)
+        q["world_node"]=str(seed)+":"+q.nid.astype(str)
+        cal.append(q)
+    cal=pd.concat(cal,ignore_index=True)
+    diag=[]
+    for name,(mode,target,kind) in spec.items():
+        names,model=models[name]
+        for split,frame in (("train",d),("cal",cal)):
+            y=target_y(frame,target);score=model.predict_proba(matrix(frame,names))[:,1]
+            diag.append(dict(model=name,split=split,n=len(frame),positive=int(y.sum()),
+                auc_roc=roc_auc_score(y,score) if len(np.unique(y))==2 else np.nan,
+                auc_pr=average_precision_score(y,score) if y.sum() else np.nan,
+                f1_at_05=f1_score(y,score>=.5,zero_division=0)))
+    dg=pd.DataFrame(diag)
+    wide=dg.pivot(index="model",columns="split",values="auc_pr")
+    gaps=(wide["train"]-wide["cal"]).sort_values(ascending=False)
+    print("GENERALIZATION\n",dg.to_string(index=False),flush=True)
+    print("AUC_PR_GAP\n",gaps.to_string(),flush=True)
+    dg.to_csv(out/"generalization.csv",index=False)
     joblib.dump(models,out/"models.joblib")
     (out/"features.json").write_text(json.dumps({n:v[0] for n,v in models.items()},indent=2))
+    (out/"anti_overfit.json").write_text(json.dumps(dict(train_stride=TRAIN_STRIDE,
+        normal_per_world=TRAIN_NORMAL_PER_WORLD,
+        rf=dict(max_depth=10,min_samples_leaf=20,max_features="sqrt",max_samples=.70),
+        gb=dict(max_depth=1,min_samples_leaf=30,learning_rate=.04,subsample=.65),
+        hgb=dict(max_leaf_nodes=7,min_samples_leaf=50,learning_rate=.05,l2_regularization=2.0)),indent=2))
     print("TRAIN",arm,len(d),d.attack.value_counts().to_dict(),flush=True)
-
 def predict(d,models):
     s={n:m.predict_proba(matrix(d,c))[:,1] for n,(c,m) in models.items()}
     for n,v in s.items():assert np.isfinite(v).all(),n
