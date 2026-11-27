@@ -1,0 +1,97 @@
+name: SS7 final untouched holdout
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ss7-final-untouched-holdout
+  cancel-in-progress: false
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  worlds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      max-parallel: 15
+      matrix:
+        seed: [21001,21002,21003,21101,21102,21201,21202,21401,21402,21403,21404,21405,21406,21407,21408]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/cu_compact_channel_development.py
+      - run: python -u -m ss7.cu_compact_channel_development selftest
+      - run: python -u -m ss7.cu_compact_channel_development generate --arm compact --seed ${{ matrix.seed }} --output results/world
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final-world-compact-${{ matrix.seed }}
+          path: results/world
+          retention-days: 14
+
+  train:
+    needs: worlds
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: final-world-compact-21*
+          path: results/incoming
+      - run: |
+          mkdir -p results/worlds
+          for seed in 21001 21002 21003 21101 21102 21201 21202 21401 21402 21403 21404 21405 21406 21407 21408; do
+            mv results/incoming/final-world-compact-${seed} results/worlds/world-compact-${seed}
+          done
+      - run: python -u -m ss7.cu_compact_channel_development train --arm compact --root results/worlds --output results/trained
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final-frozen-models
+          path: results/trained
+          retention-days: 14
+
+  evaluate_holdout:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: final-world-compact-21*
+          path: results/incoming
+      - run: |
+          mkdir -p results/worlds
+          for seed in 21101 21102 21201 21202 21401 21402 21403 21404 21405 21406 21407 21408; do
+            mv results/incoming/final-world-compact-${seed} results/worlds/world-compact-${seed}
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          name: final-frozen-models
+          path: results/trained
+      - run: |
+          python - <<'PY'
+          from pathlib import Path
+          import ss7.cu_compact_channel_development as M
+          M.TEST=(21401,21402,21403,21404,21405,21406,21407,21408)
+          M.evaluate(Path("results/worlds"),Path("results/trained"),Path("results/holdout"),"compact")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-final-untouched-holdout-results
+          path: results/holdout
+          retention-days: 30
