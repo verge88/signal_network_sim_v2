@@ -1,4 +1,4 @@
-name: SS7 route-service sketch RANK observability audit
+name: SS7 zero-overhead grouped-route RANK observability audit
 on:
   push:
     branches: [ss7-anti-overfit-development]
@@ -8,7 +8,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: ss7-route-sketch-rank-audit-${{ github.ref }}
+  group: ss7-group-route-rank-audit-${{ github.ref }}
   cancel-in-progress: true
 env:
   OMP_NUM_THREADS: "2"
@@ -34,7 +34,7 @@ jobs:
       - run: python -u -m ss7.cu_compact_channel_development generate --arm compact --seed ${{ matrix.seed }} --output results/world
       - uses: actions/upload-artifact@v4
         with:
-          name: route-sketch-world-compact-${{ matrix.seed }}
+          name: group-route-world-compact-${{ matrix.seed }}
           path: results/world
           retention-days: 7
 
@@ -50,15 +50,15 @@ jobs:
       - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
       - uses: actions/download-artifact@v4
         with:
-          pattern: route-sketch-world-compact-*
+          pattern: group-route-world-compact-*
           path: results/incoming
       - run: |
           mkdir -p results/worlds
-          mv results/incoming/route-sketch-world-compact-21101 results/worlds/world-compact-21101
-          mv results/incoming/route-sketch-world-compact-21102 results/worlds/world-compact-21102
+          mv results/incoming/group-route-world-compact-21101 results/worlds/world-compact-21101
+          mv results/incoming/group-route-world-compact-21102 results/worlds/world-compact-21102
       - run: python -u -m ss7.naive_observability_diagnostic --root results/worlds --output results/audit
       - uses: actions/upload-artifact@v4
         with:
-          name: ss7-route-sketch-rank-audit
+          name: ss7-group-route-rank-audit
           path: results/audit
           retention-days: 7
