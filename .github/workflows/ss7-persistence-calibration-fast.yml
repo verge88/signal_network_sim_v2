@@ -1,4 +1,5 @@
 name: SS7 persistence calibration fast check
+# reuses frozen worlds from run 46035508077
 on:
   push:
     branches: [ss7-anti-overfit-development]
