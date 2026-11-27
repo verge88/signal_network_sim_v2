@@ -1,0 +1,91 @@
+name: SS7 quick tail screen (15 minute cap)
+on:
+  push:
+    branches: [ss7-quick-tail-screen]
+    paths: [.github/workflows/ss7-quick-tail-screen.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 13
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        seed: [20101, 20102]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-integrated-cu-trained
+          path: results/frozen
+          github-token: ${{ github.token }}
+          run-id: 45887176159
+      - uses: actions/download-artifact@v4
+        with:
+          name: ss7-five-specialist-trained
+          path: results/special
+          github-token: ${{ github.token }}
+          run-id: 45956489605
+      - name: Smoke test causal smoothing and scenario balance
+        run: |
+          python - <<'PY'
+          import numpy as np
+          import pandas as pd
+          import ss7.quick_tail_screen as Q
+          d=pd.DataFrame(dict(nid=[1]*10+[2]*10,t=list(range(5))+list(range(6,11))+list(range(10))))
+          p=np.linspace(.05,.95,20)
+          q=Q.smooth(d,p,5)
+          assert np.isclose(q[5],p[5]) and np.isclose(q[10],p[10])
+          for n in (4,8,13,19):
+              np.testing.assert_allclose(Q.smooth(d.iloc[:n],p[:n],5),q[:n])
+          cfg=Q.F.SimConfig(seed=20100,days=Q.DAYS)
+          book=Q.F.RngBook(20100)
+          sim=Q.I.IntegratedSim(cfg,book)
+          eps=Q.schedule(sim,cfg,book["episode"],True)
+          comp=[e for e in eps if e.kind=="compromise"]
+          assert len(comp)==20
+          assert len({(sim.topo.nodes[e.nid].ntype.value,e.sophistication,e.family) for e in comp})==20
+          assert all(sum(e.kind==c for e in eps)==2 for c in Q.I.OTHER)
+          print("Causal smoothing and reduced factorial schedule passed")
+          PY
+      - name: Screen frozen models
+        run: |
+          set -o pipefail
+          mkdir -p results/seed
+          python -u -m ss7.quick_tail_screen screen --seed ${{ matrix.seed }} --frozen results/frozen/models.joblib --special results/special/models.joblib --output results/seed 2>&1 | tee results/seed/screen.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quick-tail-seed-${{ matrix.seed }}
+          path: results/seed
+  aggregate:
+    needs: screen
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: quick-tail-seed-*
+          path: results/collected
+      - run: python -u -m ss7.quick_tail_screen aggregate --input results/collected --output results/summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-quick-tail-summary
+          path: results/summary
