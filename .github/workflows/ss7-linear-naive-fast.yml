@@ -1,0 +1,51 @@
+name: SS7 linear-naive anti-overfit fast check
+on:
+  push:
+    branches: [ss7-anti-overfit-linear-naive]
+    paths:
+      - ss7/cu_compact_channel_development.py
+      - .github/workflows/ss7-linear-naive-fast.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ss7-linear-naive-fast-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+jobs:
+  train_evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/cu_compact_channel_development.py
+      - run: python -u -m ss7.cu_compact_channel_development selftest
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46063674571
+          pattern: world-compact-210*
+          path: results/worlds
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46063674571
+          pattern: world-compact-21[123]*
+          path: results/worlds
+      - run: python -u -m ss7.cu_compact_channel_development train --arm compact --root results/worlds --output results/trained
+      - run: python -u -m ss7.cu_compact_channel_development evaluate --arm compact --root results/worlds --models results/trained --output results/eval
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linear-naive-fast-results
+          path: |
+            results/trained/generalization.csv
+            results/eval
+          retention-days: 7
