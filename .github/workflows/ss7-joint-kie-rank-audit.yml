@@ -3,7 +3,7 @@ on:
   push:
     branches: [ss7-anti-overfit-development]
     paths:
-      - .github/workflows/ss7-route-sketch-rank-audit.yml
+      - .github/workflows/ss7-joint-kie-rank-audit.yml
   workflow_dispatch:
 permissions:
   contents: read
