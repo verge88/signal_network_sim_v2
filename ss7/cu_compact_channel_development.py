@@ -638,24 +638,72 @@ def channels(d,p,ref,mode):
         return {k:ev[k] for k in ("general","invariant","behavior")},mode=="dual_tail_confirm"
     return {k:ev[k] for k in OTHER+("invariant","behavior")},True
 
-def combined(d,ch,confirm,negative_only=False):
+def streak_score(d,s,length=3):
+    """Minimum score across a causal same-node run of *length* windows."""
+    if length<1:raise ValueError("length must be positive")
+    n=d.nid.to_numpy();t=d.t.to_numpy()
+    z=np.full(len(d),-np.inf)
+    if length==1:
+        z[:]=s;return z
+    for j in range(length-1,len(d)):
+        a=j-length+1
+        if n[a]!=n[j] or t[j]-t[a]!=length-1:continue
+        if np.all(n[a:j+1]==n[j]) and np.all(np.diff(t[a:j+1])==1):
+            z[j]=float(np.min(s[a:j+1]))
+    return z
+
+def combined(d,ch,confirm,negative_only=False,streak_len=3):
     neg=(d.label.to_numpy()==0) if negative_only else np.ones(len(d),bool)
     vals=[np.where(neg,v,-np.inf) for v in ch.values()]
     s=np.maximum.reduce(vals)
-    z=np.maximum.reduce([triple(d,v) for v in vals]) if confirm else triple(d,s)
+    # Specialized fusion must be confirmed within one channel. This prevents
+    # alternating weak channels from forming a synthetic multi-window alarm.
+    z=np.maximum.reduce([streak_score(d,v,streak_len) for v in vals]) if confirm else streak_score(d,s,streak_len)
     return s,z
 
-def cut(frames,preds,ref,mode,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
-    # Use the full budget, matched for all methods, and ensure both constraints
-    # on each independent operating-calibration world. No tuning on test.
-    candidates=[]
+def cut_policy(frames,preds,ref,mode,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
+    """Calibrate raw score and persistence separately on independent CAL worlds.
+
+    The old rule used max(raw_threshold, notification_threshold), so the small
+    notification budget forced the score threshold into the extreme tail.
+    Here the score threshold alone enforces the raw-window budget. We then
+    choose the shortest predeclared persistence length that satisfies the
+    notification budget on every CAL world. No TEST labels or scores are used.
+    """
+    raw_candidates=[]
+    prepared=[]
     for d,p in zip(frames,preds):
         ch,confirm=channels(d,p,ref,mode)
-        s,z=combined(d,ch,confirm,negative_only=True)
-        candidates.append(threshold(s[np.isfinite(s)],raw,elapsed(d)))
-        b=bucket_peaks(d,z);b=b[np.isfinite(b)]
-        if len(b):candidates.append(threshold(b,notice,elapsed(d)))
-    return float(max(candidates))
+        s,_=combined(d,ch,confirm,negative_only=True,streak_len=3)
+        raw_candidates.append(threshold(s[np.isfinite(s)],raw,elapsed(d)))
+        prepared.append((d,ch,confirm))
+    thr=float(max(raw_candidates))
+
+    chosen=None
+    diagnostics=[]
+    for length in (3,5,7,9,12):
+        rates=[]
+        for d,ch,confirm in prepared:
+            s,z=combined(d,ch,confirm,negative_only=True,streak_len=length)
+            rate=float(len(notify(d,z,thr))/elapsed(d))
+            rates.append(rate)
+        diagnostics.append(dict(streak=length,worst_notifications_day=max(rates),rates=rates))
+        if max(rates)<=notice:
+            chosen=length;break
+
+    # Rare finite-sample fallback: keep the longest persistence and increase
+    # only as much as required by the notification budget.
+    if chosen is None:
+        chosen=12
+        extra=[]
+        for d,ch,confirm in prepared:
+            _,z=combined(d,ch,confirm,negative_only=True,streak_len=chosen)
+            b=bucket_peaks(d,z);b=b[np.isfinite(b)]
+            if len(b):extra.append(threshold(b,notice,elapsed(d)))
+        if extra:thr=max(thr,float(max(extra)))
+
+    return dict(threshold=float(thr),streak=int(chosen),diagnostics=diagnostics)
+
 
 def class_name(k):
     return "compromise" if k in ("invariant","behavior","article_special") else k
@@ -665,26 +713,39 @@ def evaluate(root,modelpath,out,arm):
     ranks=[load(root,arm,s)[0] for s in RANK];ref=fit_tails(ranks,[predict(d,models) for d in ranks])
     del ranks
     cal=[load(root,arm,s)[0] for s in CAL];ps=[predict(d,models) for d in cal]
-    cuts={n:cut(cal,ps,ref,n) for n in MODELS}
-    # Conservative old half-budget raw fusion as matched-data reference.
-    cuts["integrated_half"]=cut(cal,ps,ref,"integrated_raw",RAW_BUDGET*.5,INCIDENT_BUDGET*.5)
-    print("CUTS",arm,cuts,flush=True)
+    policies={n:cut_policy(cal,ps,ref,n) for n in MODELS}
+    policies["integrated_half"]=cut_policy(cal,ps,ref,"integrated_raw",RAW_BUDGET*.5,INCIDENT_BUDGET*.5)
+
+    controls=[]
+    for seed,d,p in zip(CAL,cal,ps):
+        for name,policy in policies.items():
+            n="integrated_raw" if name=="integrated_half" else name
+            ch,confirm=channels(d,p,ref,n)
+            s,z=combined(d,ch,confirm,negative_only=True,streak_len=policy["streak"])
+            controls.append(dict(seed=seed,arm=arm,model=name,
+                threshold=policy["threshold"],streak=policy["streak"],
+                false_windows_day=float((s>policy["threshold"]).sum()/elapsed(d)),
+                false_notifications_day=float(len(notify(d,z,policy["threshold"]))/elapsed(d))))
+    controls=pd.DataFrame(controls)
+    controls.to_csv(out/"calibration_controls.csv",index=False)
+    print("POLICIES",arm,json.dumps(policies,indent=2),flush=True)
+    print("CALIBRATION\n",controls.to_string(index=False),flush=True)
     del cal,ps
+
     rows=[];episodes=[];overhead=[]
     for seed in TEST:
         d,eligible,cu=load(root,arm,seed);overhead.append(dict(seed=seed,**cu))
         p=predict(d,models)
-        for name,thr in cuts.items():
+        for name,policy in policies.items():
             n="integrated_raw" if name=="integrated_half" else name
-            ch,confirm=channels(d,p,ref,n);s,z=combined(d,ch,confirm)
+            thr=policy["threshold"];streak_len=policy["streak"]
+            ch,confirm=channels(d,p,ref,n);s,z=combined(d,ch,confirm,streak_len=streak_len)
             m,det=metrics(d,s,z,thr,eligible);fire=s>thr
-            m.update(seed=seed,arm=arm,model=name,
+            m.update(seed=seed,arm=arm,model=name,streak=streak_len,
                 window_f1=f1_score(d.label,fire,zero_division=0),
                 budget_ok=(m["false_windows_day"]<=RAW_BUDGET and m["false_notifications_day"]<=INCIDENT_BUDGET))
             rows.append(m)
-            # Attribute only confirmed detections; common alarm rule, never use
-            # ground truth to choose a channel. Non-specialized scores are untyped.
-            names=list(ch);zz=np.column_stack([triple(d,ch[k]) for k in names])
+            names=list(ch);zz=np.column_stack([streak_score(d,ch[k],streak_len) for k in names])
             for i,e in eligible.items():
                 mask=d.episode_id.to_numpy()==i;predicted="missed"
                 if i in det:
@@ -698,8 +759,9 @@ def evaluate(root,modelpath,out,arm):
     pd.DataFrame(rows).to_csv(out/"metrics.csv",index=False)
     pd.DataFrame(episodes).to_csv(out/"episodes.csv",index=False)
     (out/"cu.json").write_text(json.dumps(overhead,indent=2))
-    (out/"thresholds.json").write_text(json.dumps(cuts,indent=2))
+    (out/"thresholds.json").write_text(json.dumps(policies,indent=2))
     print("METRICS",pd.DataFrame(rows).to_string(index=False),flush=True)
+
 
 def aggregate(root,out):
     m=pd.concat([pd.read_csv(root/f"eval-{a}"/"metrics.csv") for a in ARMS],ignore_index=True)
