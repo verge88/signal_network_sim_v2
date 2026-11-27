@@ -1474,6 +1474,19 @@ def selftest():
         assert len(sim.polls)==len(sim.topo.slaves)
         _,p=sim.cu.exchange(1,{},set(sim.topo.linksets));assert not any(x[0] for x in p.values())
         assert all(payload_bytes(sim.topo,n,True)<payload_bytes(sim.topo,n,False) for n in sim.topo.slaves)
+        # Every compromise role must execute an action sourced by that node;
+        # sophistication affects masking only, never the physical action.
+        for role in F.NodeType:
+            nodes=[n for n in sim.topo.slaves if sim.topo.nodes[n].ntype==role]
+            assert nodes,role
+            n=nodes[0]
+            ep=Episode(kind="compromise",nid=n,t0=10,t1=20,hidden_rate=1.0,
+                       sophistication=F.Sophistication.NAIVE,
+                       params=np.array([.37,.61]))
+            action=sim.compromise_action(n,ep,extra_rng(cfg.seed,77,n))
+            assert action is not None,(role,n)
+            flow,path=action
+            assert flow.src==n and path[0]==n and path[-1]==flow.dst and len(path)>=2
     a={(0,(1,2),F.MT_IDX["IAM"]):4,(0,(1,2),F.MT_IDX["REL"]):3}
     b={((1,2),(2,3),F.MT_IDX["IAM"]):4}
     assert group_counts(a)=={(0,(1,2),0):7}
