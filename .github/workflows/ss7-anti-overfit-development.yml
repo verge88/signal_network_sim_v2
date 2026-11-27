@@ -1,8 +1,12 @@
 name: SS7 anti-overfit compact validation
 on:
-  # Full regeneration is confirmatory and intentionally manual during development.
-  # Fast frozen-world checks run automatically on code changes.
+  # Full regeneration is confirmatory. Ordinary code edits use the fast
+  # frozen-world workflow; touching the sentinel below requests one full run.
   workflow_dispatch:
+  push:
+    branches: [ss7-anti-overfit-development]
+    paths:
+      - ss7/.full-regeneration-trigger
 permissions:
   contents: read
 concurrency:
