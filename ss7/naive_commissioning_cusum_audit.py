@@ -104,6 +104,8 @@ def evaluate(d,eligible,s,thr):
                 by_role=by_role,by_rate=by_rate)
 
 def main(root,out,seeds):
+    seeds=tuple(int(x) for x in seeds)
+    if len(seeds)<2:raise ValueError("need at least two RANK worlds")
     worlds={s:C.load(root,"compact",s) for s in seeds}
     rows=[]
     for variant in VARIANTS:
@@ -115,11 +117,14 @@ def main(root,out,seeds):
                 for h in HORIZONS:
                     prepared[(seed,h)]=finite_cusum(d,margin,h)
             for h in HORIZONS:
-                for a,b in ((seeds[0],seeds[1]),(seeds[1],seeds[0])):
-                    da,_,_=worlds[a];db,eb,_=worlds[b]
-                    thr=calibrate(da,prepared[(a,h)])
+                for b in seeds:
+                    cals=[a for a in seeds if a!=b]
+                    thresholds=[calibrate(worlds[a][0],prepared[(a,h)]) for a in cals]
+                    thr=float(max(thresholds))
+                    db,eb,_=worlds[b]
                     m=evaluate(db,eb,prepared[(b,h)],thr)
-                    rows.append(dict(variant=variant,q=q,horizon=h,cal_seed=a,eval_seed=b,
+                    rows.append(dict(variant=variant,q=q,horizon=h,
+                        cal_seed=";".join(map(str,cals)),eval_seed=b,
                         threshold=thr,episodes=m["episodes"],detected=m["detected"],recall=m["recall"],
                         false_windows_day=m["false_windows_day"],
                         false_notifications_day=m["false_notifications_day"],
@@ -144,6 +149,6 @@ if __name__=="__main__":
     ap=argparse.ArgumentParser()
     ap.add_argument("--root",type=Path,required=True)
     ap.add_argument("--output",type=Path,required=True)
-    ap.add_argument("--seeds",type=int,nargs=2,required=True)
+    ap.add_argument("--seeds",type=int,nargs="+",required=True)
     a=ap.parse_args();a.output.mkdir(parents=True,exist_ok=True)
     main(a.root,a.output,tuple(a.seeds))
