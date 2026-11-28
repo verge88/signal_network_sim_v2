@@ -1,0 +1,43 @@
+name: SS7 commissioning CUSUM preliminary RANK check
+on:
+  push:
+    branches: [ss7-anti-overfit-development]
+    paths:
+      - .github/workflows/ss7-commissioning-cusum-preliminary.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  SS7_ROLE_ABUSE_V2: "1"
+  SS7_DEPLOY_BASELINE: "180"
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46128543747
+          pattern: commissioning-world-compact-2310*
+          path: results/incoming
+      - run: |
+          mkdir -p results/worlds
+          mv results/incoming/commissioning-world-compact-23101 results/worlds/world-compact-23101
+          mv results/incoming/commissioning-world-compact-23102 results/worlds/world-compact-23102
+      - run: python -m py_compile ss7/naive_commissioning_cusum_audit.py ss7/naive_role_union_rank_audit.py
+      - run: python -u -m ss7.naive_commissioning_cusum_audit --root results/worlds --output results/audit --seeds 23101 23102
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-commissioning-cusum-preliminary
+          path: results/audit
+          retention-days: 7
