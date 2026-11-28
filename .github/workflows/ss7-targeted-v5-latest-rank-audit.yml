@@ -1,5 +1,5 @@
 name: SS7 targeted-abuse v5 latest RANK audit
-# frozen source run: 46129732243
+# frozen source run: 46129732243; relay KIE route-sketch audit
 on:
   push:
     branches: [ss7-anti-overfit-development]
