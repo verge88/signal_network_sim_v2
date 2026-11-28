@@ -303,7 +303,7 @@ class IntegratedSim(O.CorrectedSim):
         future state or ground-truth feature is exposed to the detector.
         """
         opts=self.candidates(n)
-        if not (ROLE_ABUSE_V2 or TARGETED_ABUSE_V5) or not opts:
+        if not (ROLE_ABUSE_V2 or TARGETED_ABUSE_V5 or SUBSCRIBER_KIE_V6) or not opts:
             return opts
         typ=self.topo.nodes[n].ntype
         menus={
@@ -813,7 +813,7 @@ def train(root,out,arm):
 
     # v5 keeps RANK as a true method-selection holdout. Earlier development
     # arms are preserved for reproducibility, but no v5 learner may fit RANK.
-    aug_seeds=TRAIN if TARGETED_ABUSE_V5 else TRAIN+RANK
+    aug_seeds=TRAIN if (TARGETED_ABUSE_V5 or SUBSCRIBER_KIE_V6) else TRAIN+RANK
     aug=_training_frame(root,arm,aug_seeds)
     aug_spec={k+"_aug":("base",k,"hgb") for k in OTHER}
     aug_spec["invariant_aug"]=("invariant","comp","hgb")
