@@ -40,7 +40,7 @@ COMMISSIONING_V4=os.getenv("SS7_COMMISSIONING_V4","0")=="1"
 if COMMISSIONING_V4:
     # Frozen before generation or inspection of the v4 TEST worlds.
     TRAIN=(23001,23002,23003)
-    RANK=(23101,23102)
+    RANK=(23101,23102,23103)
     CAL=(23201,23202)
     TEST=(23301,23302)
 elif ROLE_ABUSE_V2:
