@@ -125,10 +125,13 @@ SUB_RESID_NAMES=tuple(
     for k in ("max_resid","rms_resid","chi2")
 )
 SUB_PACKED_NAME="__kie_sub_bins_packed"
+SERVICE_GROUP={}
+for _service in F.Service:
+    _gs={GROUP[F.MT_IDX[m]] for m in F.SERVICE_TEMPLATE[_service]}
+    assert len(_gs)==1,(_service,_gs)
+    SERVICE_GROUP[_service]=next(iter(_gs))
 def service_group(service):
-    gs={GROUP[F.MT_IDX[m]] for m in F.SERVICE_TEMPLATE[service]}
-    assert len(gs)==1,(service,gs)
-    return next(iter(gs))
+    return SERVICE_GROUP[service]
 def wire_bytes(size):
     return int(size+12*math.ceil(size/256))
 def payload_bytes(topo,n,compact):
@@ -558,14 +561,12 @@ class IntegratedSim(O.CorrectedSim):
         for n in topo.nodes:
             st=empty(n,t);cl=empty(n,t);tt=defaultdict(int);tm=defaultdict(int)
             ct=defaultdict(int);cm=defaultdict(int);hidden=0;removed=0;observable=0
-            sub_true=np.zeros((len(GROUPS),SUB_HASH_BINS),dtype=np.int64)
-            sub_claim=np.zeros_like(sub_true)
+            sub_claim=np.zeros((len(GROUPS),SUB_HASH_BINS),dtype=np.int64)
             e=active.get(n)
             for path,i,service,cnt,closed,owner,sub in records[n]:
                 add_record(st,tt,tm,path,i,service,cnt,closed)
                 remain=cnt;cc=closed
                 sg=service_group(service)
-                if SUBSCRIBER_SKETCH and sub is not None:sub_true[sg]+=sub
                 if owner==n:
                     per=sum(F.SERVICE_TEMPLATE[service].values())
                     hidden+=cnt*per*((i>0)+(i<len(path)-1))
