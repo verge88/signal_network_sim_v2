@@ -121,6 +121,7 @@ def main(root,out,seeds):
         worst_false_windows_day=("false_windows_day","max"),
         worst_false_notifications_day=("false_notifications_day","max"),
         worst_notifications_day=("notifications_day","max")).reset_index()
+    agg["threshold"]=agg["rule"].map(dict(RULES)).astype(float)
     agg["budget_ok"]=(agg.worst_false_windows_day<=RAW_DAY)&(
         agg.worst_false_notifications_day<=NOTICE_DAY)
     agg["accepted"]=(agg.budget_ok&
