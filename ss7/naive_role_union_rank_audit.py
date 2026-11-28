@@ -21,26 +21,57 @@ ROLE_MSG={
     "IGW":("SRI","PRN","SRI_SM","MT_FSM","ATI","PSI"),
     "STP":("ATI","PSI","SRI","PRN","SRI_SM","MT_FSM","SAI","UL","ISD","CL"),
 }
-VARIANTS=("max","top2","l2","max_total")
+VARIANTS=("max","top2","l2","max_total","stable_max","stable_top2","stable_l2","stable_max_total")
 SMOOTH=(1,3,5,10)
 ROLE_RAW_DAY=4.0
 
+def stable_shift(d,col):
+    """Causal robust recent-vs-past shift without score saturation."""
+    out=np.zeros(len(d),float)
+    ratio=("ratio_" in col) or col.endswith(("_share","_entropy"))
+    for _,g in d.groupby("nid",sort=False):
+        ix=g.index.to_numpy()
+        x=pd.Series(g[col].to_numpy(float),index=ix)
+        recent=x.rolling(10,min_periods=4).mean()
+        past=x.shift(10)
+        center=past.rolling(60,min_periods=15).median()
+        q25=past.rolling(60,min_periods=15).quantile(.25)
+        q75=past.rolling(60,min_periods=15).quantile(.75)
+        robust=(q75-q25)/1.349
+        c=center.to_numpy(float)
+        if ratio:
+            floor=np.full(len(ix),.02)
+        else:
+            floor=np.sqrt(np.maximum(np.abs(c),1.0))
+        scale=np.maximum(np.nan_to_num(robust.to_numpy(float),nan=0.0),floor)
+        z=(recent.to_numpy(float)-c)/scale
+        out[ix]=np.arcsinh(np.nan_to_num(z,nan=0.0,posinf=0.0,neginf=0.0))
+    return out
+
 def raw_score(d,role,variant):
-    cols=[f"drift_obs_ratio_{m}_z" for m in ROLE_MSG[role] if f"drift_obs_ratio_{m}_z" in d.columns]
-    if not cols:return np.zeros(len(d),float)
-    z=np.maximum(np.nan_to_num(d[cols].to_numpy(float),nan=0.0),0.0)
-    if variant=="max":
-        s=z.max(axis=1)
-    elif variant=="top2":
-        z=np.sort(z,axis=1)
-        s=z[:,-min(2,z.shape[1]):].mean(axis=1)
-    elif variant=="l2":
-        s=np.sqrt((z*z).mean(axis=1))
-    elif variant=="max_total":
-        total=np.maximum(np.nan_to_num(d["drift_total_messages_z"].to_numpy(float),nan=0.0),0.0)
-        s=np.maximum(z.max(axis=1),.6*total)
+    stable=variant.startswith("stable_")
+    base_variant=variant[7:] if stable else variant
+    if stable:
+        cols=[f"obs_ratio_{m}" for m in ROLE_MSG[role] if f"obs_ratio_{m}" in d.columns]
+        if not cols:return np.zeros(len(d),float)
+        z=np.column_stack([np.maximum(stable_shift(d,c),0.0) for c in cols])
+    else:
+        cols=[f"drift_obs_ratio_{m}_z" for m in ROLE_MSG[role] if f"drift_obs_ratio_{m}_z" in d.columns]
+        if not cols:return np.zeros(len(d),float)
+        z=np.maximum(np.nan_to_num(d[cols].to_numpy(float),nan=0.0),0.0)
+    if base_variant=="max":
+        score=z.max(axis=1)
+    elif base_variant=="top2":
+        zz=np.sort(z,axis=1)
+        score=zz[:,-min(2,zz.shape[1]):].mean(axis=1)
+    elif base_variant=="l2":
+        score=np.sqrt((z*z).mean(axis=1))
+    elif base_variant=="max_total":
+        total=(np.maximum(stable_shift(d,"total_messages"),0.0) if stable
+               else np.maximum(np.nan_to_num(d["drift_total_messages_z"].to_numpy(float),nan=0.0),0.0))
+        score=np.maximum(z.max(axis=1),.6*total)
     else:raise ValueError(variant)
-    return s
+    return score
 
 def smooth(d,s,w):
     if w==1:return np.asarray(s,float)
