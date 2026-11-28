@@ -38,7 +38,15 @@ ROLE_ABUSE_V2=os.getenv("SS7_ROLE_ABUSE_V2","0")=="1"
 FRESH_TEST_V3=os.getenv("SS7_FRESH_TEST_V3","0")=="1"
 COMMISSIONING_V4=os.getenv("SS7_COMMISSIONING_V4","0")=="1"
 TARGETED_ABUSE_V5=os.getenv("SS7_TARGETED_ABUSE_V5","0")=="1"
-if TARGETED_ABUSE_V5:
+SUBSCRIBER_KIE_V6=os.getenv("SS7_SUBSCRIBER_KIE_V6","0")=="1"
+if SUBSCRIBER_KIE_V6:
+    # v6 adds privacy-preserving subscriber hash sketches to compact KIE.
+    # TEST remains frozen and must not be generated during RANK development.
+    TRAIN=(25001,25002,25003)
+    RANK=(25101,25102,25103)
+    CAL=(25201,25202)
+    TEST=(25301,25302)
+elif TARGETED_ABUSE_V5:
     # Frozen before generation or inspection of the v5 TEST worlds.
     TRAIN=(24001,24002,24003)
     RANK=(24101,24102,24103)
@@ -94,6 +102,15 @@ GROUPS=(("IAM","ACM","ANM","REL","RLC"),("SRI_SM","MT_FSM","MO_FSM"),
         ("ATI","PSI","UL","ISD","CL","PURGE"),("SRI","PRN","SAI"))
 GROUP={F.MT_IDX[m]:g for g,ms in enumerate(GROUPS) for m in ms}
 assert len(GROUP)==len(F.MSG_TYPES)
+SUB_HASH_BINS=16
+SUB_PROFILE_NAMES=tuple(
+    f"kie_sub_g{g}_{k}" for g in range(len(GROUPS))
+    for k in ("top1","entropy","occupied")
+)
+def service_group(service):
+    gs={GROUP[F.MT_IDX[m]] for m in F.SERVICE_TEMPLATE[service]}
+    assert len(gs)==1,(service,gs)
+    return next(iter(gs))
 def wire_bytes(size):
     return int(size+12*math.ceil(size/256))
 def payload_bytes(topo,n,compact):
@@ -102,9 +119,10 @@ def payload_bytes(topo,n,compact):
     if not compact:return 50+8*(m+2*d+N+8+2*d*m+d*d*m)
     # Fixed-layout envelope. Base state, four-group directional counts,
     # four-group matrix marginals for relays and two eight-float64 profiles.
-    # The grouped-route sketch used by the coordinator is derived from these
-    # already-transmitted counters and adds zero wire bytes.
-    return 50+4*(m+2*d+N+8+2*d*len(GROUPS)+(2*d*len(GROUPS) if relay else 0))+16*8
+    # v6 additionally carries four service-group x 16 keyed subscriber-hash
+    # counters (uint32). Raw subscriber identifiers never leave the node.
+    sub_bytes=(4*len(GROUPS)*SUB_HASH_BINS) if SUBSCRIBER_KIE_V6 else 0
+    return 50+4*(m+2*d+N+8+2*d*len(GROUPS)+(2*d*len(GROUPS) if relay else 0))+16*8+sub_bytes
 
 def group_counts(a):
     out=defaultdict(int)
