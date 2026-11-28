@@ -45,8 +45,16 @@ SUBSCRIBER_KIE_V9=os.getenv("SS7_SUBSCRIBER_KIE_V9","0")=="1"
 SUBSCRIBER_KIE_V10=os.getenv("SS7_SUBSCRIBER_KIE_V10","0")=="1"
 SUBSCRIBER_KIE_V11=os.getenv("SS7_SUBSCRIBER_KIE_V11","0")=="1"
 SUBSCRIBER_KIE_V12=os.getenv("SS7_SUBSCRIBER_KIE_V12","0")=="1"
-SUBSCRIBER_SKETCH=SUBSCRIBER_KIE_V6 or SUBSCRIBER_KIE_V7 or SUBSCRIBER_KIE_V8 or SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12
-if SUBSCRIBER_KIE_V12:
+SUBSCRIBER_KIE_V13=os.getenv("SS7_SUBSCRIBER_KIE_V13","0")=="1"
+SUBSCRIBER_SKETCH=SUBSCRIBER_KIE_V6 or SUBSCRIBER_KIE_V7 or SUBSCRIBER_KIE_V8 or SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12 or SUBSCRIBER_KIE_V13
+if SUBSCRIBER_KIE_V13:
+    # v13 is the v12 identity-preserving CUSUM with the artificial state cap
+    # removed. Fresh RANK-only development; CAL/TEST remain untouched.
+    TRAIN=(33001,33002,33003)
+    RANK=(33101,33102,33103)
+    CAL=(33201,33202)
+    TEST=(33301,33302)
+elif SUBSCRIBER_KIE_V12:
     # v12 preserves exact peer x MAP-service x keyed-bin identity until after
     # a fixed per-bin CUSUM. Fresh RANK-only development; CAL/TEST untouched.
     TRAIN=(32001,32002,32003)
@@ -152,7 +160,7 @@ GROUPS=(("IAM","ACM","ANM","REL","RLC"),("SRI_SM","MT_FSM","MO_FSM"),
         ("ATI","PSI","UL","ISD","CL","PURGE"),("SRI","PRN","SAI"))
 GROUP={F.MT_IDX[m]:g for g,ms in enumerate(GROUPS) for m in ms}
 assert len(GROUP)==len(F.MSG_TYPES)
-SUB_HASH_BINS=32 if (SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12) else 16
+SUB_HASH_BINS=32 if (SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12 or SUBSCRIBER_KIE_V13) else 16
 SUB_PROFILE_NAMES=tuple(
     f"kie_sub_g{g}_{k}" for g in range(len(GROUPS))
     for k in ("top1","entropy","occupied")
@@ -174,11 +182,13 @@ SUB_PEER_SERVICE_PACKED_NAME="__kie_peer_service_sub_bins_packed"
 SUB_PEER_SERVICE_RESID_NAMES=("kie_peer_service_sub_max_resid","kie_peer_service_sub_rms_resid","kie_peer_service_sub_chi2")
 SUB_PEER_SERVICE_ROLL30_NAME="kie_peer_service_roll30_max_resid"
 SUB_PEER_SERVICE_BIN_CUSUM_NAME="kie_peer_service_bin_cusum"
+SUB_PEER_SERVICE_BIN_CUSUM_UNCAPPED_NAME="kie_peer_service_bin_cusum_uncapped"
 SUB_ROLL_WINDOW=30
 SUB_ROLL_MIN=15
 SUB_BIN_CUSUM_K=0.5
 SUB_BIN_CUSUM_LEAK=0.98
 SUB_BIN_CUSUM_CAP=50.0
+SUB_BIN_CUSUM_CAP_UNCAPPED=1_000_000.0
 SERVICE_GROUP={}
 for _service in F.Service:
     _gs={GROUP[F.MT_IDX[m]] for m in F.SERVICE_TEMPLATE[_service]}
@@ -196,7 +206,7 @@ def payload_bytes(topo,n,compact):
     # four-group matrix marginals for relays and two eight-float64 profiles.
     # Subscriber KIE carries keyed uint32 counters only; raw subscriber IDs
     # never leave the node. v8 conditions the same sketch on the adjacent peer.
-    if SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12:
+    if SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12 or SUBSCRIBER_KIE_V13:
         # 32 bins x uint16 == 16 bins x uint32: same nominal v9 wire cost.
         sub_bytes=2*d*len(KIE_SERVICES)*SUB_HASH_BINS
     elif SUBSCRIBER_KIE_V9:
@@ -214,7 +224,7 @@ def noisy_subscriber_sketch(a,rng,sigma):
 
 def subscriber_profile(a):
     a=np.asarray(a,float);out={}
-    if SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12:
+    if SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12 or SUBSCRIBER_KIE_V13:
         assert a.ndim==3 and a.shape[1:]==(len(KIE_SERVICES),SUB_HASH_BINS)
         out[SUB_PEER_SERVICE_PACKED_NAME]=a.astype(np.float32,copy=False).reshape(-1).copy()
         return out
@@ -369,10 +379,14 @@ def peer_service_subscriber_bin_cusum_features(d):
     extrema from accumulating as one synthetic attack. No label, CAL or TEST
     information enters the feature.
     """
-    d[SUB_PEER_SERVICE_BIN_CUSUM_NAME]=np.nan
-    if not SUBSCRIBER_KIE_V12:return d
+    if not (SUBSCRIBER_KIE_V12 or SUBSCRIBER_KIE_V13):return d
+    feature_name=(SUB_PEER_SERVICE_BIN_CUSUM_UNCAPPED_NAME
+                  if SUBSCRIBER_KIE_V13 else SUB_PEER_SERVICE_BIN_CUSUM_NAME)
+    d[feature_name]=np.nan
     if SUB_PEER_SERVICE_PACKED_NAME not in d.columns:return d
 
+    state_cap=(SUB_BIN_CUSUM_CAP_UNCAPPED if SUBSCRIBER_KIE_V13
+               else SUB_BIN_CUSUM_CAP)
     out=np.full(len(d),np.nan,dtype=float)
     cell_width=len(KIE_SERVICES)*SUB_HASH_BINS
     for _,gdf in d.groupby("nid",sort=False):
@@ -430,7 +444,7 @@ def peer_service_subscriber_bin_cusum_features(d):
                         state.fill(0.0)
                         continue
                     state=np.clip(SUB_BIN_CUSUM_LEAK*state+Z[j]-SUB_BIN_CUSUM_K,
-                                  0.0,SUB_BIN_CUSUM_CAP)
+                                  0.0,state_cap)
                     cell_score[j]=np.arcsinh(float(state.max()))
                 finite=np.isfinite(cell_score)
                 if finite.any():
@@ -440,7 +454,7 @@ def peer_service_subscriber_bin_cusum_features(d):
         best[~have]=np.nan
         out[ix]=best
 
-    d[SUB_PEER_SERVICE_BIN_CUSUM_NAME]=out
+    d[feature_name]=out
     return d.drop(columns=[SUB_PEER_SERVICE_PACKED_NAME])
 
 
@@ -774,7 +788,7 @@ class IntegratedSim(O.CorrectedSim):
 
     def normal_subscriber_bins(self,f,cnt,t):
         if not SUBSCRIBER_SKETCH:return None
-        if (SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12) and f.service not in KIE_SERVICE_INDEX:return None
+        if (SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12 or SUBSCRIBER_KIE_V13) and f.service not in KIE_SERVICE_INDEX:return None
         key=(int(f.src),int(f.dst),list(F.Service).index(f.service))
         srng=np.random.default_rng(np.random.SeedSequence(
             int(self.cfg.seed),spawn_key=(3101,int(t),key[0],key[1],key[2])))
@@ -922,7 +936,7 @@ class IntegratedSim(O.CorrectedSim):
         for n in topo.nodes:
             st=empty(n,t);cl=empty(n,t);tt=defaultdict(int);tm=defaultdict(int)
             ct=defaultdict(int);cm=defaultdict(int);hidden=0;removed=0;observable=0
-            if SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12:
+            if SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12 or SUBSCRIBER_KIE_V13:
                 peer_ids=[topo.peer(k,n) for k in topo.links_of(n)]
                 peer_pos={p:i for i,p in enumerate(peer_ids)}
                 sub_claim=np.zeros((len(peer_ids),len(KIE_SERVICES),SUB_HASH_BINS),dtype=np.int64)
@@ -966,7 +980,7 @@ class IntegratedSim(O.CorrectedSim):
                                 if cv.sum()<remain:cv[int(np.argmax(psub))]+=int(remain-cv.sum())
                     else:
                         cv=sub
-                    if SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12:
+                    if SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12 or SUBSCRIBER_KIE_V13:
                         si=KIE_SERVICE_INDEX.get(service)
                         if si is not None:
                             adj=[]
@@ -1105,6 +1119,8 @@ def generate(seed,days=DAYS,arm="compact"):
         row_feature_cols+=[SUB_PEER_SERVICE_ROLL30_NAME]
     elif SUBSCRIBER_KIE_V12:
         row_feature_cols+=[SUB_PEER_SERVICE_BIN_CUSUM_NAME]
+    elif SUBSCRIBER_KIE_V13:
+        row_feature_cols+=[SUB_PEER_SERVICE_BIN_CUSUM_UNCAPPED_NAME]
     for t in range(cfg.n_intervals):
         truth,claimed,typed,mat,boundary,audit,lstate,subclaimed=sim.step_true(t,eps)
         rng=book.child("measure",t);trng=extra_rng(seed,2,t);brng=extra_rng(seed,3,t)
@@ -1128,7 +1144,7 @@ def generate(seed,days=DAYS,arm="compact"):
                 if SUBSCRIBER_SKETCH:
                     srng=extra_rng(seed,33,t*1000+n)
                     subwire=noisy_subscriber_sketch(subclaimed[n],srng,sim.rel_sigma)
-                    if SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12:
+                    if SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12 or SUBSCRIBER_KIE_V13:
                         subwire=np.minimum(subwire,np.iinfo(np.uint16).max)
                     z.update(subscriber_profile(subwire))
             if node.role==F.NodeRole.MASTER:
@@ -1181,7 +1197,7 @@ def generate(seed,days=DAYS,arm="compact"):
             row={c:np.nan for c in row_feature_cols}
             if SUBSCRIBER_KIE_V7:row[SUB_PACKED_NAME]=None
             if SUBSCRIBER_KIE_V8:row[SUB_PEER_PACKED_NAME]=None
-            if SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12:row[SUB_PEER_SERVICE_PACKED_NAME]=None
+            if SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12 or SUBSCRIBER_KIE_V13:row[SUB_PEER_SERVICE_PACKED_NAME]=None
             row.update(inv.get(n,{}));row.update(extra.get(n,{}));row.update(behavior.get(n,{}))
             # Independent boundary sensor remains observable even when CU lost.
             if n in sensors and n not in fresh:
