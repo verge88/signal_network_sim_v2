@@ -1,0 +1,95 @@
+name: SS7 role-abuse v2 fresh holdout validation
+on:
+  push:
+    branches: [ss7-anti-overfit-development]
+    paths:
+      - .github/workflows/ss7-role-abuse-v2-validation.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  SS7_ROLE_ABUSE_V2: "1"
+jobs:
+  worlds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      max-parallel: 9
+      matrix:
+        seed: [22001,22002,22003,22101,22102,22201,22202,22301,22302]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/cu_compact_channel_development.py
+      - run: python -u -m ss7.cu_compact_channel_development selftest
+      - run: python -u -m ss7.cu_compact_channel_development generate --arm compact --seed ${{ matrix.seed }} --output results/world
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v2-world-compact-${{ matrix.seed }}
+          path: results/world
+          retention-days: 7
+
+  train:
+    needs: worlds
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: v2-world-compact-220*
+          path: results/worlds
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: v2-world-compact-221*
+          path: results/worlds
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: v2-world-compact-222*
+          path: results/worlds
+      - run: |
+          for d in results/worlds/v2-world-compact-*; do mv "$d" "results/worlds/${d##*/v2-}"; done
+      - run: python -u -m ss7.cu_compact_channel_development train --arm compact --root results/worlds --output results/trained
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v2-regularized-compact-models
+          path: results/trained
+          retention-days: 7
+
+  evaluate:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: v2-world-compact-22[123]*
+          path: results/worlds
+      - run: |
+          for d in results/worlds/v2-world-compact-*; do mv "$d" "results/worlds/${d##*/v2-}"; done
+      - uses: actions/download-artifact@v4
+        with:
+          name: v2-regularized-compact-models
+          path: results/trained
+      - run: python -u -m ss7.cu_compact_channel_development evaluate --arm compact --root results/worlds --models results/trained --output results/eval
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v2-fresh-holdout-eval
+          path: results/eval
+          retention-days: 7
