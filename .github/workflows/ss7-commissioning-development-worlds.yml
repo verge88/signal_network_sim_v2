@@ -1,4 +1,5 @@
 name: SS7 commissioning development worlds
+# frozen development seeds: 23001-23003,23201-23202
 on:
   push:
     branches: [ss7-anti-overfit-development]
