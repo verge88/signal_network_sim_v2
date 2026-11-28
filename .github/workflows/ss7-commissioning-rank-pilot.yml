@@ -1,4 +1,5 @@
 name: SS7 commissioning-baseline RANK pilot
+# commissioning end: t=180
 on:
   push:
     branches: [ss7-anti-overfit-development]
