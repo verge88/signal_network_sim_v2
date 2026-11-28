@@ -566,8 +566,8 @@ def peer_service_subscriber_identity_features(d):
                     vm[4:]=(vc[5:]-vc[:-5])==5
                     sums5=pcs[5:]-pcs[:-5]
                     score5=np.max(sums5/5.0,axis=1)
-                    best_mean[4:][vm[4:]]=np.maximum(
-                        best_mean[4:][vm[4:]],score5[vm[4:]])
+                    im=np.flatnonzero(vm[4:])+4
+                    best_mean[im]=np.maximum(best_mean[im],score5[vm[4:]])
                     have_mean|=vm
 
                 # Same-bin minimum over three consecutive valid observations.
@@ -576,8 +576,8 @@ def peer_service_subscriber_identity_features(d):
                     vn[2:]=cell[2:]&cell[1:-1]&cell[:-2]
                     mins3=np.minimum(np.minimum(P[2:],P[1:-1]),P[:-2])
                     score3=np.max(mins3,axis=1)
-                    best_min[2:][vn[2:]]=np.maximum(
-                        best_min[2:][vn[2:]],score3[vn[2:]])
+                    inn=np.flatnonzero(vn[2:])+2
+                    best_min[inn]=np.maximum(best_min[inn],score3[vn[2:]])
                     have_min|=vn
 
         best_mean[~have_mean]=np.nan;best_min[~have_min]=np.nan
