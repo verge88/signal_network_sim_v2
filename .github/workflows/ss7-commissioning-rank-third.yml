@@ -1,4 +1,5 @@
 name: SS7 commissioning third RANK world
+# frozen seed: 23103
 on:
   push:
     branches: [ss7-anti-overfit-development]
