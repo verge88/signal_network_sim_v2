@@ -604,42 +604,56 @@ def heavy_hitter_subscriber_features(d):
             out["kie_hh_top4_share"][ix]=np.nanmax(top4,axis=1)
             out["kie_hh_margin12"][ix]=np.nanmax(margin,axis=1)
 
-        # Same top-K pseudonymous identity across causal windows. For each
-        # current candidate, require it to remain in top-K of the same
-        # peer/service cell; use its actual share, not rank alone.
+        # Same top-K pseudonymous identity across causal windows. Vectorized
+        # over time/cell/identity so 128-bin local resolution remains practical.
         mean5=np.full(n,np.nan);min3=np.full(n,np.nan);persist=np.full(n,np.nan)
-        for j in range(n):
-            best5=-np.inf;best3=-np.inf;bestp=-np.inf
-            if not ok[j]:continue
-            for cell in range(cells):
-                if total[j,cell]<=0:continue
-                for q in range(HH_TOPK):
-                    hid=int(ids[j,cell,q]);cur=float(share[j,cell,q])
-                    if cur<=0:continue
-                    if j>=4:
-                        vals=[];good=True
-                        for z in range(j-4,j+1):
-                            hit=np.flatnonzero((ids[z,cell]==hid)&(counts[z,cell]>0))
-                            if not ok[z] or len(hit)==0:good=False;break
-                            vals.append(float(share[z,cell,hit[0]]))
-                        if good:best5=max(best5,float(np.mean(vals)))
-                    if j>=2:
-                        vals=[];good=True
-                        for z in range(j-2,j+1):
-                            hit=np.flatnonzero((ids[z,cell]==hid)&(counts[z,cell]>0))
-                            if not ok[z] or len(hit)==0:good=False;break
-                            vals.append(float(share[z,cell,hit[0]]))
-                        if good:best3=max(best3,float(np.min(vals)))
-                    if j>=9:
-                        hits=0;den=0
-                        for z in range(j-9,j+1):
-                            if not ok[z]:continue
-                            den+=1
-                            if np.any((ids[z,cell]==hid)&(counts[z,cell]>0)):hits+=1
-                        if den>=7:bestp=max(bestp,hits/den)
-            if np.isfinite(best5):mean5[j]=best5
-            if np.isfinite(best3):min3[j]=best3
-            if np.isfinite(bestp):persist[j]=bestp
+
+        if n>=3:
+            cur_ids=ids[2:];cur_share=share[2:];cur_valid=(counts[2:]>0)&ok[2:,None,None]
+            vals=[cur_share];valid3=cur_valid.copy()
+            for lag in (1,2):
+                prv_ids=ids[2-lag:n-lag];prv_share=share[2-lag:n-lag]
+                prv_count=counts[2-lag:n-lag]
+                match=(cur_ids[:,:,:,None]==prv_ids[:,:,None,:])&(prv_count[:,:,None,:]>0)
+                got=np.max(np.where(match,prv_share[:,:,None,:],0.0),axis=3)
+                valid3&=(got>0)&ok[2-lag:n-lag,None,None]
+                vals.append(got)
+            sc=np.where(valid3,np.minimum.reduce(vals),-np.inf)
+            best=np.max(sc,axis=(1,2));good=np.isfinite(best)
+            tmp=min3[2:];tmp[good]=best[good];min3[2:]=tmp
+
+        if n>=5:
+            cur_ids=ids[4:];acc=share[4:].copy()
+            valid5=(counts[4:]>0)&ok[4:,None,None]
+            for lag in (1,2,3,4):
+                prv_ids=ids[4-lag:n-lag];prv_share=share[4-lag:n-lag]
+                prv_count=counts[4-lag:n-lag]
+                match=(cur_ids[:,:,:,None]==prv_ids[:,:,None,:])&(prv_count[:,:,None,:]>0)
+                got=np.max(np.where(match,prv_share[:,:,None,:],0.0),axis=3)
+                valid5&=(got>0)&ok[4-lag:n-lag,None,None]
+                acc+=got
+            sc=np.where(valid5,acc/5.0,-np.inf)
+            best=np.max(sc,axis=(1,2));good=np.isfinite(best)
+            tmp=mean5[4:];tmp[good]=best[good];mean5[4:]=tmp
+
+        if n>=10:
+            cur_ids=ids[9:];cur_valid=(counts[9:]>0)&ok[9:,None,None]
+            hits=cur_valid.astype(np.int16)
+            den=np.zeros(n-9,dtype=np.int16)
+            for lag in range(10):
+                den+=ok[9-lag:n-lag].astype(np.int16)
+                if lag==0:continue
+                prv_ids=ids[9-lag:n-lag];prv_count=counts[9-lag:n-lag]
+                match=(cur_ids[:,:,:,None]==prv_ids[:,:,None,:])&(prv_count[:,:,None,:]>0)
+                present=np.any(match,axis=3)&ok[9-lag:n-lag,None,None]
+                hits+=present.astype(np.int16)
+            score=np.divide(hits,den[:,None,None],out=np.zeros_like(hits,dtype=float),
+                            where=den[:,None,None]>0)
+            validp=cur_valid&(den[:,None,None]>=7)
+            sc=np.where(validp,score,-np.inf)
+            best=np.max(sc,axis=(1,2));good=np.isfinite(best)
+            tmp=persist[9:];tmp[good]=best[good];persist[9:]=tmp
+
         out["kie_hh_sameid_mean5"][ix]=mean5
         out["kie_hh_sameid_min3"][ix]=min3
         out["kie_hh_persist10"][ix]=persist
