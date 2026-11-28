@@ -1,4 +1,5 @@
 name: SS7 capability KIE v23 fast audit
+# rolling-memory-clean false-window evaluation
 on:
   push:
     branches: [ss7-anti-overfit-development]
