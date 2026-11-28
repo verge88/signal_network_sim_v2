@@ -41,8 +41,16 @@ TARGETED_ABUSE_V5=os.getenv("SS7_TARGETED_ABUSE_V5","0")=="1"
 SUBSCRIBER_KIE_V6=os.getenv("SS7_SUBSCRIBER_KIE_V6","0")=="1"
 SUBSCRIBER_KIE_V7=os.getenv("SS7_SUBSCRIBER_KIE_V7","0")=="1"
 SUBSCRIBER_KIE_V8=os.getenv("SS7_SUBSCRIBER_KIE_V8","0")=="1"
-SUBSCRIBER_SKETCH=SUBSCRIBER_KIE_V6 or SUBSCRIBER_KIE_V7 or SUBSCRIBER_KIE_V8
-if SUBSCRIBER_KIE_V8:
+SUBSCRIBER_KIE_V9=os.getenv("SS7_SUBSCRIBER_KIE_V9","0")=="1"
+SUBSCRIBER_SKETCH=SUBSCRIBER_KIE_V6 or SUBSCRIBER_KIE_V7 or SUBSCRIBER_KIE_V8 or SUBSCRIBER_KIE_V9
+if SUBSCRIBER_KIE_V9:
+    # v9 conditions the keyed subscriber sketch on adjacent peer and exact
+    # MAP service. Fresh RANK-only development; CAL/TEST remain untouched.
+    TRAIN=(28001,28002,28003)
+    RANK=(28101,28102,28103)
+    CAL=(28201,28202)
+    TEST=(28301,28302)
+elif SUBSCRIBER_KIE_V8:
     # v8 conditions the privacy-preserving subscriber sketch on the adjacent
     # SS7 peer. RANK-only development; TEST is frozen and untouched.
     TRAIN=(27001,27002,27003)
@@ -135,6 +143,10 @@ SUB_RESID_NAMES=tuple(
 SUB_PACKED_NAME="__kie_sub_bins_packed"
 SUB_PEER_PACKED_NAME="__kie_peer_sub_bins_packed"
 SUB_PEER_RESID_NAMES=("kie_peer_sub_max_resid","kie_peer_sub_rms_resid","kie_peer_sub_chi2")
+KIE_SERVICES=tuple(s for s in F.Service if s in F.TCAP_SERVICES)
+KIE_SERVICE_INDEX={s:i for i,s in enumerate(KIE_SERVICES)}
+SUB_PEER_SERVICE_PACKED_NAME="__kie_peer_service_sub_bins_packed"
+SUB_PEER_SERVICE_RESID_NAMES=("kie_peer_service_sub_max_resid","kie_peer_service_sub_rms_resid","kie_peer_service_sub_chi2")
 SERVICE_GROUP={}
 for _service in F.Service:
     _gs={GROUP[F.MT_IDX[m]] for m in F.SERVICE_TEMPLATE[_service]}
@@ -152,7 +164,9 @@ def payload_bytes(topo,n,compact):
     # four-group matrix marginals for relays and two eight-float64 profiles.
     # Subscriber KIE carries keyed uint32 counters only; raw subscriber IDs
     # never leave the node. v8 conditions the same sketch on the adjacent peer.
-    if SUBSCRIBER_KIE_V8:
+    if SUBSCRIBER_KIE_V9:
+        sub_bytes=4*d*len(KIE_SERVICES)*SUB_HASH_BINS
+    elif SUBSCRIBER_KIE_V8:
         sub_bytes=4*d*len(GROUPS)*SUB_HASH_BINS
     else:
         sub_bytes=(4*len(GROUPS)*SUB_HASH_BINS) if SUBSCRIBER_SKETCH else 0
@@ -165,6 +179,10 @@ def noisy_subscriber_sketch(a,rng,sigma):
 
 def subscriber_profile(a):
     a=np.asarray(a,float);out={}
+    if SUBSCRIBER_KIE_V9:
+        assert a.ndim==3 and a.shape[1:]==(len(KIE_SERVICES),SUB_HASH_BINS)
+        out[SUB_PEER_SERVICE_PACKED_NAME]=a.astype(np.float32,copy=False).reshape(-1).copy()
+        return out
     if SUBSCRIBER_KIE_V8:
         assert a.ndim==3 and a.shape[1:]==(len(GROUPS),SUB_HASH_BINS)
         out[SUB_PEER_PACKED_NAME]=a.astype(np.float32,copy=False).reshape(-1).copy()
