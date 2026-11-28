@@ -1,0 +1,67 @@
+name: SS7 independent capability KIE v23 RANK
+on:
+  push:
+    branches: [ss7-anti-overfit-development]
+    paths:
+      - .github/workflows/ss7-v23-capability-kie-rank.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  SS7_CAPABILITY_KIE_V23: "1"
+  SS7_DEPLOY_BASELINE: "180"
+  SS7_CAP_BENIGN_FAIL: "0.00002"
+  SS7_CAP_ATTACK_BYPASS: "0.0"
+
+jobs:
+  worlds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        seed: [41101,41102,41103]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/cu_compact_channel_development.py ss7/v23_capability_kie_rank.py
+      - run: python -u -m ss7.cu_compact_channel_development selftest
+      - run: python -u -m ss7.cu_compact_channel_development generate --arm compact --seed ${{ matrix.seed }} --output results/world
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v23-world-compact-${{ matrix.seed }}
+          path: results/world
+          retention-days: 7
+
+  audit:
+    needs: worlds
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: v23-world-compact-*
+          path: results/incoming
+      - run: |
+          mkdir -p results/worlds
+          for d in results/incoming/v23-world-compact-*; do
+            mv "$d" "results/worlds/${d##*/v23-}"
+          done
+      - run: python -u -m ss7.v23_capability_kie_rank --root results/worlds --output results/audit --seeds 41101 41102 41103
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-v23-capability-kie-rank
+          path: results/audit
+          retention-days: 7
