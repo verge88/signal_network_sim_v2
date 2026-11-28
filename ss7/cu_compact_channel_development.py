@@ -4,7 +4,7 @@ Dense and compact share topology, episode schedule and underlying traffic seeds.
 Compact transmits grouped directional counts, relay marginals and local profiles.
 """
 from __future__ import annotations
-import argparse, json, math
+import argparse, json, math, os
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -32,10 +32,18 @@ INTERVALS_PER_DAY=F.INTERVALS_PER_DAY
 add_record=O.add_record
 empty=O.empty
 extra_rng=O.extra_rng
-TRAIN=(21001,21002,21003)
-RANK=(21101,21102)
-CAL=(21201,21202)
-TEST=(21301,21302)
+ROLE_ABUSE_V2=os.getenv("SS7_ROLE_ABUSE_V2","0")=="1"
+if ROLE_ABUSE_V2:
+    # Frozen before any v2 holdout result is inspected.
+    TRAIN=(22001,22002,22003)
+    RANK=(22101,22102)
+    CAL=(22201,22202)
+    TEST=(22301,22302)
+else:
+    TRAIN=(21001,21002,21003)
+    RANK=(21101,21102)
+    CAL=(21201,21202)
+    TEST=(21301,21302)
 DAYS=1.
 # Anti-overfit protocol: temporally thin highly autocorrelated windows before fitting.
 # Train/cal/test remain different simulator worlds; CAL is used only for diagnostics and thresholds.
@@ -222,6 +230,34 @@ class IntegratedSim(O.CorrectedSim):
         for sp in (n for ns in self.topo.zone_sp.values() for n in ns):
             for h in self.topo.hlr:fl.append(F.Flow(sp,h,Service.LOCATION,float(rng.gamma(1.5,.04))))
         return fl
+    def compromise_candidates(self,n,e):
+        """Role-consistent malicious SS7 procedures on already legal routes.
+
+        The legacy corrected arm sampled any normal transaction touching the
+        compromised node, often making a NAIVE compromise indistinguishable
+        from benign load variation. In v2 the attacker still uses only routes
+        and service templates already present in the simulated SS7 network,
+        but abuses MAP procedures appropriate for the node role. No label,
+        future state or ground-truth feature is exposed to the detector.
+        """
+        opts=self.candidates(n)
+        if not ROLE_ABUSE_V2 or not opts:
+            return opts
+        typ=self.topo.nodes[n].ntype
+        menus={
+            F.NodeType.SP:(Service.LOCATION,Service.SMS_MT,Service.AUTH,Service.MOBILITY),
+            F.NodeType.SCP:(Service.LOCATION,Service.ROAM_SRI,Service.SMS_MT,Service.AUTH,Service.MOBILITY),
+            F.NodeType.IGW:(Service.ROAM_SRI,Service.SMS_MT,Service.LOCATION),
+            F.NodeType.STP:(Service.LOCATION,Service.ROAM_SRI,Service.SMS_MT,Service.MOBILITY,Service.AUTH),
+        }
+        menu=menus[typ]
+        j=min(len(menu)-1,int(float(e.params[0])*len(menu)))
+        primary=menu[j]
+        chosen=[x for x in opts if x[0].service==primary]
+        if chosen:return chosen
+        chosen=[x for x in opts if x[0].service in menu]
+        return chosen or opts
+
     def flows_for(self,t,episodes):
         """Synthetic service-volume profiles on the existing simulated graph."""
         active={e.nid:e for e in episodes if e.kind in KINDS[:-1] and e.t0<=t<=e.t1}
@@ -324,7 +360,7 @@ class IntegratedSim(O.CorrectedSim):
         for n,e in active.items():
             h=int(arng.poisson(max(e.hidden_rate*dt,0.)))
             if h<=0:continue
-            opts=self.candidates(n)
+            opts=self.compromise_candidates(n,e)
             if not opts:continue
             f,path=opts[int(arng.integers(len(opts)))]
             if any(tuple(sorted((u,v))) in failed_links for u,v in zip(path[:-1],path[1:])):continue
