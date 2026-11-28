@@ -5,6 +5,7 @@ on:
     branches: [ss7-anti-overfit-development]
     paths:
       - .github/workflows/ss7-naive-role-union-rank-audit.yml
+      - ss7/naive_role_union_rank_audit.py
   workflow_dispatch:
 permissions:
   contents: read
