@@ -701,6 +701,11 @@ def generate(seed,days=DAYS,arm="compact"):
     last={};losses=defaultdict(int);age=defaultdict(int);history=defaultdict(lambda:deque(maxlen=30))
     jitter=defaultdict(lambda:deque(maxlen=10))
     rows=[]
+    row_feature_cols=list(NEW)+list(O.EXTRA)+list(D.BEHAVIOR)+list(KIE_GROUP_SKETCH)
+    if SUBSCRIBER_KIE_V6:
+        row_feature_cols+=list(SUB_PROFILE_NAMES)+list(SUB_BIN_NAMES)
+    elif SUBSCRIBER_KIE_V7:
+        row_feature_cols+=list(SUB_RESID_NAMES)
     for t in range(cfg.n_intervals):
         truth,claimed,typed,mat,boundary,audit,lstate,subclaimed=sim.step_true(t,eps)
         rng=book.child("measure",t);trng=extra_rng(seed,2,t);brng=extra_rng(seed,3,t)
@@ -772,7 +777,7 @@ def generate(seed,days=DAYS,arm="compact"):
             for n in fresh:behavior[n].update(profiles[n])
         for n,vals in obs.items():
             nd=sim.topo.nodes[n];e=active.get(n)
-            row={c:np.nan for c in list(NEW)+list(O.EXTRA)+list(D.BEHAVIOR)+list(KIE_GROUP_SKETCH)+list(SUB_PROFILE_NAMES)+list(SUB_BIN_NAMES)+list(SUB_RESID_NAMES)}
+            row={c:np.nan for c in row_feature_cols}
             if SUBSCRIBER_KIE_V7:row[SUB_PACKED_NAME]=None
             row.update(inv.get(n,{}));row.update(extra.get(n,{}));row.update(behavior.get(n,{}))
             # Independent boundary sensor remains observable even when CU lost.
