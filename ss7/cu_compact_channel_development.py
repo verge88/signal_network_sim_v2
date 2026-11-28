@@ -107,6 +107,10 @@ SUB_PROFILE_NAMES=tuple(
     f"kie_sub_g{g}_{k}" for g in range(len(GROUPS))
     for k in ("top1","entropy","occupied")
 )
+SUB_BIN_NAMES=tuple(
+    f"kie_sub_g{g}_b{b}" for g in range(len(GROUPS))
+    for b in range(SUB_HASH_BINS)
+)
 def service_group(service):
     gs={GROUP[F.MT_IDX[m]] for m in F.SERVICE_TEMPLATE[service]}
     assert len(gs)==1,(service,gs)
@@ -134,6 +138,11 @@ def subscriber_profile(a):
     assert a.shape==(len(GROUPS),SUB_HASH_BINS)
     for g in range(len(GROUPS)):
         x=a[g];tot=float(x.sum())
+        # These keyed bin counts are already transported by compact KIE v6.
+        # Keeping them at the coordinator adds zero wire overhead and allows
+        # causal rolling aggregation before concentration metrics are formed.
+        for b,v in enumerate(x):
+            out[f"kie_sub_g{g}_b{b}"]=float(v)
         if tot<=0:
             top1=entropy=occupied=0.0
         else:
@@ -693,7 +702,7 @@ def generate(seed,days=DAYS,arm="compact"):
             for n in fresh:behavior[n].update(profiles[n])
         for n,vals in obs.items():
             nd=sim.topo.nodes[n];e=active.get(n)
-            row={c:np.nan for c in list(NEW)+list(O.EXTRA)+list(D.BEHAVIOR)+list(KIE_GROUP_SKETCH)+list(SUB_PROFILE_NAMES)}
+            row={c:np.nan for c in list(NEW)+list(O.EXTRA)+list(D.BEHAVIOR)+list(KIE_GROUP_SKETCH)+list(SUB_PROFILE_NAMES)+list(SUB_BIN_NAMES)}
             row.update(inv.get(n,{}));row.update(extra.get(n,{}));row.update(behavior.get(n,{}))
             # Independent boundary sensor remains observable even when CU lost.
             if n in sensors and n not in fresh:
