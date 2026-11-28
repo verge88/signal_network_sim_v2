@@ -591,9 +591,16 @@ def peer_service_subscriber_tail_features(d):
         score_area=np.where(persistent,area5/5.0,-np.inf)
         score_count=np.where(persistent,count5.astype(float),-np.inf)
         ma=np.max(score_area,axis=1);mc=np.max(score_count,axis=1)
-        ga=np.isfinite(ma);gc=np.isfinite(mc)
-        if ga.any():out_area[ix[np.flatnonzero(ga)+4]]=ma[ga]
-        if gc.any():out_count[ix[np.flatnonzero(gc)+4]]=mc[gc]
+        # A valid decision epoch with no persistent identity evidence is a real
+        # zero, not missing data. Keeping it as NaN would condition evaluation
+        # on positive evidence and bias both calibration and AUC.
+        decision_valid=rvalid[4:]
+        ma=np.where(np.isfinite(ma),ma,0.0)
+        mc=np.where(np.isfinite(mc),mc,0.0)
+        if decision_valid.any():
+            dst=np.flatnonzero(decision_valid)+4
+            out_area[ix[dst]]=ma[decision_valid]
+            out_count[ix[dst]]=mc[decision_valid]
 
     d[SUB_PEER_SERVICE_TAILAREA5_NAME]=out_area
     d[SUB_PEER_SERVICE_TAILCOUNT5_NAME]=out_count
