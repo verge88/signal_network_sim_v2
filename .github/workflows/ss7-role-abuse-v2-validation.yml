@@ -1,4 +1,5 @@
 name: SS7 role-abuse v2 fresh holdout validation
+# frozen protocol seeds: 22001-22302
 on:
   push:
     branches: [ss7-anti-overfit-development]
