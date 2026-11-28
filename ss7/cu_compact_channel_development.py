@@ -325,6 +325,62 @@ def peer_subscriber_residual_features(d):
     return d.drop(columns=[SUB_PEER_PACKED_NAME])
 
 
+def peer_service_subscriber_residual_features(d):
+    """Residuals for peer x exact-MAP-service keyed subscriber sketches (v9)."""
+    for c in SUB_PEER_SERVICE_RESID_NAMES:d[c]=np.nan
+    if not SUBSCRIBER_KIE_V9:return d
+    if SUB_PEER_SERVICE_PACKED_NAME not in d.columns:return d
+
+    nrow=len(d)
+    result={c:np.full(nrow,np.nan,dtype=float) for c in SUB_PEER_SERVICE_RESID_NAMES}
+    cell_width=len(KIE_SERVICES)*SUB_HASH_BINS
+    for _,gdf in d.groupby("nid",sort=False):
+        ix=gdf.index.to_numpy();tt=gdf.t.to_numpy()
+        obj=gdf[SUB_PEER_SERVICE_PACKED_NAME].to_numpy()
+        valid=np.array([isinstance(v,np.ndarray) and v.size>0 and v.size%cell_width==0 for v in obj],dtype=bool)
+        if not valid.any():continue
+        width=int(obj[np.flatnonzero(valid)[0]].size);peers=width//cell_width
+        X=np.full((len(gdf),peers,len(KIE_SERVICES),SUB_HASH_BINS),np.nan,dtype=float)
+        ok=valid.copy()
+        for j in np.flatnonzero(valid):
+            if obj[j].size!=width:ok[j]=False
+        if ok.any():
+            X[ok]=np.stack(obj[ok]).reshape((-1,peers,len(KIE_SERVICES),SUB_HASH_BINS))
+        warm=ok&(tt<DEPLOY_BASELINE)
+        if warm.sum()<20:continue
+
+        best=np.zeros((len(gdf),3),float);any_cell=np.zeros(len(gdf),bool)
+        for pi in range(peers):
+            for si in range(len(KIE_SERVICES)):
+                A=X[:,pi,si,:];H=np.maximum(A[warm],0.0);agg=H.sum(axis=0)
+                # No commissioning traffic for this peer/service => no stable
+                # reference cell; do not turn first use into an automatic alarm.
+                if agg.sum()<=0:continue
+                alpha=1.0;p=(agg+alpha)/(agg.sum()+alpha*SUB_HASH_BINS)
+                def pearson(B):
+                    B=np.maximum(np.asarray(B,float),0.0)
+                    N=B.sum(axis=1,keepdims=True);E=N*p[None,:]
+                    var=E*(1.0-p[None,:])+(0.10*E)**2+1.0
+                    return (B-E)/np.sqrt(var)
+                Zw=pearson(H);center=np.median(Zw,axis=0)
+                q25,q75=np.quantile(Zw,[.25,.75],axis=0)
+                scale=np.maximum((q75-q25)/1.349,1.0)
+                cell=np.isfinite(A).all(axis=1)
+                Z=np.zeros_like(A,dtype=float)
+                if cell.any():Z[cell]=(pearson(A[cell])-center[None,:])/scale[None,:]
+                P=np.maximum(Z,0.0)
+                vals=np.column_stack((
+                    np.arcsinh(np.max(P,axis=1)),
+                    np.arcsinh(np.sqrt(np.mean(P*P,axis=1))),
+                    np.arcsinh(np.sqrt(np.sum(P*P,axis=1)))))
+                best=np.maximum(best,vals);any_cell|=cell
+        best[~any_cell]=np.nan
+        for k,c in enumerate(SUB_PEER_SERVICE_RESID_NAMES):result[c][ix]=best[:,k]
+
+    for c,v in result.items():d[c]=v
+    return d.drop(columns=[SUB_PEER_SERVICE_PACKED_NAME])
+
+
 def group_counts(a):
     out=defaultdict(int)
     for (direction,k,j),v in a.items():out[(direction,k,GROUP[j])]+=int(v)
@@ -511,6 +567,7 @@ class IntegratedSim(O.CorrectedSim):
 
     def normal_subscriber_bins(self,f,cnt,t):
         if not SUBSCRIBER_SKETCH:return None
+        if SUBSCRIBER_KIE_V9 and f.service not in KIE_SERVICE_INDEX:return None
         key=(int(f.src),int(f.dst),list(F.Service).index(f.service))
         srng=np.random.default_rng(np.random.SeedSequence(
             int(self.cfg.seed),spawn_key=(3101,int(t),key[0],key[1],key[2])))
@@ -658,7 +715,11 @@ class IntegratedSim(O.CorrectedSim):
         for n in topo.nodes:
             st=empty(n,t);cl=empty(n,t);tt=defaultdict(int);tm=defaultdict(int)
             ct=defaultdict(int);cm=defaultdict(int);hidden=0;removed=0;observable=0
-            if SUBSCRIBER_KIE_V8:
+            if SUBSCRIBER_KIE_V9:
+                peer_ids=[topo.peer(k,n) for k in topo.links_of(n)]
+                peer_pos={p:i for i,p in enumerate(peer_ids)}
+                sub_claim=np.zeros((len(peer_ids),len(KIE_SERVICES),SUB_HASH_BINS),dtype=np.int64)
+            elif SUBSCRIBER_KIE_V8:
                 peer_ids=[topo.peer(k,n) for k in topo.links_of(n)]
                 peer_pos={p:i for i,p in enumerate(peer_ids)}
                 sub_claim=np.zeros((len(peer_ids),len(GROUPS),SUB_HASH_BINS),dtype=np.int64)
@@ -698,7 +759,15 @@ class IntegratedSim(O.CorrectedSim):
                                 if cv.sum()<remain:cv[int(np.argmax(psub))]+=int(remain-cv.sum())
                     else:
                         cv=sub
-                    if SUBSCRIBER_KIE_V8:
+                    if SUBSCRIBER_KIE_V9:
+                        si=KIE_SERVICE_INDEX.get(service)
+                        if si is not None:
+                            adj=[]
+                            if i>0:adj.append(path[i-1])
+                            if i<len(path)-1:adj.append(path[i+1])
+                            for peer in adj:
+                                if peer in peer_pos:sub_claim[peer_pos[peer],si]+=cv
+                    elif SUBSCRIBER_KIE_V8:
                         adj=[]
                         if i>0:adj.append(path[i-1])
                         if i<len(path)-1:adj.append(path[i+1])
@@ -744,6 +813,7 @@ def schedule(sim,rng):
 
 def features(d):
     d=d.sort_values(["nid","t"]).reset_index(drop=True)
+    d=peer_service_subscriber_residual_features(d)
     d=peer_subscriber_residual_features(d)
     d=subscriber_residual_features(d)
     for name in TEMP:d[name]=np.nan
@@ -820,6 +890,8 @@ def generate(seed,days=DAYS,arm="compact"):
         row_feature_cols+=list(SUB_RESID_NAMES)
     elif SUBSCRIBER_KIE_V8:
         row_feature_cols+=list(SUB_PEER_RESID_NAMES)
+    elif SUBSCRIBER_KIE_V9:
+        row_feature_cols+=list(SUB_PEER_SERVICE_RESID_NAMES)
     for t in range(cfg.n_intervals):
         truth,claimed,typed,mat,boundary,audit,lstate,subclaimed=sim.step_true(t,eps)
         rng=book.child("measure",t);trng=extra_rng(seed,2,t);brng=extra_rng(seed,3,t)
@@ -894,6 +966,7 @@ def generate(seed,days=DAYS,arm="compact"):
             row={c:np.nan for c in row_feature_cols}
             if SUBSCRIBER_KIE_V7:row[SUB_PACKED_NAME]=None
             if SUBSCRIBER_KIE_V8:row[SUB_PEER_PACKED_NAME]=None
+            if SUBSCRIBER_KIE_V9:row[SUB_PEER_SERVICE_PACKED_NAME]=None
             row.update(inv.get(n,{}));row.update(extra.get(n,{}));row.update(behavior.get(n,{}))
             # Independent boundary sensor remains observable even when CU lost.
             if n in sensors and n not in fresh:
