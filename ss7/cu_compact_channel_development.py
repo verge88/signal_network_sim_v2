@@ -53,8 +53,16 @@ SUBSCRIBER_KIE_V17=os.getenv("SS7_SUBSCRIBER_KIE_V17","0")=="1"
 SUBSCRIBER_KIE_V18=os.getenv("SS7_SUBSCRIBER_KIE_V18","0")=="1"
 SUBSCRIBER_KIE_V19=os.getenv("SS7_SUBSCRIBER_KIE_V19","0")=="1"
 SUBSCRIBER_KIE_V22=os.getenv("SS7_SUBSCRIBER_KIE_V22","0")=="1"
+CAPABILITY_KIE_V23=os.getenv("SS7_CAPABILITY_KIE_V23","0")=="1"
 SUBSCRIBER_SKETCH=SUBSCRIBER_KIE_V6 or SUBSCRIBER_KIE_V7 or SUBSCRIBER_KIE_V8 or SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12 or SUBSCRIBER_KIE_V13 or SUBSCRIBER_KIE_V14 or SUBSCRIBER_KIE_V15 or SUBSCRIBER_KIE_V16 or SUBSCRIBER_KIE_V17 or SUBSCRIBER_KIE_V18 or SUBSCRIBER_KIE_V19 or SUBSCRIBER_KIE_V22
-if SUBSCRIBER_KIE_V22:
+if CAPABILITY_KIE_V23:
+    # v23 adds an independently verified authorization/capability invariant
+    # for high-risk MAP operations. Only aggregate counters enter KIE.
+    TRAIN=(41001,41002,41003)
+    RANK=(41101,41102,41103)
+    CAL=(41201,41202)
+    TEST=(41301,41302)
+elif SUBSCRIBER_KIE_V22:
     # v22 replaces the dense 32-bin wire vector with a compact heavy-hitter
     # summary. Local keyed hash resolution is 128 bins; only total plus top-4
     # pseudonymous IDs/counts per peer x exact MAP service leave the node.
@@ -260,6 +268,9 @@ SUB_MULTIVIEW_NAMES=(
 SUB_PEER_SERVICE_BIN_CUSUM_NAME="kie_peer_service_bin_cusum"
 SUB_PEER_SERVICE_BIN_CUSUM_UNCAPPED_NAME="kie_peer_service_bin_cusum_uncapped"
 HH_TOPK=4
+CAP_BENIGN_FAIL=2e-5
+CAP_KIE_NAMES=("kie_cap_checked","kie_cap_missing","kie_cap_missing_rate")
+CAP_DERIVED_NAMES=("kie_cap_missing_5m","kie_cap_missing_rate_5m")
 SUB_HH_PACKED_NAME="__kie_hh_packed"
 SUB_HH_NAMES=(
     "kie_hh_top1_share","kie_hh_top4_share","kie_hh_margin12",
@@ -300,7 +311,8 @@ def payload_bytes(topo,n,compact):
         sub_bytes=4*d*len(GROUPS)*SUB_HASH_BINS
     else:
         sub_bytes=(4*len(GROUPS)*SUB_HASH_BINS) if SUBSCRIBER_SKETCH else 0
-    return 50+4*(m+2*d+N+8+2*d*len(GROUPS)+(2*d*len(GROUPS) if relay else 0))+16*8+sub_bytes
+    cap_bytes=8 if CAPABILITY_KIE_V23 else 0
+    return 50+4*(m+2*d+N+8+2*d*len(GROUPS)+(2*d*len(GROUPS) if relay else 0))+16*8+sub_bytes+cap_bytes
 
 def noisy_subscriber_sketch(a,rng,sigma):
     a=np.asarray(a,float)
@@ -1581,12 +1593,25 @@ class IntegratedSim(O.CorrectedSim):
                 k=tuple(sorted((u,v)));offered[k]=offered.get(k,0.)+h*bits/dt
         lstate,self.polls=self.cu.exchange(t,offered,failed_links)
         records=defaultdict(list)
+        cap_checked=defaultdict(int);cap_missing=defaultdict(int)
+        caprng=extra_rng(self.cfg.seed,44,t)
         for f,path,cnt,owner,sub in pending:
             hops=[tuple(sorted((u,v))) for u,v in zip(path[:-1],path[1:])]
             p=float(np.prod([1.-lstate[k][2] for k in hops]))**2
             p=1.-(1.-p)**(1+self.max_retry)
             crng=rng if owner is None else arng
             closed=int(crng.binomial(cnt,np.clip(p,0.,1.)))
+            if CAPABILITY_KIE_V23 and f.service in KIE_SERVICE_INDEX and closed>0:
+                # The verifier is independent from the signalling node report.
+                # Normal operations almost always carry a valid authorization
+                # context; hidden injected operations do not possess one.
+                actor=int(owner) if owner is not None else int(f.src)
+                if actor in topo.nodes and not topo.nodes[actor].external:
+                    cap_checked[actor]+=closed
+                    if owner is not None:
+                        cap_missing[actor]+=closed
+                    else:
+                        cap_missing[actor]+=int(caprng.binomial(closed,CAP_BENIGN_FAIL))
             for i,n in enumerate(path):records[n].append((path,i,f.service,cnt,closed,owner,sub))
         true={};claimed={};typed={};mat={};boundary={};audit={};subclaimed={}
         for n in topo.nodes:
@@ -1659,6 +1684,11 @@ class IntegratedSim(O.CorrectedSim):
             # Only sensor measurements, never this latent dictionary, reach features.
             boundary[n]={k:v for k,v in tt.items() if topo.nodes[topo.peer(k[1],n)].external}
             audit[n]=(hidden,removed,observable,max(st.total()-hidden,0))
+        if CAPABILITY_KIE_V23:
+            self.last_cap_kie={n:(int(cap_checked.get(n,0)),int(cap_missing.get(n,0)))
+                               for n in topo.nodes if not topo.nodes[n].external}
+        else:
+            self.last_cap_kie={}
         return true,claimed,typed,mat,boundary,audit,lstate,subclaimed
 
 def schedule(sim,rng):
@@ -1690,6 +1720,15 @@ def schedule(sim,rng):
 
 def features(d):
     d=d.sort_values(["nid","t"]).reset_index(drop=True)
+    for c in CAP_DERIVED_NAMES:d[c]=np.nan
+    if CAPABILITY_KIE_V23 and all(c in d.columns for c in CAP_KIE_NAMES):
+        for _,g in d.groupby("nid",sort=False):
+            miss=g["kie_cap_missing"].fillna(0.0).astype(float)
+            checked=g["kie_cap_checked"].fillna(0.0).astype(float)
+            sm=miss.rolling(10,min_periods=4).sum()
+            sc=checked.rolling(10,min_periods=4).sum()
+            d.loc[g.index,"kie_cap_missing_5m"]=sm.to_numpy()
+            d.loc[g.index,"kie_cap_missing_rate_5m"]=(sm/np.maximum(sc,1.0)).to_numpy()
     d=heavy_hitter_subscriber_features(d)
     d=peer_service_subscriber_multiview_features(d)
     d=peer_service_subscriber_rank_persistence_features(d)
@@ -1768,6 +1807,8 @@ def generate(seed,days=DAYS,arm="compact"):
     jitter=defaultdict(lambda:deque(maxlen=10))
     rows=[]
     row_feature_cols=list(NEW)+list(O.EXTRA)+list(D.BEHAVIOR)+list(KIE_GROUP_SKETCH)
+    if CAPABILITY_KIE_V23:
+        row_feature_cols+=list(CAP_KIE_NAMES)+list(CAP_DERIVED_NAMES)
     if SUBSCRIBER_KIE_V22:
         row_feature_cols+=list(SUB_HH_NAMES)
     elif SUBSCRIBER_KIE_V6:
@@ -1794,6 +1835,7 @@ def generate(seed,days=DAYS,arm="compact"):
         row_feature_cols+=[SUB_PEER_SERVICE_BIN_CUSUM_UNCAPPED_NAME]
     for t in range(cfg.n_intervals):
         truth,claimed,typed,mat,boundary,audit,lstate,subclaimed=sim.step_true(t,eps)
+        capkie=getattr(sim,"last_cap_kie",{})
         rng=book.child("measure",t);trng=extra_rng(seed,2,t);brng=extra_rng(seed,3,t)
         active={e.nid:e for e in eps if e.kind in KINDS and e.t0<=t<=e.t1}
         fresh={};tc={};mc={};sensors={};obs={};profiles={}
@@ -1871,6 +1913,11 @@ def generate(seed,days=DAYS,arm="compact"):
             if SUBSCRIBER_KIE_V8:row[SUB_PEER_PACKED_NAME]=None
             if SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10 or SUBSCRIBER_KIE_V11 or SUBSCRIBER_KIE_V12 or SUBSCRIBER_KIE_V13 or SUBSCRIBER_KIE_V14 or SUBSCRIBER_KIE_V15 or SUBSCRIBER_KIE_V16 or SUBSCRIBER_KIE_V17 or SUBSCRIBER_KIE_V18 or SUBSCRIBER_KIE_V19 or SUBSCRIBER_KIE_V22:row[SUB_PEER_SERVICE_PACKED_NAME]=None
             row.update(inv.get(n,{}));row.update(extra.get(n,{}));row.update(behavior.get(n,{}))
+            if CAPABILITY_KIE_V23:
+                checked,missing=capkie.get(n,(0,0))
+                row["kie_cap_checked"]=float(checked)
+                row["kie_cap_missing"]=float(missing)
+                row["kie_cap_missing_rate"]=float(missing/max(checked,1))
             # Independent boundary sensor remains observable even when CU lost.
             if n in sensors and n not in fresh:
                 row.update({"beh_border_"+k:v for k,v in zip(D.PROFILE,D.profile(sensors[n]))})
