@@ -124,6 +124,7 @@ SUB_RESID_NAMES=tuple(
     f"kie_sub_g{g}_{k}" for g in range(len(GROUPS))
     for k in ("max_resid","rms_resid","chi2")
 )
+SUB_PACKED_NAME="__kie_sub_bins_packed"
 def service_group(service):
     gs={GROUP[F.MT_IDX[m]] for m in F.SERVICE_TEMPLATE[service]}
     assert len(gs)==1,(service,gs)
@@ -149,11 +150,15 @@ def noisy_subscriber_sketch(a,rng,sigma):
 def subscriber_profile(a):
     a=np.asarray(a,float);out={}
     assert a.shape==(len(GROUPS),SUB_HASH_BINS)
+    if SUBSCRIBER_KIE_V7:
+        # Internal representation only: the wire format is still exactly the
+        # same 4 x 16 uint32 KIE sketch. Packing avoids millions of Python dict
+        # insertions during simulation; residuals are expanded once afterwards.
+        out[SUB_PACKED_NAME]=a.astype(np.float32,copy=False).reshape(-1).copy()
+        return out
     for g in range(len(GROUPS)):
         x=a[g];tot=float(x.sum())
-        # These keyed bin counts are already transported by compact KIE v6.
-        # Keeping them at the coordinator adds zero wire overhead and allows
-        # causal rolling aggregation before concentration metrics are formed.
+        # v6 development keeps scalar bins for rolling-audit reproducibility.
         for b,v in enumerate(x):
             out[f"kie_sub_g{g}_b{b}"]=float(v)
         if tot<=0:
@@ -170,51 +175,55 @@ def subscriber_profile(a):
     return out
 
 def subscriber_residual_features(d):
-    """Derive zero-extra-wire subscriber residuals from frozen commissioning data.
+    """Derive zero-extra-wire subscriber residuals from frozen commissioning data."""
+    if not SUBSCRIBER_KIE_V7:
+        for c in SUB_RESID_NAMES:d[c]=np.nan
+        return d
 
-    The compact KIE transports only keyed 16-bin counts. For each node/service
-    group we estimate benign bin probabilities from t < DEPLOY_BASELINE. Current
-    expected counts scale with the current group total, so ordinary load changes
-    do not masquerade as concentration. Residuals are additionally divided by
-    their empirical commissioning IQR to absorb over-dispersion across flows.
-    """
-    for c in SUB_RESID_NAMES:d[c]=np.nan
-    if not SUBSCRIBER_KIE_V7:return d
+    nrow=len(d)
+    result={c:np.full(nrow,np.nan,dtype=float) for c in SUB_RESID_NAMES}
+    if SUB_PACKED_NAME not in d.columns:
+        for c,v in result.items():d[c]=v
+        return d
+
+    # Process each node as dense NumPy arrays. This replaces repeated pandas
+    # column slicing/loc writes in the hot path and removes the packed sketch
+    # before the rest of feature engineering.
     for _,gdf in d.groupby("nid",sort=False):
         ix=gdf.index.to_numpy()
         tt=gdf.t.to_numpy()
+        obj=gdf[SUB_PACKED_NAME].to_numpy()
+        valid=np.array([isinstance(v,np.ndarray) and v.size==len(GROUPS)*SUB_HASH_BINS for v in obj],dtype=bool)
+        if not valid.any():continue
+        X=np.full((len(gdf),len(GROUPS),SUB_HASH_BINS),np.nan,dtype=float)
+        X[valid]=np.stack(obj[valid]).reshape((-1,len(GROUPS),SUB_HASH_BINS))
+        warm=valid&(tt<DEPLOY_BASELINE)
+        if warm.sum()<20:continue
+
         for grp in range(len(GROUPS)):
-            cols=[f"kie_sub_g{grp}_b{b}" for b in range(SUB_HASH_BINS)]
-            X=gdf[cols].to_numpy(float)
-            finite=np.isfinite(X).all(axis=1)
-            warm=finite&(tt<DEPLOY_BASELINE)
-            if warm.sum()<20:continue
-            H=np.maximum(X[warm],0.0)
-            agg=H.sum(axis=0)
-            alpha=1.0
+            A=X[:,grp,:]
+            H=np.maximum(A[warm],0.0)
+            agg=H.sum(axis=0);alpha=1.0
             p=(agg+alpha)/(agg.sum()+alpha*SUB_HASH_BINS)
-            def pearson(A):
-                A=np.maximum(np.asarray(A,float),0.0)
-                N=A.sum(axis=1,keepdims=True)
+            def pearson(B):
+                B=np.maximum(np.asarray(B,float),0.0)
+                N=B.sum(axis=1,keepdims=True)
                 E=N*p[None,:]
                 var=E*(1.0-p[None,:])+(0.10*E)**2+1.0
-                return (A-E)/np.sqrt(var)
+                return (B-E)/np.sqrt(var)
             Zw=pearson(H)
             center=np.median(Zw,axis=0)
-            q25=np.quantile(Zw,.25,axis=0);q75=np.quantile(Zw,.75,axis=0)
+            q25,q75=np.quantile(Zw,[.25,.75],axis=0)
             scale=np.maximum((q75-q25)/1.349,1.0)
-            allz=np.zeros_like(X,dtype=float)
-            if finite.any():
-                allz[finite]=(pearson(X[finite])-center[None,:])/scale[None,:]
-            posz=np.maximum(allz,0.0)
-            maxr=np.arcsinh(np.max(posz,axis=1))
-            rms=np.arcsinh(np.sqrt(np.mean(posz*posz,axis=1)))
-            chi=np.arcsinh(np.sqrt(np.sum(posz*posz,axis=1)))
-            maxr[~finite]=np.nan;rms[~finite]=np.nan;chi[~finite]=np.nan
-            d.loc[ix,f"kie_sub_g{grp}_max_resid"]=maxr
-            d.loc[ix,f"kie_sub_g{grp}_rms_resid"]=rms
-            d.loc[ix,f"kie_sub_g{grp}_chi2"]=chi
-    return d
+            Z=np.zeros_like(A,dtype=float)
+            Z[valid]=(pearson(A[valid])-center[None,:])/scale[None,:]
+            P=np.maximum(Z,0.0)
+            result[f"kie_sub_g{grp}_max_resid"][ix]=np.where(valid,np.arcsinh(np.max(P,axis=1)),np.nan)
+            result[f"kie_sub_g{grp}_rms_resid"][ix]=np.where(valid,np.arcsinh(np.sqrt(np.mean(P*P,axis=1))),np.nan)
+            result[f"kie_sub_g{grp}_chi2"][ix]=np.where(valid,np.arcsinh(np.sqrt(np.sum(P*P,axis=1))),np.nan)
+
+    for c,v in result.items():d[c]=v
+    return d.drop(columns=[SUB_PACKED_NAME])
 
 def group_counts(a):
     out=defaultdict(int)
@@ -764,6 +773,7 @@ def generate(seed,days=DAYS,arm="compact"):
         for n,vals in obs.items():
             nd=sim.topo.nodes[n];e=active.get(n)
             row={c:np.nan for c in list(NEW)+list(O.EXTRA)+list(D.BEHAVIOR)+list(KIE_GROUP_SKETCH)+list(SUB_PROFILE_NAMES)+list(SUB_BIN_NAMES)+list(SUB_RESID_NAMES)}
+            if SUBSCRIBER_KIE_V7:row[SUB_PACKED_NAME]=None
             row.update(inv.get(n,{}));row.update(extra.get(n,{}));row.update(behavior.get(n,{}))
             # Independent boundary sensor remains observable even when CU lost.
             if n in sensors and n not in fresh:
