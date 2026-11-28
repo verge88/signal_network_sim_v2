@@ -36,7 +36,14 @@ empty=O.empty
 extra_rng=O.extra_rng
 ROLE_ABUSE_V2=os.getenv("SS7_ROLE_ABUSE_V2","0")=="1"
 FRESH_TEST_V3=os.getenv("SS7_FRESH_TEST_V3","0")=="1"
-if ROLE_ABUSE_V2:
+COMMISSIONING_V4=os.getenv("SS7_COMMISSIONING_V4","0")=="1"
+if COMMISSIONING_V4:
+    # Frozen before generation or inspection of the v4 TEST worlds.
+    TRAIN=(23001,23002,23003)
+    RANK=(23101,23102)
+    CAL=(23201,23202)
+    TEST=(23301,23302)
+elif ROLE_ABUSE_V2:
     # Development/calibration worlds remain frozen. Each detector revision gets
     # a new untouched holdout instead of reusing a previously inspected TEST.
     TRAIN=(22001,22002,22003)
