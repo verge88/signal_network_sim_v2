@@ -1,0 +1,52 @@
+name: SS7 capability hybrid v23.2 frozen RANK
+on:
+  push:
+    branches: [ss7-anti-overfit-development]
+    paths:
+      - .github/workflows/ss7-v232-capability-hybrid-fast.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  SS7_CAPABILITY_KIE_V23: "1"
+  SS7_DEPLOY_BASELINE: "180"
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {profile: nominal, runid: "46161152270", pattern: "v23-world-compact-*"}
+          - {profile: moderate, runid: "46162317317", pattern: "v23-stress-moderate-*"}
+          - {profile: severe, runid: "46162317317", pattern: "v23-stress-severe-*"}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/v232_capability_hybrid_rank.py
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ matrix.runid }}
+          pattern: ${{ matrix.pattern }}
+          path: results/incoming
+      - run: |
+          mkdir -p results/worlds
+          for d in results/incoming/*; do
+            seed="${d##*-}"
+            mv "$d" "results/worlds/world-compact-$seed"
+          done
+      - run: python -u -m ss7.v232_capability_hybrid_rank --root results/worlds --output results/audit --seeds 41101 41102 41103
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-v232-capability-hybrid-${{ matrix.profile }}
+          path: results/audit
+          retention-days: 7
