@@ -12,6 +12,8 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, HistGradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import precision_score, recall_score, f1_score, average_precision_score, roc_auc_score
@@ -33,12 +35,14 @@ add_record=O.add_record
 empty=O.empty
 extra_rng=O.extra_rng
 ROLE_ABUSE_V2=os.getenv("SS7_ROLE_ABUSE_V2","0")=="1"
+FRESH_TEST_V3=os.getenv("SS7_FRESH_TEST_V3","0")=="1"
 if ROLE_ABUSE_V2:
-    # Frozen before any v2 holdout result is inspected.
+    # Development/calibration worlds remain frozen. Each detector revision gets
+    # a new untouched holdout instead of reusing a previously inspected TEST.
     TRAIN=(22001,22002,22003)
     RANK=(22101,22102)
     CAL=(22201,22202)
-    TEST=(22301,22302)
+    TEST=(22401,22402) if FRESH_TEST_V3 else (22301,22302)
 else:
     TRAIN=(21001,21002,21003)
     RANK=(21101,21102)
@@ -622,13 +626,21 @@ def fit(d,mode,target,kind):
     if kind=="rf":
         est=RandomForestClassifier(n_estimators=120,max_depth=10,min_samples_leaf=20,
             max_features="sqrt",bootstrap=True,max_samples=.70,n_jobs=2,random_state=42)
+        model=make_pipeline(SimpleImputer(strategy="median",keep_empty_features=True),est)
     elif kind=="gb":
         est=GradientBoostingClassifier(n_estimators=80,learning_rate=.04,max_depth=1,
             min_samples_leaf=30,subsample=.65,max_features="sqrt",random_state=42)
+        model=make_pipeline(SimpleImputer(strategy="median",keep_empty_features=True),est)
+    elif kind=="logit":
+        # Strong L2 shrinkage and role-specific fitting deliberately trade
+        # training fit for transfer across independently generated worlds.
+        est=LogisticRegression(C=.05,max_iter=800,solver="lbfgs",random_state=42)
+        model=make_pipeline(SimpleImputer(strategy="median",keep_empty_features=True),
+                            StandardScaler(),est)
     else:
         est=HistGradientBoostingClassifier(max_iter=70,learning_rate=.05,max_leaf_nodes=7,
             min_samples_leaf=50,l2_regularization=2.0,early_stopping=False,random_state=42)
-    model=make_pipeline(SimpleImputer(strategy="median",keep_empty_features=True),est)
+        model=make_pipeline(SimpleImputer(strategy="median",keep_empty_features=True),est)
     model.fit(matrix(d,names),y,**{model.steps[-1][0]+"__sample_weight":w})
     return names,model
 def fit_compromise_soph(d,soph,mode,kind="hgb"):
@@ -638,6 +650,15 @@ def fit_compromise_soph(d,soph,mode,kind="hgb"):
     keep=(d.attack=="normal")|((d.attack=="compromise")&(d.sophistication==soph))
     q=d.loc[keep].copy()
     return fit(q,mode,"comp",kind)
+
+def fit_compromise_role_soph(d,soph,role,mode="naive_drift",kind="logit"):
+    """Fit one compromise expert inside a single observable node role."""
+    keep=((d.attack=="normal")|((d.attack=="compromise")&(d.sophistication==soph))) & (d.ntype.astype(str)==role)
+    q=d.loc[keep].copy()
+    if q.empty or target_y(q,"comp").sum()==0:
+        raise ValueError(f"no training support for {soph}/{role}")
+    return fit(q,mode,"comp",kind)
+
 
 
 OTHER=KINDS[:-1]
@@ -685,12 +706,17 @@ def train(root,out,arm):
     # in local/base temporal and zone behaviour. STATISTICAL/ADAPTIVE actively
     # falsify reports, so cross-node invariants are the appropriate evidence.
     soph_spec={
+        # Keep the former global naive model only as a diagnostic / CUSUM
+        # baseline. The primary cascade below uses role-specific linear experts.
         "comp_naive_aug":("naive","naive_drift","hgb"),
         "comp_statistical_aug":("statistical","invariant","hgb"),
         "comp_adaptive_aug":("adaptive","invariant","hgb"),
     }
     for n,(soph,mode,kind) in soph_spec.items():
         models[n]=fit_compromise_soph(aug,soph,mode,kind);print("FIT",arm,n,flush=True)
+    for role,name in NAIVE_ROLE_MODEL_NAMES.items():
+        models[name]=fit_compromise_role_soph(aug,"naive",role,"naive_drift","logit")
+        print("FIT",arm,name,flush=True)
 
     cal=[]
     for seed in CAL:
@@ -733,13 +759,23 @@ def train(root,out,arm):
         train_stride=TRAIN_STRIDE,normal_per_world=TRAIN_NORMAL_PER_WORLD,
         rf=dict(max_depth=10,min_samples_leaf=20,max_features="sqrt",max_samples=.70),
         gb=dict(max_depth=1,min_samples_leaf=30,learning_rate=.04,subsample=.65),
-        hgb=dict(max_leaf_nodes=7,min_samples_leaf=50,learning_rate=.05,l2_regularization=2.0)),indent=2))
+        hgb=dict(max_leaf_nodes=7,min_samples_leaf=50,learning_rate=.05,l2_regularization=2.0),
+        naive_role_logit=dict(C=.05,features="naive_drift",roles=sorted(NAIVE_ROLE_MODEL_NAMES))),indent=2))
     print("TRAIN",arm,len(d),d.attack.value_counts().to_dict(),flush=True)
     print("TRAIN_AUG",arm,len(aug),aug.attack.value_counts().to_dict(),flush=True)
 def predict(d,models):
     s={n:m.predict_proba(matrix(d,c))[:,1] for n,(c,m) in models.items()}
     for n,v in s.items():assert np.isfinite(v).all(),n
     s["article_special"]=.5*(s["article_rf"]+s["article_gb"])
+    # Runtime role is part of network inventory, not an attack label. Select
+    # the corresponding frozen role expert without mixing incomparable scores.
+    if all(name in s for name in NAIVE_ROLE_MODEL_NAMES.values()):
+        role=d.ntype.astype(str).to_numpy()
+        v=np.zeros(len(d),float)
+        for r,name in NAIVE_ROLE_MODEL_NAMES.items():
+            mask=role==r
+            v[mask]=s[name][mask]
+        s["comp_naive_role_aug"]=v
     return s
 
 CHANNELS=("general","invariant","behavior")+OTHER
@@ -979,7 +1015,8 @@ def calibrate_hybrid_raw(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
     return dict(kind="hybrid_raw",threshold=margin_cut,streak=int(chosen),
         channel_thresholds=thresholds,diagnostics=diagnostics)
 
-COMP_SOPH_CHANNELS=("comp_naive","comp_statistical","comp_adaptive")
+COMP_SOPH_CHANNELS=("comp_naive_role","comp_statistical","comp_adaptive")
+NAIVE_ROLE_MODEL_NAMES={r.value:f"comp_naive_{r.value.lower()}_lin" for r in F.NodeType}
 NAIVE_CUSUM_K=24
 NAIVE_CUSUM_Q=.50
 
