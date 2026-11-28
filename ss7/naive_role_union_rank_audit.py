@@ -178,6 +178,14 @@ def evaluate_holdout(cal_items,ev,se,variant,w,role):
     ye=y[eligible];score=se[eligible]
     neg=eligible&(ev.label.to_numpy()==0)
     pos=y.astype(bool)
+    naive_eps=[]
+    for eid,g in ev[(ev.attack=="compromise")&(ev.sophistication=="naive")&
+                    (ev.ntype.astype(str)==role)].groupby("episode_id",sort=False):
+        ix=g.index.to_numpy()
+        if len(ix):naive_eps.append(ix)
+    ep1=sum(bool(np.any(se[ix]>cut)) for ix in naive_eps)
+    z3=C.streak_score(ev,se,3)
+    ep3=sum(bool(np.any(z3[ix]>cut)) for ix in naive_eps)
     return dict(
         cut=float(cut),
         auc=float(roc_auc_score(ye,score)) if ye.sum() and (~ye.astype(bool)).sum() else np.nan,
@@ -185,6 +193,9 @@ def evaluate_holdout(cal_items,ev,se,variant,w,role):
         positives=int(pos.sum()),
         detected=int((se[pos]>cut).sum()),
         row_tpr=float((se[pos]>cut).mean()) if pos.sum() else np.nan,
+        episodes=len(naive_eps),
+        episode_recall_1=float(ep1/len(naive_eps)) if naive_eps else np.nan,
+        episode_recall_3=float(ep3/len(naive_eps)) if naive_eps else np.nan,
         false_rows_day=float((se[neg]>cut).sum()/elapsed(ev)),
     )
 
@@ -215,17 +226,24 @@ def main(root,out,seeds=RANK):
         mean_auc=("auc","mean"),min_auc=("auc","min"),
         mean_ap=("ap","mean"),min_ap=("ap","min"),
         mean_row_tpr=("row_tpr","mean"),min_row_tpr=("row_tpr","min"),
+        mean_episode_recall_1=("episode_recall_1","mean"),
+        min_episode_recall_1=("episode_recall_1","min"),
+        mean_episode_recall_3=("episode_recall_3","mean"),
+        min_episode_recall_3=("episode_recall_3","min"),
         worst_false_rows_day=("false_rows_day","max")
     ).reset_index()
-    # Predeclared selection: maximize worst-role/world row TPR, then min AP,
-    # subject to a modest cross-world raw false-row envelope.
+    # Predeclared selection: maximize worst-role/world three-window episode
+    # recall, then average three-window recall and minimum AP, under a strict
+    # raw false-row envelope.
     ok=agg[agg.worst_false_rows_day<=8.0].copy()
     cand=ok if len(ok) else agg
-    cand=cand.sort_values(["min_row_tpr","min_ap","mean_ap"],ascending=False)
+    cand=cand.sort_values(["min_episode_recall_3","mean_episode_recall_3","min_ap","mean_ap"],
+                          ascending=False)
     winner=cand.iloc[0].to_dict()
     agg.to_csv(out/"summary.csv",index=False)
     (out/"winner.json").write_text(json.dumps(winner,indent=2))
-    print("SUMMARY\n",agg.sort_values(["min_row_tpr","min_ap"],ascending=False).to_string(index=False),flush=True)
+    print("SUMMARY\n",agg.sort_values(["min_episode_recall_3","mean_episode_recall_3","min_ap"],
+        ascending=False).to_string(index=False),flush=True)
     print("WINNER",json.dumps(winner,indent=2),flush=True)
 
 if __name__=="__main__":
