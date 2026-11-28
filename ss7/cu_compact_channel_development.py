@@ -718,10 +718,10 @@ def train(root,out,arm):
     for n,sp in spec.items():
         models[n]=fit(d,*sp);print("FIT",arm,n,flush=True)
 
-    # New anti-overfit specialists see five independent development worlds.
-    # RANK remains untouched by the original comparators; only *_aug models
-    # consume it, so the baseline/tail models are still directly comparable.
-    aug=_training_frame(root,arm,TRAIN+RANK)
+    # v5 keeps RANK as a true method-selection holdout. Earlier development
+    # arms are preserved for reproducibility, but no v5 learner may fit RANK.
+    aug_seeds=TRAIN if TARGETED_ABUSE_V5 else TRAIN+RANK
+    aug=_training_frame(root,arm,aug_seeds)
     aug_spec={k+"_aug":("base",k,"hgb") for k in OTHER}
     aug_spec["invariant_aug"]=("invariant","comp","hgb")
     aug_spec["local_aug"]=("local","all","rf")
@@ -781,7 +781,7 @@ def train(root,out,arm):
     dg.to_csv(out/"generalization.csv",index=False)
     joblib.dump(models,out/"models.joblib")
     (out/"features.json").write_text(json.dumps({n:v[0] for n,v in models.items()},indent=2))
-    (out/"anti_overfit.json").write_text(json.dumps(dict(train=TRAIN,augmented_train=TRAIN+RANK,
+    (out/"anti_overfit.json").write_text(json.dumps(dict(train=TRAIN,augmented_train=aug_seeds,rank=RANK,
         train_stride=TRAIN_STRIDE,normal_per_world=TRAIN_NORMAL_PER_WORLD,
         rf=dict(max_depth=10,min_samples_leaf=20,max_features="sqrt",max_samples=.70),
         gb=dict(max_depth=1,min_samples_leaf=30,learning_rate=.04,subsample=.65),
