@@ -1607,6 +1607,61 @@ def calibrate_soph_hybrid(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
     return dict(kind="soph_hybrid",threshold=margin_cut,streak=int(chosen),
         channel_thresholds=thresholds,diagnostics=diagnostics)
 
+CORE_COMP_CHANNELS=("comp_statistical","comp_adaptive")
+
+def soph_core_channels(d,p,thresholds):
+    """Stable cascade core: no NAIVE channel and therefore no naive-score shift."""
+    out={"fallback":_logit(p["local_aug"])-_logit(_threshold_vector(d,thresholds["fallback"]))}
+    for k in OTHER:
+        out[k]=_logit(p[k+"_aug"])-_logit(_threshold_vector(d,thresholds[k]))
+    for k in CORE_COMP_CHANNELS:
+        out[k]=_logit(p[k+"_aug"])-_logit(_threshold_vector(d,thresholds[k]))
+    return out
+
+def calibrate_soph_core(frames,preds,raw=RAW_BUDGET,notice=INCIDENT_BUDGET):
+    """CAL-only fusion for common attacks plus statistical/adaptive compromise."""
+    thresholds={}
+    thresholds["fallback"]=float(max(
+        threshold(p["local_aug"][d.label.to_numpy()==0],raw,elapsed(d))
+        for d,p in zip(frames,preds)))
+    n_special=len(OTHER)+len(CORE_COMP_CHANNELS)
+    share=float(raw/n_special)
+    for k in OTHER:
+        thresholds[k]=float(max(
+            threshold(p[k+"_aug"][d.label.to_numpy()==0],share,elapsed(d))
+            for d,p in zip(frames,preds)))
+    for k in CORE_COMP_CHANNELS:
+        by_role={}
+        for role in sorted(set(np.concatenate([d.ntype.astype(str).unique() for d in frames]))):
+            vals=[]
+            for d,p in zip(frames,preds):
+                mask=(d.label.to_numpy()==0)&(d.ntype.astype(str).to_numpy()==role)
+                if mask.any():vals.append(threshold(p[k+"_aug"][mask],share,elapsed(d)))
+            if vals:by_role[role]=float(max(vals))
+        thresholds[k]=by_role
+
+    prepared=[];cuts=[]
+    for d,p in zip(frames,preds):
+        ch=soph_core_channels(d,p,thresholds)
+        score,_=combined(d,ch,True,negative_only=True,streak_len=3)
+        cuts.append(threshold(score[np.isfinite(score)],raw,elapsed(d)))
+        prepared.append((d,ch))
+    margin_cut=float(max(cuts))
+    diagnostics=[];chosen=None
+    for length in (3,5,7,9,12):
+        nr=[];wr=[]
+        for d,ch in prepared:
+            score,z=combined(d,ch,True,negative_only=True,streak_len=length)
+            wr.append(float((score>margin_cut).sum()/elapsed(d)))
+            nr.append(float(len(notify(d,z,margin_cut))/elapsed(d)))
+        diagnostics.append(dict(streak=length,worst_notifications_day=max(nr),
+            worst_windows_day=max(wr),rates=nr))
+        if max(nr)<=notice:
+            chosen=length;break
+    if chosen is None:chosen=12
+    return dict(kind="soph_core",threshold=margin_cut,streak=int(chosen),
+        raw_budget=float(raw),channel_thresholds=thresholds,diagnostics=diagnostics)
+
 def soph_cusum_channels(d,p,thresholds,cusum_rule,negative_only=False):
     out=soph_hybrid_channels(d,p,thresholds)
     out["comp_naive_cusum"]=naive_cusum_margin(d,p,cusum_rule,negative_only=negative_only)
@@ -1647,6 +1702,8 @@ def policy_channels(d,p,ref,name,policy):
         return hybrid_raw_channels(d,p,policy["channel_thresholds"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_hybrid":
         return soph_hybrid_channels(d,p,policy["channel_thresholds"]),True,float(policy["threshold"])
+    if policy.get("kind")=="soph_core":
+        return soph_core_channels(d,p,policy["channel_thresholds"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_cusum":
         return soph_cusum_channels(d,p,policy["channel_thresholds"],policy["naive_cusum"]),True,float(policy["threshold"])
     if policy.get("kind")=="soph_selfnorm":
@@ -1681,6 +1738,8 @@ def evaluate(root,modelpath,out,arm):
             policies["hybrid_augmented"]=calibrate_hybrid_raw(cal,ps)
             if all((k+"_aug") in ps[0] for k in COMP_SOPH_CHANNELS):
                 policies["hybrid_soph_augmented"]=calibrate_soph_hybrid(cal,ps)
+                for base_raw in (20.,18.,16.):
+                    policies[f"hybrid_soph_core_{int(base_raw)}"]=calibrate_soph_core(cal,ps,base_raw)
                 policies["hybrid_soph_cusum"]=calibrate_soph_cusum(cal,ps)
                 policies["hybrid_soph_selfnorm"]=calibrate_soph_selfnorm(cal,ps)
                 policies["hybrid_soph_load_total"]=calibrate_soph_load_shift(cal,ps,"total")
