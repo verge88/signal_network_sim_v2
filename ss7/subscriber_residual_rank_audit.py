@@ -90,8 +90,15 @@ def main(root,out,seeds):
         min_episode_recall_1=("episode_recall_1","min"),
         mean_episode_recall_3=("episode_recall_3","mean"),
         min_episode_recall_3=("episode_recall_3","min"),
-        worst_false_rows_day=("false_rows_day","max")).reset_index()
-    ok=agg[agg.worst_false_rows_day<=RAW_DAY].copy()
+        worst_role_false_rows_day=("false_rows_day","max")).reset_index()
+    # The supplement gets one global budget, not one budget per role.
+    gf=(df.groupby(["variant","smooth","eval_seed"],as_index=False)
+          .false_rows_day.sum()
+          .groupby(["variant","smooth"],as_index=False)
+          .false_rows_day.max()
+          .rename(columns={"false_rows_day":"worst_global_false_rows_day"}))
+    agg=agg.merge(gf,on=["variant","smooth"],how="left")
+    ok=agg[agg.worst_global_false_rows_day<=RAW_DAY].copy()
     cand=ok if len(ok) else agg
     cand=cand.sort_values(["min_episode_recall_3","mean_episode_recall_3",
                            "min_ap","mean_ap"],
