@@ -1,4 +1,5 @@
 name: SS7 naive MAP-count CUSUM RANK
+# frozen RANK: 26101-26103
 on:
   push:
     branches: [ss7-anti-overfit-development]
