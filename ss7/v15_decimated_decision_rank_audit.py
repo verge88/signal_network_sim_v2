@@ -1,0 +1,117 @@
+"""RANK-only decision-cadence audit for frozen v15 rolling KIE.
+
+v15 forms a 15-minute rolling statistic every 30 seconds. Adjacent scores share
+29/30 of their underlying counts, so one benign burst can be counted as many
+false windows. KIE sampling remains 30 s; only alert evaluation is decimated at
+a fixed, label-free cadence. No CAL/TEST data are loaded.
+"""
+from __future__ import annotations
+import argparse, json, os
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from sklearn.metrics import roc_auc_score, average_precision_score
+from ss7 import fix as F
+from ss7 import cu_compact_channel_development as C
+from ss7.incident_calibration_study import threshold, notify
+
+BASELINE_END=int(os.getenv("SS7_DEPLOY_BASELINE","180"))
+RAW_DAY=20.0
+NOTICE_DAY=2.0
+FEATURE=C.SUB_PEER_SERVICE_ROLL30_NAME
+STRIDES=(5,10,20,30)  # 2.5, 5, 10, 15 minutes
+
+def monitor_days(d):
+    return max((int(d.t.max())-BASELINE_END+1)/F.INTERVALS_PER_DAY,
+               1/F.INTERVALS_PER_DAY)
+
+def decision_mask(d,stride):
+    t=d.t.to_numpy()
+    # Deterministic global cadence; no seed/label dependent phase.
+    return (t>=BASELINE_END)&((t-BASELINE_END)%stride==0)
+
+def world_cut(d,s,stride):
+    m=(d.label.to_numpy()==0)&decision_mask(d,stride)&np.isfinite(s)
+    return float(threshold(s[m],RAW_DAY,monitor_days(d)))
+
+def evaluate(d,s,cut,stride,eligible):
+    dm=decision_mask(d,stride);finite=np.isfinite(s)
+    y=((d.attack=="compromise")&(d.sophistication=="naive")).to_numpy(int)
+    valid=((d.label.to_numpy()==0)|y.astype(bool))&dm&finite
+    yy=y[valid];ss=s[valid]
+    auc=float(roc_auc_score(yy,ss)) if yy.sum() and (~yy.astype(bool)).sum() else np.nan
+    ap=float(average_precision_score(yy,ss)) if yy.sum() else np.nan
+
+    neg=(d.label.to_numpy()==0)&dm&finite
+    fwin=float((s[neg]>cut).sum()/monitor_days(d))
+
+    z=np.where(dm&finite,s,-np.inf)
+    nidx=notify(d,z,cut)
+    labels=d.label.to_numpy()
+    fnot=sum(bool((labels[max(0,j-2):j+1]==0).all()) for j in nidx)/monitor_days(d)
+
+    eps=[]
+    q=d[(d.attack=="compromise")&(d.sophistication=="naive")]
+    for eid,g in q.groupby("episode_id",sort=False):
+        ix=g.index.to_numpy();e=eligible.get(int(eid))
+        fire=(z[ix]>cut);first=np.flatnonzero(fire)
+        eps.append(dict(episode=int(eid),role=str(g.ntype.iloc[0]),
+            hidden_rate=float(e.hidden_rate) if e is not None else np.nan,
+            hit=int(np.any(fire)),
+            delay_seconds=float(first[0]*30) if len(first) else np.nan,
+            peak=float(np.max(z[ix])) if np.isfinite(z[ix]).any() else np.nan))
+    ep=pd.DataFrame(eps);low=ep.hidden_rate<.5
+    return ep,dict(auc=auc,ap=ap,episodes=len(ep),
+        episode_recall=float(ep.hit.mean()),
+        low_recall=float(ep.loc[low,"hit"].mean()) if low.any() else np.nan,
+        high_recall=float(ep.loc[~low,"hit"].mean()) if (~low).any() else np.nan,
+        false_windows_day=fwin,false_notifications_day=float(fnot))
+
+def main(root,out,seeds):
+    seeds=tuple(int(x) for x in seeds)
+    loaded={seed:C.load(root,"compact",seed) for seed in seeds}
+    worlds={seed:x[0] for seed,x in loaded.items()}
+    eligible={seed:x[1] for seed,x in loaded.items()}
+    scores={seed:worlds[seed][FEATURE].to_numpy(float) for seed in seeds}
+    rows=[];episodes=[]
+    for stride in STRIDES:
+        for held in seeds:
+            cals=[x for x in seeds if x!=held]
+            cut=float(max(world_cut(worlds[x],scores[x],stride) for x in cals))
+            ep,m=evaluate(worlds[held],scores[held],cut,stride,eligible[held])
+            m.update(stride=stride,eval_seed=held,
+                     cal_seed=";".join(map(str,cals)),threshold=cut)
+            rows.append(m);ep["stride"]=stride;ep["eval_seed"]=held;episodes.append(ep)
+
+    df=pd.DataFrame(rows);ed=pd.concat(episodes,ignore_index=True)
+    agg=df.groupby("stride").agg(
+        mean_auc=("auc","mean"),min_auc=("auc","min"),
+        mean_ap=("ap","mean"),min_ap=("ap","min"),
+        mean_recall=("episode_recall","mean"),min_recall=("episode_recall","min"),
+        mean_low_recall=("low_recall","mean"),mean_high_recall=("high_recall","mean"),
+        worst_false_windows_day=("false_windows_day","max"),
+        worst_false_notifications_day=("false_notifications_day","max")).reset_index()
+    agg["budget_ok"]=(agg.worst_false_windows_day<=RAW_DAY)&(
+        agg.worst_false_notifications_day<=NOTICE_DAY)
+    ok=agg[agg.budget_ok].copy();cand=ok if len(ok) else agg
+    cand=cand.sort_values(["min_recall","mean_recall","min_ap","mean_ap"],
+                          ascending=[False,False,False,False])
+    winner=cand.iloc[0].to_dict();stride=int(winner["stride"])
+    byrole=ed[ed.stride==stride].groupby("role").agg(
+        episodes=("episode","count"),recall=("hit","mean"),
+        mean_peak=("peak","mean")).reset_index()
+
+    df.to_csv(out/"cross_world.csv",index=False);agg.to_csv(out/"summary.csv",index=False)
+    ed.to_csv(out/"episodes.csv",index=False);byrole.to_csv(out/"by_role.csv",index=False)
+    (out/"winner.json").write_text(json.dumps(winner,indent=2))
+    print("SUMMARY\n",agg.to_string(index=False),flush=True)
+    print("BY_ROLE\n",byrole.to_string(index=False),flush=True)
+    print("WINNER",json.dumps(winner,indent=2),flush=True)
+
+if __name__=="__main__":
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--root",type=Path,required=True)
+    ap.add_argument("--output",type=Path,required=True)
+    ap.add_argument("--seeds",type=int,nargs="+",required=True)
+    a=ap.parse_args();a.output.mkdir(parents=True,exist_ok=True)
+    main(a.root,a.output,a.seeds)
