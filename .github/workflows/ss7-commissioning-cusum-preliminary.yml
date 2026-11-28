@@ -1,4 +1,5 @@
 name: SS7 commissioning CUSUM preliminary RANK check
+# preliminary only; final selection waits for 23103
 on:
   push:
     branches: [ss7-anti-overfit-development]
