@@ -1,4 +1,5 @@
 name: SS7 subscriber-KIE v6b rolling RANK validation
+# fresh RANK seeds: 25401-25403
 on:
   push:
     branches: [ss7-anti-overfit-development]
