@@ -1,4 +1,5 @@
 name: SS7 v19 same-world oracle diagnostic
+# frozen diagnostic 39101-39103
 on:
   push:
     branches: [ss7-anti-overfit-development]
