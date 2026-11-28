@@ -29,7 +29,9 @@ rejected rather than tuned on TEST:
 - commissioning-normalized subscriber residuals (v7);
 - node-self-normalized residuals (v7.1);
 - MAP-count CUSUM and signed service-template CUSUM;
-- peer-conditioned subscriber residuals (v8).
+- peer-conditioned subscriber residuals (v8);
+- role-stratified v8.1 and node-tail-normalized v8.2 calibration;
+- v8 neighborhood oracle (compromised node or any direct signaling neighbor).
 
 Representative strict results:
 
@@ -42,10 +44,17 @@ Representative strict results:
 | MAP-count CUSUM | 4.2% / 0% | 30.9 | rejected |
 | service-template signed CUSUM | 0% / 0% | 125.9 | rejected |
 | v8 peer-conditioned subscriber KIE | 0% / 0% | 86.4 | rejected |
+| v8.1 role-stratified calibration | 0% / 0% | 182.4 | rejected |
+| v8.2 node-tail normalization | 0% / 0% | 34.1 | rejected |
+| v8 neighborhood oracle | 0% / 0% | 3.2 | oracle; rejected |
 
 The v8 sensor also increased compact-KIE overhead to roughly 2.1--2.2% maximum
 mean link-capacity fraction in the observed RANK worlds, with responses up to
-about 5 KB, without producing transferable episode detection.
+about 5 KB, without producing transferable episode detection. Even an
+optimistic neighborhood oracle that accepted an alert at the compromised node
+or any directly adjacent signaling node detected 0/24 NAIVE episodes across
+the three v8 RANK worlds at about 3.2 false rows/day. Thus the failure is not
+explained by source-localization scoring alone.
 
 ## Oracle observability audit
 
