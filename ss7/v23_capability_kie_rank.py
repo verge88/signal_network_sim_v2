@@ -30,6 +30,18 @@ def monitor_days(d):
     return max((int(d.t.max())-BASELINE_END+1)/F.INTERVALS_PER_DAY,
                1/F.INTERVALS_PER_DAY)
 
+def clean_normal_mask(d,history=10):
+    """Normal rows whose detector-memory window contains no labelled attack."""
+    out=np.zeros(len(d),dtype=bool)
+    for _,g in d.groupby("nid",sort=False):
+        ix=g.index.to_numpy()
+        a=g.label.to_numpy(int)
+        contaminated=pd.Series(a,index=ix).rolling(
+            history,min_periods=1).max().to_numpy()>0
+        out[ix]=(a==0)&(~contaminated)&(
+            g.t.to_numpy()>=BASELINE_END)
+    return out
+
 def notifications(d,fire):
     """Node-local rising-edge notifications with a 30-minute refractory period."""
     out=[]
@@ -70,6 +82,7 @@ def evaluate(d,eligible,threshold):
     eligible_time=d.t.to_numpy()>=BASELINE_END
     fire=eligible_time&np.isfinite(score)&(score>=threshold)
     normal=(d.label.to_numpy()==0)&eligible_time
+    clean_normal=clean_normal_mask(d,history=10)
     notes=notifications(d,fire)
     ep=episode_table(d,fire,eligible)
 
@@ -85,18 +98,32 @@ def evaluate(d,eligible,threshold):
         statistical_recall=float(ep.loc[stat,"hit"].mean()),
         adaptive_recall=float(ep.loc[adap,"hit"].mean()),
         external_episode_activation=float(ep.loc[ext,"hit"].mean()),
-        false_windows_day=float((fire&normal).sum()/days),
-        false_notifications_day=float(sum(bool(normal[j]) for j in notes)/days),
-        notifications_day=float(len(notes)/days))
+        false_windows_day=float((fire&clean_normal).sum()/days),
+        raw_normal_windows_day=float((fire&normal).sum()/days),
+        false_notifications_day=float(sum(bool(clean_normal[j]) for j in notes)/days),
+        notifications_day=float(len(notes)/days),
+        clean_normal_rows=int(clean_normal.sum()))
     return ep,m
 
 def main(root,out,seeds):
     seeds=tuple(map(int,seeds))
     rows=[];episodes=[]
-    overhead=[]
+    overhead=[];diagnostics=[]
     for seed in seeds:
         d,eligible,cu=C.load(root,"compact",seed)
         overhead.append(dict(seed=seed,**cu))
+        clean=clean_normal_mask(d,history=10)
+        checked=d.loc[clean,"kie_cap_checked"].to_numpy(float)
+        missing=d.loc[clean,"kie_cap_missing"].to_numpy(float)
+        missing5=d.loc[clean,"kie_cap_missing_5m"].to_numpy(float)
+        diagnostics.append(dict(
+            seed=seed,clean_rows=int(clean.sum()),
+            checked_q50=float(np.nanquantile(checked,.50)),
+            checked_q90=float(np.nanquantile(checked,.90)),
+            checked_q99=float(np.nanquantile(checked,.99)),
+            missing_q99=float(np.nanquantile(missing,.99)),
+            missing5_q99=float(np.nanquantile(missing5,.99)),
+            missing5_max=float(np.nanmax(missing5))))
         required=set(C.CAP_KIE_NAMES+C.CAP_DERIVED_NAMES)
         miss=sorted(required-set(d.columns))
         if miss:raise KeyError(f"missing v23 fields: {miss}")
@@ -159,6 +186,7 @@ def main(root,out,seeds):
     bysoph.to_csv(out/"by_sophistication.csv",index=False)
     byattack.to_csv(out/"by_attack.csv",index=False)
     pd.DataFrame(overhead).to_csv(out/"cu_overhead.csv",index=False)
+    pd.DataFrame(diagnostics).to_csv(out/"normal_diagnostics.csv",index=False)
     (out/"winner.json").write_text(json.dumps(winner,indent=2))
 
     print("CROSS_WORLD\n",df.to_string(index=False),flush=True)
@@ -167,6 +195,7 @@ def main(root,out,seeds):
     print("BY_SOPH\n",bysoph.to_string(index=False),flush=True)
     print("BY_ATTACK\n",byattack.to_string(index=False),flush=True)
     print("WINNER",json.dumps(winner,indent=2),flush=True)
+    print("NORMAL_DIAGNOSTICS\n",pd.DataFrame(diagnostics).to_string(index=False),flush=True)
     print("CU_OVERHEAD\n",pd.DataFrame(overhead).to_string(index=False),flush=True)
 
 if __name__=="__main__":
