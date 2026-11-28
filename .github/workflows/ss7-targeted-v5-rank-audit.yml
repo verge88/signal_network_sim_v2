@@ -1,4 +1,5 @@
 name: SS7 targeted-abuse v5 RANK observability audit
+# frozen RANK-only seeds: 24101-24103
 on:
   push:
     branches: [ss7-anti-overfit-development]
