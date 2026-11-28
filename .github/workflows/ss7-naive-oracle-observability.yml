@@ -1,0 +1,50 @@
+name: SS7 naive oracle observability audit
+on:
+  push:
+    branches: [ss7-anti-overfit-development]
+    paths:
+      - .github/workflows/ss7-naive-oracle-observability.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  SS7_SUBSCRIBER_KIE_V7: "1"
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/naive_oracle_observability_audit.py
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46132390936
+          name: residual-v7-world-compact-26101
+          path: results/worlds/world-compact-26101
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46137883794
+          name: residual-v7-world-compact-26102
+          path: results/worlds/world-compact-26102
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46132390936
+          name: residual-v7-world-compact-26103
+          path: results/worlds/world-compact-26103
+      - run: python -u -m ss7.naive_oracle_observability_audit --root results/worlds --output results/audit --seeds 26101 26102 26103
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-naive-oracle-observability
+          path: results/audit
+          retention-days: 7
