@@ -1738,7 +1738,7 @@ def evaluate(root,modelpath,out,arm):
             policies["hybrid_augmented"]=calibrate_hybrid_raw(cal,ps)
             if all((k+"_aug") in ps[0] for k in COMP_SOPH_CHANNELS):
                 policies["hybrid_soph_augmented"]=calibrate_soph_hybrid(cal,ps)
-                for base_raw in (20.,18.,16.):
+                for base_raw in (20.,18.,16.,14.,12.,10.,8.):
                     policies[f"hybrid_soph_core_{int(base_raw)}"]=calibrate_soph_core(cal,ps,base_raw)
                 policies["hybrid_soph_cusum"]=calibrate_soph_cusum(cal,ps)
                 policies["hybrid_soph_selfnorm"]=calibrate_soph_selfnorm(cal,ps)
