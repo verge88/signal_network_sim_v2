@@ -1,4 +1,5 @@
 name: SS7 subscriber-KIE v6 RANK validation
+# frozen RANK-only seeds: 25101-25103
 on:
   push:
     branches: [ss7-anti-overfit-development]
