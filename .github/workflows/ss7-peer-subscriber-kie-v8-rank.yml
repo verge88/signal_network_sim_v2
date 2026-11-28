@@ -1,4 +1,5 @@
 name: SS7 peer-conditioned subscriber KIE v8 RANK
+# fresh RANK seeds 27101-27103
 on:
   push:
     branches: [ss7-anti-overfit-development]
