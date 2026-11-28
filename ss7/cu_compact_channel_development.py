@@ -124,6 +124,29 @@ def payload_bytes(topo,n,compact):
     sub_bytes=(4*len(GROUPS)*SUB_HASH_BINS) if SUBSCRIBER_KIE_V6 else 0
     return 50+4*(m+2*d+N+8+2*d*len(GROUPS)+(2*d*len(GROUPS) if relay else 0))+16*8+sub_bytes
 
+def noisy_subscriber_sketch(a,rng,sigma):
+    a=np.asarray(a,float)
+    z=np.rint(a*(1.0+rng.normal(0.0,sigma,size=a.shape)))
+    return np.maximum(z,0.0).astype(np.int64)
+
+def subscriber_profile(a):
+    a=np.asarray(a,float);out={}
+    assert a.shape==(len(GROUPS),SUB_HASH_BINS)
+    for g in range(len(GROUPS)):
+        x=a[g];tot=float(x.sum())
+        if tot<=0:
+            top1=entropy=occupied=0.0
+        else:
+            p=x/tot
+            top1=float(p.max())
+            nz=p[p>0]
+            entropy=float(-(nz*np.log2(nz)).sum()/np.log2(SUB_HASH_BINS))
+            occupied=float(np.count_nonzero(x)/SUB_HASH_BINS)
+        out[f"kie_sub_g{g}_top1"]=top1
+        out[f"kie_sub_g{g}_entropy"]=entropy
+        out[f"kie_sub_g{g}_occupied"]=occupied
+    return out
+
 def group_counts(a):
     out=defaultdict(int)
     for (direction,k,j),v in a.items():out[(direction,k,GROUP[j])]+=int(v)
@@ -600,7 +623,7 @@ def generate(seed,days=DAYS,arm="compact"):
     jitter=defaultdict(lambda:deque(maxlen=10))
     rows=[]
     for t in range(cfg.n_intervals):
-        truth,claimed,typed,mat,boundary,audit,lstate=sim.step_true(t,eps)
+        truth,claimed,typed,mat,boundary,audit,lstate,subclaimed=sim.step_true(t,eps)
         rng=book.child("measure",t);trng=extra_rng(seed,2,t);brng=extra_rng(seed,3,t)
         active={e.nid:e for e in eps if e.kind in KINDS and e.t0<=t<=e.t1}
         fresh={};tc={};mc={};sensors={};obs={};profiles={}
@@ -617,7 +640,12 @@ def generate(seed,days=DAYS,arm="compact"):
                  rotation=sim.rotation,background=sim.background,stale=False,rng=rng)
             a=O.noisy(typed[n],trng,sim.rel_sigma);b=O.noisy(mat[n],trng,sim.rel_sigma)
             if node.ntype==F.NodeType.IGW:sensors[n]=O.noisy(boundary[n],brng,sim.rel_sigma)
-            if arm=="compact":a,b,z=encode_compact(rep,a,b)
+            if arm=="compact":
+                a,b,z=encode_compact(rep,a,b)
+                if SUBSCRIBER_KIE_V6:
+                    srng=extra_rng(seed,33,t*1000+n)
+                    z.update(subscriber_profile(
+                        noisy_subscriber_sketch(subclaimed[n],srng,sim.rel_sigma)))
             if node.role==F.NodeRole.MASTER:
                 fresh[n]=rep;tc[n]=a;mc[n]=b
                 if arm=="compact":profiles[n]=z
@@ -665,7 +693,7 @@ def generate(seed,days=DAYS,arm="compact"):
             for n in fresh:behavior[n].update(profiles[n])
         for n,vals in obs.items():
             nd=sim.topo.nodes[n];e=active.get(n)
-            row={c:np.nan for c in list(NEW)+list(O.EXTRA)+list(D.BEHAVIOR)+list(KIE_GROUP_SKETCH)}
+            row={c:np.nan for c in list(NEW)+list(O.EXTRA)+list(D.BEHAVIOR)+list(KIE_GROUP_SKETCH)+list(SUB_PROFILE_NAMES)}
             row.update(inv.get(n,{}));row.update(extra.get(n,{}));row.update(behavior.get(n,{}))
             # Independent boundary sensor remains observable even when CU lost.
             if n in sensors and n not in fresh:
