@@ -1,0 +1,61 @@
+name: SS7 consumed-holdout core development check
+on:
+  push:
+    branches: [ss7-anti-overfit-development]
+    paths:
+      - .github/workflows/ss7-core-consumed-dev-eval.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  SS7_ROLE_ABUSE_V2: "1"
+  SS7_FRESH_TEST_V3: "1"
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/cu_compact_channel_development.py
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46123932425
+          pattern: v2-world-compact-221*
+          path: results/incoming
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46123932425
+          pattern: v2-world-compact-222*
+          path: results/incoming
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46126465367
+          pattern: v3-world-compact-224*
+          path: results/incoming
+      - run: |
+          mkdir -p results/worlds
+          for d in results/incoming/v2-world-compact-*; do mv "$d" "results/worlds/${d##*/v2-}"; done
+          for d in results/incoming/v3-world-compact-*; do mv "$d" "results/worlds/${d##*/v3-}"; done
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46126465367
+          name: v3-role-linear-models
+          path: results/trained
+      - run: python -u -m ss7.cu_compact_channel_development evaluate --arm compact --root results/worlds --models results/trained --output results/eval
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-core-consumed-dev-eval
+          path: results/eval
+          retention-days: 7
