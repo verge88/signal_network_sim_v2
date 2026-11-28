@@ -1,0 +1,51 @@
+name: SS7 peer-service KIE v9 smooth5 20-2 oracle
+on:
+  push:
+    branches: [ss7-anti-overfit-development]
+    paths:
+      - .github/workflows/ss7-peer-service-v9-smooth-budget-oracle.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  SS7_SUBSCRIBER_KIE_V9: "1"
+  SS7_DEPLOY_BASELINE: "180"
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/peer_service_v9_smooth_budget_oracle.py
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46140397017
+          name: peer-service-v9-world-compact-28101
+          path: results/worlds/world-compact-28101
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46140397017
+          name: peer-service-v9-world-compact-28102
+          path: results/worlds/world-compact-28102
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46140397017
+          name: peer-service-v9-world-compact-28103
+          path: results/worlds/world-compact-28103
+      - run: python -u -m ss7.peer_service_v9_smooth_budget_oracle --root results/worlds --output results/audit --seeds 28101 28102 28103
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-peer-service-v9-smooth-budget-oracle
+          path: results/audit
+          retention-days: 7
