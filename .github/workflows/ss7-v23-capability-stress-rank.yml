@@ -1,4 +1,5 @@
 name: SS7 capability KIE v23 stress RANK
+# fixed stress profiles; TEST untouched
 on:
   push:
     branches: [ss7-anti-overfit-development]
