@@ -1,4 +1,5 @@
 name: SS7 commissioning CUSUM lint
+# syntax-only gate
 on:
   push:
     branches: [ss7-anti-overfit-development]
