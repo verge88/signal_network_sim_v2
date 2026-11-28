@@ -21,7 +21,7 @@ ROLE_MSG={
     "IGW":("SRI","PRN","SRI_SM","MT_FSM","ATI","PSI"),
     "STP":("ATI","PSI","SRI","PRN","SRI_SM","MT_FSM","SAI","UL","ISD","CL"),
 }
-VARIANTS=("max","top2","l2","max_total","stable_max","stable_top2","stable_l2","stable_max_total","count_max","count_top2","count_l2","count_max_total")
+VARIANTS=("max","top2","l2","max_total","stable_max","stable_top2","stable_l2","stable_max_total","count_max","count_top2","count_l2","count_max_total","composition_max","composition_top2","composition_l2")
 SMOOTH=(1,3,5,10)
 ROLE_RAW_DAY=4.0
 
@@ -74,11 +74,38 @@ def stable_array_shift(d,x,ratio=False):
         out[ix]=np.arcsinh(np.nan_to_num(z,nan=0.0,posinf=0.0,neginf=0.0))
     return out
 
+def composition_residuals(d,role):
+    """Node-local MAP composition residuals using only attack-free warm-up."""
+    msgs=[m for m in ROLE_MSG[role] if f"obs_ratio_{m}" in d.columns]
+    out=np.zeros((len(d),len(msgs)),float)
+    if not msgs:return out
+    total=(np.nan_to_num(d["total_messages"].to_numpy(float),nan=0.0)
+           *np.nan_to_num(d["map_share"].to_numpy(float),nan=0.0))
+    counts=np.column_stack([reconstructed_count(d,m) for m in msgs])
+    for _,g in d.groupby("nid",sort=False):
+        ix=g.index.to_numpy()
+        warm=(g.t.to_numpy()<C.WARMUP)
+        if not warm.any():continue
+        den=float(total[ix][warm].sum())
+        if den<=0:continue
+        p=np.clip(counts[ix][warm].sum(axis=0)/den,1e-6,1-1e-6)
+        exp=total[ix,None]*p[None,:]
+        # Multinomial variance plus 10% relative over-dispersion protects
+        # against AR traffic and measurement noise absent from ideal Poisson.
+        var=exp*(1-p[None,:])+(0.10*exp)**2+1.0
+        z=(counts[ix]-exp)/np.sqrt(var)
+        out[ix]=np.arcsinh(np.maximum(z,0.0))
+    return out
+
 def raw_score(d,role,variant):
     stable=variant.startswith("stable_")
     count=variant.startswith("count_")
-    base_variant=variant.split("_",1)[1] if (stable or count) else variant
-    if count:
+    composition=variant.startswith("composition_")
+    base_variant=variant.split("_",1)[1] if (stable or count or composition) else variant
+    if composition:
+        z=composition_residuals(d,role)
+        if z.shape[1]==0:return np.zeros(len(d),float)
+    elif count:
         msgs=[m for m in ROLE_MSG[role] if f"obs_ratio_{m}" in d.columns]
         if not msgs:return np.zeros(len(d),float)
         z=np.column_stack([np.maximum(stable_array_shift(d,reconstructed_count(d,m)),0.0) for m in msgs])
@@ -98,7 +125,9 @@ def raw_score(d,role,variant):
     elif base_variant=="l2":
         score=np.sqrt((z*z).mean(axis=1))
     elif base_variant=="max_total":
-        if count:
+        if composition:
+            total=np.zeros(len(d),float)
+        elif count:
             total=np.maximum(stable_array_shift(d,d["total_messages"].to_numpy(float)),0.0)
         elif stable:
             total=np.maximum(stable_shift(d,"total_messages"),0.0)
@@ -119,9 +148,7 @@ def smooth(d,s,w):
 def load(root,seed):
     return C.load(root,"compact",seed)[0]
 
-def evaluate_pair(cal,ev,variant,w,role):
-    sc=smooth(cal,raw_score(cal,role,variant),w)
-    se=smooth(ev,raw_score(ev,role,variant),w)
+def evaluate_pair(cal,ev,sc,se,variant,w,role):
     cal_role=cal.ntype.astype(str).to_numpy()==role
     ev_role=ev.ntype.astype(str).to_numpy()==role
     cal_neg=cal_role&(cal.label.to_numpy()==0)
@@ -145,11 +172,16 @@ def evaluate_pair(cal,ev,variant,w,role):
 def main(root,out):
     frames={s:load(root,s) for s in RANK}
     rows=[]
+    cache={}
     for variant in VARIANTS:
-        for w in SMOOTH:
-            for role in ROLE_MSG:
+        for role in ROLE_MSG:
+            base={seed:raw_score(frames[seed],role,variant) for seed in RANK}
+            for w in SMOOTH:
+                for seed in RANK:
+                    cache[(seed,variant,w,role)]=smooth(frames[seed],base[seed],w)
                 for a,b in ((RANK[0],RANK[1]),(RANK[1],RANK[0])):
-                    r=evaluate_pair(frames[a],frames[b],variant,w,role)
+                    r=evaluate_pair(frames[a],frames[b],cache[(a,variant,w,role)],
+                        cache[(b,variant,w,role)],variant,w,role)
                     r.update(variant=variant,smooth=w,role=role,cal_seed=a,eval_seed=b)
                     rows.append(r)
     q=pd.DataFrame(rows)
