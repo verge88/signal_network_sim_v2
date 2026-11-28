@@ -525,11 +525,10 @@ def peer_service_subscriber_identity_features(d):
         flat=X.reshape((len(gdf),-1))
         cs=np.vstack([np.zeros((1,flat.shape[1])),np.cumsum(flat,axis=0)])
         cc=np.r_[0,np.cumsum(ok.astype(np.int64))]
-        R=np.zeros_like(flat);count=np.zeros(len(gdf),dtype=np.int64)
-        for j in range(len(gdf)):
-            a=max(0,j-SUB_ROLL_WINDOW+1)
-            R[j]=cs[j+1]-cs[a];count[j]=cc[j+1]-cc[a]
-        R=R.reshape(X.shape)
+        jj=np.arange(len(gdf),dtype=np.int64)
+        aa=np.maximum(0,jj-SUB_ROLL_WINDOW+1)
+        R=(cs[jj+1]-cs[aa]).reshape(X.shape)
+        count=cc[jj+1]-cc[aa]
         rvalid=ok&(count>=SUB_ROLL_MIN)
         warm_raw=ok&(tt<DEPLOY_BASELINE)
         warm_roll=rvalid&(tt<DEPLOY_BASELINE)&(tt>=SUB_ROLL_WINDOW-1)
@@ -562,24 +561,24 @@ def peer_service_subscriber_identity_features(d):
                 # Same-bin mean over five consecutive valid observations.
                 pcs=np.vstack([np.zeros((1,SUB_HASH_BINS)),np.cumsum(P,axis=0)])
                 vc=np.r_[0,np.cumsum(cell.astype(np.int64))]
-                mean5=np.full((len(gdf),SUB_HASH_BINS),np.nan,float)
-                for j in range(4,len(gdf)):
-                    if vc[j+1]-vc[j-4]==5:
-                        mean5[j]=(pcs[j+1]-pcs[j-4])/5.0
-                vm=np.isfinite(mean5).any(axis=1)
-                if vm.any():
-                    score=np.nanmax(mean5,axis=1)
-                    best_mean[vm]=np.maximum(best_mean[vm],score[vm]);have_mean|=vm
+                vm=np.zeros(len(gdf),dtype=bool)
+                if len(gdf)>=5:
+                    vm[4:]=(vc[5:]-vc[:-5])==5
+                    sums5=pcs[5:]-pcs[:-5]
+                    score5=np.max(sums5/5.0,axis=1)
+                    best_mean[4:][vm[4:]]=np.maximum(
+                        best_mean[4:][vm[4:]],score5[vm[4:]])
+                    have_mean|=vm
 
                 # Same-bin minimum over three consecutive valid observations.
-                min3=np.full((len(gdf),SUB_HASH_BINS),np.nan,float)
-                for j in range(2,len(gdf)):
-                    if cell[j] and cell[j-1] and cell[j-2]:
-                        min3[j]=np.minimum(np.minimum(P[j],P[j-1]),P[j-2])
-                vn=np.isfinite(min3).any(axis=1)
-                if vn.any():
-                    score=np.nanmax(min3,axis=1)
-                    best_min[vn]=np.maximum(best_min[vn],score[vn]);have_min|=vn
+                vn=np.zeros(len(gdf),dtype=bool)
+                if len(gdf)>=3:
+                    vn[2:]=cell[2:]&cell[1:-1]&cell[:-2]
+                    mins3=np.minimum(np.minimum(P[2:],P[1:-1]),P[:-2])
+                    score3=np.max(mins3,axis=1)
+                    best_min[2:][vn[2:]]=np.maximum(
+                        best_min[2:][vn[2:]],score3[vn[2:]])
+                    have_min|=vn
 
         best_mean[~have_mean]=np.nan;best_min[~have_min]=np.nan
         out_mean[ix]=best_mean;out_min[ix]=best_min
