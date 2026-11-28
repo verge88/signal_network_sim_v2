@@ -1,4 +1,5 @@
 name: SS7 naive role-linear fresh v3 validation
+# frozen unseen holdout: 22401,22402
 on:
   push:
     branches: [ss7-anti-overfit-development]
