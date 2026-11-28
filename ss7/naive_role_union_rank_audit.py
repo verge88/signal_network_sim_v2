@@ -22,7 +22,7 @@ ROLE_MSG={
     "IGW":("SRI","PRN","SRI_SM","MT_FSM","ATI","PSI"),
     "STP":("ATI","PSI","SRI","PRN","SRI_SM","MT_FSM","SAI","UL","ISD","CL"),
 }
-VARIANTS=("max","top2","l2","max_total","stable_max","stable_top2","stable_l2","stable_max_total","count_max","count_top2","count_l2","count_max_total","composition_max","composition_top2","composition_l2","dest_concentration","service_dest_max","service_dest_top2","commission_dest","commission_service_dest")
+VARIANTS=("max","top2","l2","max_total","stable_max","stable_top2","stable_l2","stable_max_total","count_max","count_top2","count_l2","count_max_total","composition_max","composition_top2","composition_l2","dest_concentration","service_dest_max","service_dest_top2","commission_dest","commission_service_dest","kie_route_js","kie_route_shift","kie_route_max","service_kie_route")
 SMOOTH=(1,3,5,10)
 ROLE_RAW_DAY=4.0
 
@@ -126,6 +126,16 @@ def destination_concentration_score(d):
     return np.maximum(top,ent)
 
 def raw_score(d,role,variant):
+    if variant=="kie_route_js":
+        return np.nan_to_num(d["kie_group_route_js"].to_numpy(float),nan=0.0)
+    if variant=="kie_route_shift":
+        return np.nan_to_num(d["kie_group_route_maxshift"].to_numpy(float),nan=0.0)
+    if variant=="kie_route_max":
+        return np.maximum(raw_score(d,role,"kie_route_js"),
+                          raw_score(d,role,"kie_route_shift"))
+    if variant=="service_kie_route":
+        return np.maximum(raw_score(d,role,"composition_max"),
+                          raw_score(d,role,"kie_route_max"))
     if variant=="commission_dest":
         return commissioning_destination_score(d)
     if variant=="commission_service_dest":
