@@ -37,7 +37,14 @@ extra_rng=O.extra_rng
 ROLE_ABUSE_V2=os.getenv("SS7_ROLE_ABUSE_V2","0")=="1"
 FRESH_TEST_V3=os.getenv("SS7_FRESH_TEST_V3","0")=="1"
 COMMISSIONING_V4=os.getenv("SS7_COMMISSIONING_V4","0")=="1"
-if COMMISSIONING_V4:
+TARGETED_ABUSE_V5=os.getenv("SS7_TARGETED_ABUSE_V5","0")=="1"
+if TARGETED_ABUSE_V5:
+    # Frozen before generation or inspection of the v5 TEST worlds.
+    TRAIN=(24001,24002,24003)
+    RANK=(24101,24102,24103)
+    CAL=(24201,24202)
+    TEST=(24301,24302)
+elif COMMISSIONING_V4:
     # Frozen before generation or inspection of the v4 TEST worlds.
     TRAIN=(23001,23002,23003)
     RANK=(23101,23102,23103)
@@ -255,7 +262,7 @@ class IntegratedSim(O.CorrectedSim):
         future state or ground-truth feature is exposed to the detector.
         """
         opts=self.candidates(n)
-        if not ROLE_ABUSE_V2 or not opts:
+        if not (ROLE_ABUSE_V2 or TARGETED_ABUSE_V5) or not opts:
             return opts
         typ=self.topo.nodes[n].ntype
         menus={
@@ -376,7 +383,16 @@ class IntegratedSim(O.CorrectedSim):
             if h<=0:continue
             opts=self.compromise_candidates(n,e)
             if not opts:continue
-            f,path=opts[int(arng.integers(len(opts)))]
+            if TARGETED_ABUSE_V5:
+                # A compromise episode represents one targeted abuse campaign.
+                # Keep its legal flow/path fixed for the full episode instead of
+                # re-randomising the destination every 30 s. e.params[1] is
+                # sampled once when the episode is created and is not observable
+                # by the detector.
+                j=min(len(opts)-1,int(float(e.params[1])*len(opts)))
+                f,path=opts[j]
+            else:
+                f,path=opts[int(arng.integers(len(opts)))]
             if any(tuple(sorted((u,v))) in failed_links for u,v in zip(path[:-1],path[1:])):continue
             pending.append((f,path,h,n))
             bits=8.*sum(F.MSG_BYTES[m]*c for m,c in F.SERVICE_TEMPLATE[f.service].items())
