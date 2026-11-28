@@ -1862,7 +1862,7 @@ def main():
     a=p.parse_args();out=Path(a.output);out.mkdir(parents=True,exist_ok=True)
     if a.mode=="selftest":selftest()
     elif a.mode=="generate":
-        assert a.seed in TRAIN+RANK+CAL+TEST
+        if a.seed is None or a.seed<0:raise ValueError("generate requires a non-negative --seed")
         d,e,cu=generate(a.seed,arm=a.arm);joblib.dump((d,e,cu),out/"world.joblib",compress=2)
         print("WORLD",a.arm,a.seed,len(d),d.attack.value_counts().to_dict(),cu,flush=True)
     elif a.mode=="train":train(Path(a.root),out,a.arm)
