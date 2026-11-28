@@ -39,7 +39,16 @@ FRESH_TEST_V3=os.getenv("SS7_FRESH_TEST_V3","0")=="1"
 COMMISSIONING_V4=os.getenv("SS7_COMMISSIONING_V4","0")=="1"
 TARGETED_ABUSE_V5=os.getenv("SS7_TARGETED_ABUSE_V5","0")=="1"
 SUBSCRIBER_KIE_V6=os.getenv("SS7_SUBSCRIBER_KIE_V6","0")=="1"
-if SUBSCRIBER_KIE_V6:
+SUBSCRIBER_KIE_V7=os.getenv("SS7_SUBSCRIBER_KIE_V7","0")=="1"
+SUBSCRIBER_SKETCH=SUBSCRIBER_KIE_V6 or SUBSCRIBER_KIE_V7
+if SUBSCRIBER_KIE_V7:
+    # v7 keeps the exact v6 wire sketch but replaces raw concentration scores
+    # with node-local commissioning residuals. TEST is frozen and untouched.
+    TRAIN=(26001,26002,26003)
+    RANK=(26101,26102,26103)
+    CAL=(26201,26202)
+    TEST=(26301,26302)
+elif SUBSCRIBER_KIE_V6:
     # v6 adds privacy-preserving subscriber hash sketches to compact KIE.
     # TEST remains frozen and must not be generated during RANK development.
     TRAIN=(25001,25002,25003)
@@ -111,6 +120,10 @@ SUB_BIN_NAMES=tuple(
     f"kie_sub_g{g}_b{b}" for g in range(len(GROUPS))
     for b in range(SUB_HASH_BINS)
 )
+SUB_RESID_NAMES=tuple(
+    f"kie_sub_g{g}_{k}" for g in range(len(GROUPS))
+    for k in ("max_resid","rms_resid","chi2")
+)
 def service_group(service):
     gs={GROUP[F.MT_IDX[m]] for m in F.SERVICE_TEMPLATE[service]}
     assert len(gs)==1,(service,gs)
@@ -125,7 +138,7 @@ def payload_bytes(topo,n,compact):
     # four-group matrix marginals for relays and two eight-float64 profiles.
     # v6 additionally carries four service-group x 16 keyed subscriber-hash
     # counters (uint32). Raw subscriber identifiers never leave the node.
-    sub_bytes=(4*len(GROUPS)*SUB_HASH_BINS) if SUBSCRIBER_KIE_V6 else 0
+    sub_bytes=(4*len(GROUPS)*SUB_HASH_BINS) if SUBSCRIBER_SKETCH else 0
     return 50+4*(m+2*d+N+8+2*d*len(GROUPS)+(2*d*len(GROUPS) if relay else 0))+16*8+sub_bytes
 
 def noisy_subscriber_sketch(a,rng,sigma):
@@ -155,6 +168,53 @@ def subscriber_profile(a):
         out[f"kie_sub_g{g}_entropy"]=entropy
         out[f"kie_sub_g{g}_occupied"]=occupied
     return out
+
+def subscriber_residual_features(d):
+    """Derive zero-extra-wire subscriber residuals from frozen commissioning data.
+
+    The compact KIE transports only keyed 16-bin counts. For each node/service
+    group we estimate benign bin probabilities from t < DEPLOY_BASELINE. Current
+    expected counts scale with the current group total, so ordinary load changes
+    do not masquerade as concentration. Residuals are additionally divided by
+    their empirical commissioning IQR to absorb over-dispersion across flows.
+    """
+    for c in SUB_RESID_NAMES:d[c]=np.nan
+    if not SUBSCRIBER_KIE_V7:return d
+    for _,gdf in d.groupby("nid",sort=False):
+        ix=gdf.index.to_numpy()
+        tt=gdf.t.to_numpy()
+        for grp in range(len(GROUPS)):
+            cols=[f"kie_sub_g{grp}_b{b}" for b in range(SUB_HASH_BINS)]
+            X=gdf[cols].to_numpy(float)
+            finite=np.isfinite(X).all(axis=1)
+            warm=finite&(tt<DEPLOY_BASELINE)
+            if warm.sum()<20:continue
+            H=np.maximum(X[warm],0.0)
+            agg=H.sum(axis=0)
+            alpha=1.0
+            p=(agg+alpha)/(agg.sum()+alpha*SUB_HASH_BINS)
+            def pearson(A):
+                A=np.maximum(np.asarray(A,float),0.0)
+                N=A.sum(axis=1,keepdims=True)
+                E=N*p[None,:]
+                var=E*(1.0-p[None,:])+(0.10*E)**2+1.0
+                return (A-E)/np.sqrt(var)
+            Zw=pearson(H)
+            center=np.median(Zw,axis=0)
+            q25=np.quantile(Zw,.25,axis=0);q75=np.quantile(Zw,.75,axis=0)
+            scale=np.maximum((q75-q25)/1.349,1.0)
+            allz=np.zeros_like(X,dtype=float)
+            if finite.any():
+                allz[finite]=(pearson(X[finite])-center[None,:])/scale[None,:]
+            posz=np.maximum(allz,0.0)
+            maxr=np.arcsinh(np.max(posz,axis=1))
+            rms=np.arcsinh(np.sqrt(np.mean(posz*posz,axis=1)))
+            chi=np.arcsinh(np.sqrt(np.sum(posz*posz,axis=1)))
+            maxr[~finite]=np.nan;rms[~finite]=np.nan;chi[~finite]=np.nan
+            d.loc[ix,f"kie_sub_g{grp}_max_resid"]=maxr
+            d.loc[ix,f"kie_sub_g{grp}_rms_resid"]=rms
+            d.loc[ix,f"kie_sub_g{grp}_chi2"]=chi
+    return d
 
 def group_counts(a):
     out=defaultdict(int)
@@ -312,7 +372,7 @@ class IntegratedSim(O.CorrectedSim):
         future state or ground-truth feature is exposed to the detector.
         """
         opts=self.candidates(n)
-        if not (ROLE_ABUSE_V2 or TARGETED_ABUSE_V5 or SUBSCRIBER_KIE_V6) or not opts:
+        if not (ROLE_ABUSE_V2 or TARGETED_ABUSE_V5 or SUBSCRIBER_SKETCH) or not opts:
             return opts
         typ=self.topo.nodes[n].ntype
         menus={
@@ -341,14 +401,14 @@ class IntegratedSim(O.CorrectedSim):
         return self._subscriber_prob_cache[key]
 
     def normal_subscriber_bins(self,f,cnt,t):
-        if not SUBSCRIBER_KIE_V6:return None
+        if not SUBSCRIBER_SKETCH:return None
         key=(int(f.src),int(f.dst),list(F.Service).index(f.service))
         srng=np.random.default_rng(np.random.SeedSequence(
             int(self.cfg.seed),spawn_key=(3101,int(t),key[0],key[1],key[2])))
         return srng.multinomial(int(cnt),self._subscriber_probs(f)).astype(np.int64)
 
     def attack_subscriber_bins(self,e,cnt):
-        if not SUBSCRIBER_KIE_V6:return None
+        if not SUBSCRIBER_SKETCH:return None
         srng=np.random.default_rng(np.random.SeedSequence(
             int(self.cfg.seed),spawn_key=(3102,int(e.nid),int(e.t0))))
         b=int(srng.integers(SUB_HASH_BINS))
@@ -460,7 +520,7 @@ class IntegratedSim(O.CorrectedSim):
             if h<=0:continue
             opts=self.compromise_candidates(n,e)
             if not opts:continue
-            if TARGETED_ABUSE_V5 or SUBSCRIBER_KIE_V6:
+            if TARGETED_ABUSE_V5 or SUBSCRIBER_SKETCH:
                 # A compromise episode represents one targeted abuse campaign.
                 # Keep its legal flow/path fixed for the full episode instead of
                 # re-randomising the destination every 30 s. e.params[1] is
@@ -496,7 +556,7 @@ class IntegratedSim(O.CorrectedSim):
                 add_record(st,tt,tm,path,i,service,cnt,closed)
                 remain=cnt;cc=closed
                 sg=service_group(service)
-                if SUBSCRIBER_KIE_V6 and sub is not None:sub_true[sg]+=sub
+                if SUBSCRIBER_SKETCH and sub is not None:sub_true[sg]+=sub
                 if owner==n:
                     per=sum(F.SERVICE_TEMPLATE[service].values())
                     hidden+=cnt*per*((i>0)+(i<len(path)-1))
@@ -511,7 +571,7 @@ class IntegratedSim(O.CorrectedSim):
                     observable+=cut*per*sum(not topo.nodes[p].external for p in
                         ([path[i-1]] if i>0 else [])+([path[i+1]] if i<len(path)-1 else []))
                 if remain:add_record(cl,ct,cm,path,i,service,remain,cc)
-                if SUBSCRIBER_KIE_V6 and sub is not None:
+                if SUBSCRIBER_SKETCH and sub is not None:
                     if owner==n and remain!=cnt:
                         cv=np.zeros_like(sub)
                         if sub.sum()>0:
@@ -564,6 +624,7 @@ def schedule(sim,rng):
 
 def features(d):
     d=d.sort_values(["nid","t"]).reset_index(drop=True)
+    d=subscriber_residual_features(d)
     for name in TEMP:d[name]=np.nan
     local_temp=[x for x in TEMP if x!="integrity_fail_rate"]
     for name in local_temp:d["local_"+name]=np.nan
@@ -651,7 +712,7 @@ def generate(seed,days=DAYS,arm="compact"):
             if node.ntype==F.NodeType.IGW:sensors[n]=O.noisy(boundary[n],brng,sim.rel_sigma)
             if arm=="compact":
                 a,b,z=encode_compact(rep,a,b)
-                if SUBSCRIBER_KIE_V6:
+                if SUBSCRIBER_SKETCH:
                     srng=extra_rng(seed,33,t*1000+n)
                     z.update(subscriber_profile(
                         noisy_subscriber_sketch(subclaimed[n],srng,sim.rel_sigma)))
@@ -702,7 +763,7 @@ def generate(seed,days=DAYS,arm="compact"):
             for n in fresh:behavior[n].update(profiles[n])
         for n,vals in obs.items():
             nd=sim.topo.nodes[n];e=active.get(n)
-            row={c:np.nan for c in list(NEW)+list(O.EXTRA)+list(D.BEHAVIOR)+list(KIE_GROUP_SKETCH)+list(SUB_PROFILE_NAMES)+list(SUB_BIN_NAMES)}
+            row={c:np.nan for c in list(NEW)+list(O.EXTRA)+list(D.BEHAVIOR)+list(KIE_GROUP_SKETCH)+list(SUB_PROFILE_NAMES)+list(SUB_BIN_NAMES)+list(SUB_RESID_NAMES)}
             row.update(inv.get(n,{}));row.update(extra.get(n,{}));row.update(behavior.get(n,{}))
             # Independent boundary sensor remains observable even when CU lost.
             if n in sensors and n not in fresh:
@@ -822,7 +883,7 @@ def train(root,out,arm):
 
     # v5 keeps RANK as a true method-selection holdout. Earlier development
     # arms are preserved for reproducibility, but no v5 learner may fit RANK.
-    aug_seeds=TRAIN if (TARGETED_ABUSE_V5 or SUBSCRIBER_KIE_V6) else TRAIN+RANK
+    aug_seeds=TRAIN if (TARGETED_ABUSE_V5 or SUBSCRIBER_SKETCH) else TRAIN+RANK
     aug=_training_frame(root,arm,aug_seeds)
     aug_spec={k+"_aug":("base",k,"hgb") for k in OTHER}
     aug_spec["invariant_aug"]=("invariant","comp","hgb")
