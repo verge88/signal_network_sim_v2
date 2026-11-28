@@ -149,12 +149,15 @@ def smooth(d,s,w):
 def load(root,seed):
     return C.load(root,"compact",seed)[0]
 
-def evaluate_pair(cal,ev,sc,se,variant,w,role):
-    cal_role=cal.ntype.astype(str).to_numpy()==role
-    ev_role=ev.ntype.astype(str).to_numpy()==role
-    cal_neg=cal_role&(cal.label.to_numpy()==0)
-    cut=threshold(sc[cal_neg],ROLE_RAW_DAY,elapsed(cal))
+def evaluate_holdout(cal_items,ev,se,variant,w,role):
+    cuts=[]
+    for cal,sc in cal_items:
+        cal_role=cal.ntype.astype(str).to_numpy()==role
+        cal_neg=cal_role&(cal.label.to_numpy()==0)
+        cuts.append(threshold(sc[cal_neg],ROLE_RAW_DAY,elapsed(cal)))
+    cut=float(max(cuts))
 
+    ev_role=ev.ntype.astype(str).to_numpy()==role
     y=((ev.attack=="compromise")&(ev.sophistication=="naive")&ev_role).to_numpy(int)
     eligible=ev_role&((ev.label.to_numpy()==0)|y.astype(bool))
     ye=y[eligible];score=se[eligible]
@@ -173,7 +176,7 @@ def evaluate_pair(cal,ev,sc,se,variant,w,role):
 def main(root,out,seeds=RANK):
     global RANK
     RANK=tuple(int(x) for x in seeds)
-    if len(RANK)!=2:raise ValueError("audit requires exactly two RANK worlds")
+    if len(RANK)<2:raise ValueError("audit requires at least two RANK worlds")
     frames={s:load(root,s) for s in RANK}
     rows=[]
     cache={}
@@ -183,10 +186,13 @@ def main(root,out,seeds=RANK):
             for w in SMOOTH:
                 for seed in RANK:
                     cache[(seed,variant,w,role)]=smooth(frames[seed],base[seed],w)
-                for a,b in ((RANK[0],RANK[1]),(RANK[1],RANK[0])):
-                    r=evaluate_pair(frames[a],frames[b],cache[(a,variant,w,role)],
-                        cache[(b,variant,w,role)],variant,w,role)
-                    r.update(variant=variant,smooth=w,role=role,cal_seed=a,eval_seed=b)
+                for b in RANK:
+                    cals=[a for a in RANK if a!=b]
+                    r=evaluate_holdout(
+                        [(frames[a],cache[(a,variant,w,role)]) for a in cals],
+                        frames[b],cache[(b,variant,w,role)],variant,w,role)
+                    r.update(variant=variant,smooth=w,role=role,
+                        cal_seed=";".join(map(str,cals)),eval_seed=b)
                     rows.append(r)
     q=pd.DataFrame(rows)
     q.to_csv(out/"cross_world.csv",index=False)
@@ -211,5 +217,5 @@ if __name__=="__main__":
     ap=argparse.ArgumentParser()
     ap.add_argument("--root",type=Path,required=True)
     ap.add_argument("--output",type=Path,required=True)
-    ap.add_argument("--seeds",type=int,nargs=2,default=list(RANK))
+    ap.add_argument("--seeds",type=int,nargs="+",default=list(RANK))
     a=ap.parse_args();a.output.mkdir(parents=True,exist_ok=True);main(a.root,a.output,a.seeds)
