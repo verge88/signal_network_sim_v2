@@ -42,8 +42,16 @@ SUBSCRIBER_KIE_V6=os.getenv("SS7_SUBSCRIBER_KIE_V6","0")=="1"
 SUBSCRIBER_KIE_V7=os.getenv("SS7_SUBSCRIBER_KIE_V7","0")=="1"
 SUBSCRIBER_KIE_V8=os.getenv("SS7_SUBSCRIBER_KIE_V8","0")=="1"
 SUBSCRIBER_KIE_V9=os.getenv("SS7_SUBSCRIBER_KIE_V9","0")=="1"
-SUBSCRIBER_SKETCH=SUBSCRIBER_KIE_V6 or SUBSCRIBER_KIE_V7 or SUBSCRIBER_KIE_V8 or SUBSCRIBER_KIE_V9
-if SUBSCRIBER_KIE_V9:
+SUBSCRIBER_KIE_V10=os.getenv("SS7_SUBSCRIBER_KIE_V10","0")=="1"
+SUBSCRIBER_SKETCH=SUBSCRIBER_KIE_V6 or SUBSCRIBER_KIE_V7 or SUBSCRIBER_KIE_V8 or SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10
+if SUBSCRIBER_KIE_V10:
+    # v10 doubles hash resolution while keeping v9 wire bytes constant by
+    # encoding per-window counters as saturating uint16 instead of uint32.
+    TRAIN=(30001,30002,30003)
+    RANK=(30101,30102,30103)
+    CAL=(30201,30202)
+    TEST=(30301,30302)
+elif SUBSCRIBER_KIE_V9:
     # v9 conditions the keyed subscriber sketch on adjacent peer and exact
     # MAP service. Fresh RANK-only development; CAL/TEST remain untouched.
     TRAIN=(28001,28002,28003)
@@ -127,7 +135,7 @@ GROUPS=(("IAM","ACM","ANM","REL","RLC"),("SRI_SM","MT_FSM","MO_FSM"),
         ("ATI","PSI","UL","ISD","CL","PURGE"),("SRI","PRN","SAI"))
 GROUP={F.MT_IDX[m]:g for g,ms in enumerate(GROUPS) for m in ms}
 assert len(GROUP)==len(F.MSG_TYPES)
-SUB_HASH_BINS=16
+SUB_HASH_BINS=32 if SUBSCRIBER_KIE_V10 else 16
 SUB_PROFILE_NAMES=tuple(
     f"kie_sub_g{g}_{k}" for g in range(len(GROUPS))
     for k in ("top1","entropy","occupied")
@@ -164,7 +172,10 @@ def payload_bytes(topo,n,compact):
     # four-group matrix marginals for relays and two eight-float64 profiles.
     # Subscriber KIE carries keyed uint32 counters only; raw subscriber IDs
     # never leave the node. v8 conditions the same sketch on the adjacent peer.
-    if SUBSCRIBER_KIE_V9:
+    if SUBSCRIBER_KIE_V10:
+        # 32 bins x uint16 == 16 bins x uint32: same nominal v9 wire cost.
+        sub_bytes=2*d*len(KIE_SERVICES)*SUB_HASH_BINS
+    elif SUBSCRIBER_KIE_V9:
         sub_bytes=4*d*len(KIE_SERVICES)*SUB_HASH_BINS
     elif SUBSCRIBER_KIE_V8:
         sub_bytes=4*d*len(GROUPS)*SUB_HASH_BINS
@@ -179,7 +190,7 @@ def noisy_subscriber_sketch(a,rng,sigma):
 
 def subscriber_profile(a):
     a=np.asarray(a,float);out={}
-    if SUBSCRIBER_KIE_V9:
+    if SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10:
         assert a.ndim==3 and a.shape[1:]==(len(KIE_SERVICES),SUB_HASH_BINS)
         out[SUB_PEER_SERVICE_PACKED_NAME]=a.astype(np.float32,copy=False).reshape(-1).copy()
         return out
@@ -328,7 +339,7 @@ def peer_subscriber_residual_features(d):
 def peer_service_subscriber_residual_features(d):
     """Residuals for peer x exact-MAP-service keyed subscriber sketches (v9)."""
     for c in SUB_PEER_SERVICE_RESID_NAMES:d[c]=np.nan
-    if not SUBSCRIBER_KIE_V9:return d
+    if not (SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10):return d
     if SUB_PEER_SERVICE_PACKED_NAME not in d.columns:return d
 
     nrow=len(d)
@@ -567,7 +578,7 @@ class IntegratedSim(O.CorrectedSim):
 
     def normal_subscriber_bins(self,f,cnt,t):
         if not SUBSCRIBER_SKETCH:return None
-        if SUBSCRIBER_KIE_V9 and f.service not in KIE_SERVICE_INDEX:return None
+        if (SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10) and f.service not in KIE_SERVICE_INDEX:return None
         key=(int(f.src),int(f.dst),list(F.Service).index(f.service))
         srng=np.random.default_rng(np.random.SeedSequence(
             int(self.cfg.seed),spawn_key=(3101,int(t),key[0],key[1],key[2])))
@@ -715,7 +726,7 @@ class IntegratedSim(O.CorrectedSim):
         for n in topo.nodes:
             st=empty(n,t);cl=empty(n,t);tt=defaultdict(int);tm=defaultdict(int)
             ct=defaultdict(int);cm=defaultdict(int);hidden=0;removed=0;observable=0
-            if SUBSCRIBER_KIE_V9:
+            if SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10:
                 peer_ids=[topo.peer(k,n) for k in topo.links_of(n)]
                 peer_pos={p:i for i,p in enumerate(peer_ids)}
                 sub_claim=np.zeros((len(peer_ids),len(KIE_SERVICES),SUB_HASH_BINS),dtype=np.int64)
@@ -759,7 +770,7 @@ class IntegratedSim(O.CorrectedSim):
                                 if cv.sum()<remain:cv[int(np.argmax(psub))]+=int(remain-cv.sum())
                     else:
                         cv=sub
-                    if SUBSCRIBER_KIE_V9:
+                    if SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10:
                         si=KIE_SERVICE_INDEX.get(service)
                         if si is not None:
                             adj=[]
@@ -890,7 +901,7 @@ def generate(seed,days=DAYS,arm="compact"):
         row_feature_cols+=list(SUB_RESID_NAMES)
     elif SUBSCRIBER_KIE_V8:
         row_feature_cols+=list(SUB_PEER_RESID_NAMES)
-    elif SUBSCRIBER_KIE_V9:
+    elif SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10:
         row_feature_cols+=list(SUB_PEER_SERVICE_RESID_NAMES)
     for t in range(cfg.n_intervals):
         truth,claimed,typed,mat,boundary,audit,lstate,subclaimed=sim.step_true(t,eps)
@@ -914,8 +925,10 @@ def generate(seed,days=DAYS,arm="compact"):
                 a,b,z=encode_compact(rep,a,b)
                 if SUBSCRIBER_SKETCH:
                     srng=extra_rng(seed,33,t*1000+n)
-                    z.update(subscriber_profile(
-                        noisy_subscriber_sketch(subclaimed[n],srng,sim.rel_sigma)))
+                    subwire=noisy_subscriber_sketch(subclaimed[n],srng,sim.rel_sigma)
+                    if SUBSCRIBER_KIE_V10:
+                        subwire=np.minimum(subwire,np.iinfo(np.uint16).max)
+                    z.update(subscriber_profile(subwire))
             if node.role==F.NodeRole.MASTER:
                 fresh[n]=rep;tc[n]=a;mc[n]=b
                 if arm=="compact":profiles[n]=z
@@ -966,7 +979,7 @@ def generate(seed,days=DAYS,arm="compact"):
             row={c:np.nan for c in row_feature_cols}
             if SUBSCRIBER_KIE_V7:row[SUB_PACKED_NAME]=None
             if SUBSCRIBER_KIE_V8:row[SUB_PEER_PACKED_NAME]=None
-            if SUBSCRIBER_KIE_V9:row[SUB_PEER_SERVICE_PACKED_NAME]=None
+            if SUBSCRIBER_KIE_V9 or SUBSCRIBER_KIE_V10:row[SUB_PEER_SERVICE_PACKED_NAME]=None
             row.update(inv.get(n,{}));row.update(extra.get(n,{}));row.update(behavior.get(n,{}))
             # Independent boundary sensor remains observable even when CU lost.
             if n in sensors and n not in fresh:
