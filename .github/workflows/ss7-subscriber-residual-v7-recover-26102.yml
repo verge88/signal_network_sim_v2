@@ -1,4 +1,5 @@
 name: SS7 subscriber residual-KIE v7 recovery 26102
+# optimized packed residual path
 on:
   push:
     branches: [ss7-anti-overfit-development]
