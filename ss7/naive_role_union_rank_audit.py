@@ -21,7 +21,7 @@ ROLE_MSG={
     "IGW":("SRI","PRN","SRI_SM","MT_FSM","ATI","PSI"),
     "STP":("ATI","PSI","SRI","PRN","SRI_SM","MT_FSM","SAI","UL","ISD","CL"),
 }
-VARIANTS=("max","top2","l2","max_total","stable_max","stable_top2","stable_l2","stable_max_total")
+VARIANTS=("max","top2","l2","max_total","stable_max","stable_top2","stable_l2","stable_max_total","count_max","count_top2","count_l2","count_max_total")
 SMOOTH=(1,3,5,10)
 ROLE_RAW_DAY=4.0
 
@@ -48,10 +48,41 @@ def stable_shift(d,col):
         out[ix]=np.arcsinh(np.nan_to_num(z,nan=0.0,posinf=0.0,neginf=0.0))
     return out
 
+def reconstructed_count(d,m):
+    # Compact KIE already carries total mtype counts. The stored ratio form is
+    # algebraically inverted here without adding any wire field.
+    return (np.nan_to_num(d["total_messages"].to_numpy(float),nan=0.0)
+            *np.nan_to_num(d["map_share"].to_numpy(float),nan=0.0)
+            *np.nan_to_num(d[f"obs_ratio_{m}"].to_numpy(float),nan=0.0))
+
+def stable_array_shift(d,x,ratio=False):
+    out=np.zeros(len(d),float)
+    x=np.asarray(x,float)
+    for _,g in d.groupby("nid",sort=False):
+        ix=g.index.to_numpy()
+        v=pd.Series(x[ix],index=ix)
+        recent=v.rolling(10,min_periods=4).mean()
+        past=v.shift(10)
+        center=past.rolling(60,min_periods=15).median()
+        q25=past.rolling(60,min_periods=15).quantile(.25)
+        q75=past.rolling(60,min_periods=15).quantile(.75)
+        robust=(q75-q25)/1.349
+        c=center.to_numpy(float)
+        floor=(np.full(len(ix),.02) if ratio else np.sqrt(np.maximum(np.abs(c),1.0)))
+        scale=np.maximum(np.nan_to_num(robust.to_numpy(float),nan=0.0),floor)
+        z=(recent.to_numpy(float)-c)/scale
+        out[ix]=np.arcsinh(np.nan_to_num(z,nan=0.0,posinf=0.0,neginf=0.0))
+    return out
+
 def raw_score(d,role,variant):
     stable=variant.startswith("stable_")
-    base_variant=variant[7:] if stable else variant
-    if stable:
+    count=variant.startswith("count_")
+    base_variant=variant.split("_",1)[1] if (stable or count) else variant
+    if count:
+        msgs=[m for m in ROLE_MSG[role] if f"obs_ratio_{m}" in d.columns]
+        if not msgs:return np.zeros(len(d),float)
+        z=np.column_stack([np.maximum(stable_array_shift(d,reconstructed_count(d,m)),0.0) for m in msgs])
+    elif stable:
         cols=[f"obs_ratio_{m}" for m in ROLE_MSG[role] if f"obs_ratio_{m}" in d.columns]
         if not cols:return np.zeros(len(d),float)
         z=np.column_stack([np.maximum(stable_shift(d,c),0.0) for c in cols])
@@ -67,8 +98,12 @@ def raw_score(d,role,variant):
     elif base_variant=="l2":
         score=np.sqrt((z*z).mean(axis=1))
     elif base_variant=="max_total":
-        total=(np.maximum(stable_shift(d,"total_messages"),0.0) if stable
-               else np.maximum(np.nan_to_num(d["drift_total_messages_z"].to_numpy(float),nan=0.0),0.0))
+        if count:
+            total=np.maximum(stable_array_shift(d,d["total_messages"].to_numpy(float)),0.0)
+        elif stable:
+            total=np.maximum(stable_shift(d,"total_messages"),0.0)
+        else:
+            total=np.maximum(np.nan_to_num(d["drift_total_messages_z"].to_numpy(float),nan=0.0),0.0)
         score=np.maximum(z.max(axis=1),.6*total)
     else:raise ValueError(variant)
     return score
