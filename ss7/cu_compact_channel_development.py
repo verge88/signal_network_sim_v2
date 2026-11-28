@@ -297,6 +297,32 @@ class IntegratedSim(O.CorrectedSim):
         chosen=[x for x in opts if x[0].service in menu]
         return chosen or opts
 
+    def _subscriber_probs(self,f):
+        if not hasattr(self,"_subscriber_prob_cache"):self._subscriber_prob_cache={}
+        key=(int(f.src),int(f.dst),list(F.Service).index(f.service))
+        if key not in self._subscriber_prob_cache:
+            srng=np.random.default_rng(np.random.SeedSequence(
+                int(self.cfg.seed),spawn_key=(3100,key[0],key[1],key[2])))
+            # Mildly non-uniform benign population; hash collisions and natural
+            # subscriber locality remain present instead of assuming perfection.
+            self._subscriber_prob_cache[key]=srng.dirichlet(np.full(SUB_HASH_BINS,4.0))
+        return self._subscriber_prob_cache[key]
+
+    def normal_subscriber_bins(self,f,cnt,t):
+        if not SUBSCRIBER_KIE_V6:return None
+        key=(int(f.src),int(f.dst),list(F.Service).index(f.service))
+        srng=np.random.default_rng(np.random.SeedSequence(
+            int(self.cfg.seed),spawn_key=(3101,int(t),key[0],key[1],key[2])))
+        return srng.multinomial(int(cnt),self._subscriber_probs(f)).astype(np.int64)
+
+    def attack_subscriber_bins(self,e,cnt):
+        if not SUBSCRIBER_KIE_V6:return None
+        srng=np.random.default_rng(np.random.SeedSequence(
+            int(self.cfg.seed),spawn_key=(3102,int(e.nid),int(e.t0))))
+        b=int(srng.integers(SUB_HASH_BINS))
+        out=np.zeros(SUB_HASH_BINS,dtype=np.int64);out[b]=int(cnt)
+        return out
+
     def flows_for(self,t,episodes):
         """Synthetic service-volume profiles on the existing simulated graph."""
         active={e.nid:e for e in episodes if e.kind in KINDS[:-1] and e.t0<=t<=e.t1}
@@ -384,7 +410,8 @@ class IntegratedSim(O.CorrectedSim):
                 if cnt <= 0 or any((min(u, v), max(u, v)) in failed_links
                                    for u, v in zip(path[:-1], path[1:])):
                     continue
-                pending.append((f, path, int(cnt), None))
+                sub=self.normal_subscriber_bins(f,int(cnt),t)
+                pending.append((f, path, int(cnt), None, sub))
                 tmpl = SERVICE_TEMPLATE[f.service]
                 bits = 8.0 * sum(MSG_BYTES[m] * c for m, c in tmpl.items())
                 for u, v in zip(path[:-1], path[1:]):
@@ -401,7 +428,7 @@ class IntegratedSim(O.CorrectedSim):
             if h<=0:continue
             opts=self.compromise_candidates(n,e)
             if not opts:continue
-            if TARGETED_ABUSE_V5:
+            if TARGETED_ABUSE_V5 or SUBSCRIBER_KIE_V6:
                 # A compromise episode represents one targeted abuse campaign.
                 # Keep its legal flow/path fixed for the full episode instead of
                 # re-randomising the destination every 30 s. e.params[1] is
@@ -412,27 +439,32 @@ class IntegratedSim(O.CorrectedSim):
             else:
                 f,path=opts[int(arng.integers(len(opts)))]
             if any(tuple(sorted((u,v))) in failed_links for u,v in zip(path[:-1],path[1:])):continue
-            pending.append((f,path,h,n))
+            sub=self.attack_subscriber_bins(e,h)
+            pending.append((f,path,h,n,sub))
             bits=8.*sum(F.MSG_BYTES[m]*c for m,c in F.SERVICE_TEMPLATE[f.service].items())
             for u,v in zip(path[:-1],path[1:]):
                 k=tuple(sorted((u,v)));offered[k]=offered.get(k,0.)+h*bits/dt
         lstate,self.polls=self.cu.exchange(t,offered,failed_links)
         records=defaultdict(list)
-        for f,path,cnt,owner in pending:
+        for f,path,cnt,owner,sub in pending:
             hops=[tuple(sorted((u,v))) for u,v in zip(path[:-1],path[1:])]
             p=float(np.prod([1.-lstate[k][2] for k in hops]))**2
             p=1.-(1.-p)**(1+self.max_retry)
             crng=rng if owner is None else arng
             closed=int(crng.binomial(cnt,np.clip(p,0.,1.)))
-            for i,n in enumerate(path):records[n].append((path,i,f.service,cnt,closed,owner))
-        true={};claimed={};typed={};mat={};boundary={};audit={}
+            for i,n in enumerate(path):records[n].append((path,i,f.service,cnt,closed,owner,sub))
+        true={};claimed={};typed={};mat={};boundary={};audit={};subclaimed={}
         for n in topo.nodes:
             st=empty(n,t);cl=empty(n,t);tt=defaultdict(int);tm=defaultdict(int)
             ct=defaultdict(int);cm=defaultdict(int);hidden=0;removed=0;observable=0
+            sub_true=np.zeros((len(GROUPS),SUB_HASH_BINS),dtype=np.int64)
+            sub_claim=np.zeros_like(sub_true)
             e=active.get(n)
-            for path,i,service,cnt,closed,owner in records[n]:
+            for path,i,service,cnt,closed,owner,sub in records[n]:
                 add_record(st,tt,tm,path,i,service,cnt,closed)
                 remain=cnt;cc=closed
+                sg=service_group(service)
+                if SUBSCRIBER_KIE_V6 and sub is not None:sub_true[sg]+=sub
                 if owner==n:
                     per=sum(F.SERVICE_TEMPLATE[service].values())
                     hidden+=cnt*per*((i>0)+(i<len(path)-1))
@@ -447,14 +479,29 @@ class IntegratedSim(O.CorrectedSim):
                     observable+=cut*per*sum(not topo.nodes[p].external for p in
                         ([path[i-1]] if i>0 else [])+([path[i+1]] if i<len(path)-1 else []))
                 if remain:add_record(cl,ct,cm,path,i,service,remain,cc)
+                if SUBSCRIBER_KIE_V6 and sub is not None:
+                    if owner==n and remain!=cnt:
+                        cv=np.zeros_like(sub)
+                        if sub.sum()>0:
+                            # Malicious v6 batches occupy one keyed bin; keep
+                            # the claimed sketch coherent with the claimed txn count.
+                            if np.count_nonzero(sub)==1:
+                                cv[int(np.argmax(sub))]=int(remain)
+                            else:
+                                psub=sub/sub.sum()
+                                cv=np.floor(psub*remain).astype(np.int64)
+                                if cv.sum()<remain:cv[int(np.argmax(psub))]+=int(remain-cv.sum())
+                    else:
+                        cv=sub
+                    sub_claim[sg]+=cv
             st.check_identities();cl.check_identities()
-            true[n]=st;claimed[n]=cl;typed[n]=ct;mat[n]=cm
+            true[n]=st;claimed[n]=cl;typed[n]=ct;mat[n]=cm;subclaimed[n]=sub_claim
             # Explicit additional sensor: true offered counters sampled on
             # the domestic side of an external link, independently of node report.
             # Only sensor measurements, never this latent dictionary, reach features.
             boundary[n]={k:v for k,v in tt.items() if topo.nodes[topo.peer(k[1],n)].external}
             audit[n]=(hidden,removed,observable,max(st.total()-hidden,0))
-        return true,claimed,typed,mat,boundary,audit,lstate
+        return true,claimed,typed,mat,boundary,audit,lstate,subclaimed
 
 def schedule(sim,rng):
     # Every test topology has all classes; role/sophistication balanced for compromise.
