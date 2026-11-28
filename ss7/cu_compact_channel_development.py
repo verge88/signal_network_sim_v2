@@ -492,10 +492,10 @@ def peer_service_subscriber_bin_cusum_features(d):
 def peer_service_subscriber_identity_features(d):
     """v16: temporal confirmation inside one peer x service x keyed bin.
 
-    The wire sketch is unchanged from v15. For each identity-preserving bin,
-    first form the same 30-interval raw-count Pearson residual as v15, then
-    compute a 5-window mean and 3-window minimum within that exact bin. Only
-    after this temporal step is the maximum across bins/cells taken.
+    Vectorized equivalent of the original v16 implementation. The wire sketch
+    and statistics are unchanged: 30-interval raw-count Pearson residual per
+    exact peer x service x keyed bin, followed by same-bin mean-5/min-3, and
+    only then a maximum across identities.
     """
     for c in (SUB_PEER_SERVICE_IDMEAN5_NAME,SUB_PEER_SERVICE_IDMIN3_NAME):
         d[c]=np.nan
@@ -507,7 +507,7 @@ def peer_service_subscriber_identity_features(d):
     cell_width=len(KIE_SERVICES)*SUB_HASH_BINS
 
     for _,gdf in d.groupby("nid",sort=False):
-        ix=gdf.index.to_numpy();tt=gdf.t.to_numpy()
+        ix=gdf.index.to_numpy();tt=gdf.t.to_numpy();n=len(gdf)
         obj=gdf[SUB_PEER_SERVICE_PACKED_NAME].to_numpy()
         valid=np.array([isinstance(v,np.ndarray) and v.size>0 and
                         v.size%cell_width==0 for v in obj],dtype=bool)
@@ -519,69 +519,71 @@ def peer_service_subscriber_identity_features(d):
             if obj[j].size!=width:ok[j]=False
         if not ok.any():continue
 
-        X=np.zeros((len(gdf),peers,len(KIE_SERVICES),SUB_HASH_BINS),dtype=float)
-        X[ok]=np.stack(obj[ok]).reshape((-1,peers,len(KIE_SERVICES),SUB_HASH_BINS))
+        # n x cell x bin, where cell preserves peer+exact-service identity.
+        cells=peers*len(KIE_SERVICES)
+        X=np.zeros((n,cells,SUB_HASH_BINS),dtype=float)
+        X[ok]=np.stack(obj[ok]).reshape((-1,cells,SUB_HASH_BINS))
 
-        flat=X.reshape((len(gdf),-1))
+        # Causal 30-interval rolling sums, vectorized over all cells/bins.
+        flat=X.reshape((n,-1))
         cs=np.vstack([np.zeros((1,flat.shape[1])),np.cumsum(flat,axis=0)])
         cc=np.r_[0,np.cumsum(ok.astype(np.int64))]
-        jj=np.arange(len(gdf),dtype=np.int64)
-        aa=np.maximum(0,jj-SUB_ROLL_WINDOW+1)
-        R=(cs[jj+1]-cs[aa]).reshape(X.shape)
+        jj=np.arange(n,dtype=np.int64);aa=np.maximum(0,jj-SUB_ROLL_WINDOW+1)
+        R=(cs[jj+1]-cs[aa]).reshape((n,cells,SUB_HASH_BINS))
         count=cc[jj+1]-cc[aa]
         rvalid=ok&(count>=SUB_ROLL_MIN)
         warm_raw=ok&(tt<DEPLOY_BASELINE)
         warm_roll=rvalid&(tt<DEPLOY_BASELINE)&(tt>=SUB_ROLL_WINDOW-1)
         if warm_raw.sum()<40 or warm_roll.sum()<20:continue
 
-        best_mean=np.full(len(gdf),-np.inf,float)
-        best_min=np.full(len(gdf),-np.inf,float)
-        have_mean=np.zeros(len(gdf),bool);have_min=np.zeros(len(gdf),bool)
+        agg=np.maximum(X[warm_raw],0.0).sum(axis=0)              # cell x bin
+        cell_ref=agg.sum(axis=1)>0
+        if not cell_ref.any():continue
+        p=(agg+1.0)/(agg.sum(axis=1,keepdims=True)+SUB_HASH_BINS)
 
-        for pi in range(peers):
-            for si in range(len(KIE_SERVICES)):
-                raw=X[:,pi,si,:]
-                agg=np.maximum(raw[warm_raw],0.0).sum(axis=0)
-                if agg.sum()<=0:continue
-                p=(agg+1.0)/(agg.sum()+SUB_HASH_BINS)
+        A=np.maximum(R,0.0)
+        N=A.sum(axis=2,keepdims=True)
+        E=N*p[None,:,:]
+        var=E*(1.0-p[None,:,:])+1.0
+        Z=(A-E)/np.sqrt(var)
 
-                A=np.maximum(R[:,pi,si,:],0.0)
-                N=A.sum(axis=1,keepdims=True);E=N*p[None,:]
-                var=E*(1.0-p[None,:])+1.0
-                Z=(A-E)/np.sqrt(var)
-                Zw=Z[warm_roll]
-                center=np.median(Zw,axis=0)
-                q25,q75=np.quantile(Zw,[.25,.75],axis=0)
-                scale=np.maximum((q75-q25)/1.349,1.0)
-                Zn=(Z-center[None,:])/scale[None,:]
-                cell=rvalid&(N[:,0]>0)&np.isfinite(Zn).all(axis=1)
-                P=np.arcsinh(np.maximum(Zn,0.0))
-                P[~cell]=0.0
+        Zw=Z[warm_roll]                                          # warm x cell x bin
+        center=np.median(Zw,axis=0)
+        q25,q75=np.quantile(Zw,[.25,.75],axis=0)
+        scale=np.maximum((q75-q25)/1.349,1.0)
+        Zn=(Z-center[None,:,:])/scale[None,:,:]
 
-                # Same-bin mean over five consecutive valid observations.
-                pcs=np.vstack([np.zeros((1,SUB_HASH_BINS)),np.cumsum(P,axis=0)])
-                vc=np.r_[0,np.cumsum(cell.astype(np.int64))]
-                vm=np.zeros(len(gdf),dtype=bool)
-                if len(gdf)>=5:
-                    vm[4:]=(vc[5:]-vc[:-5])==5
-                    sums5=pcs[5:]-pcs[:-5]
-                    score5=np.max(sums5/5.0,axis=1)
-                    im=np.flatnonzero(vm[4:])+4
-                    best_mean[im]=np.maximum(best_mean[im],score5[vm[4:]])
-                    have_mean|=vm
+        cell_valid=(rvalid[:,None]&(N[:,:,0]>0)&cell_ref[None,:]&
+                    np.isfinite(Zn).all(axis=2))
+        P=np.arcsinh(np.maximum(Zn,0.0))
+        P[~cell_valid]=0.0
 
-                # Same-bin minimum over three consecutive valid observations.
-                vn=np.zeros(len(gdf),dtype=bool)
-                if len(gdf)>=3:
-                    vn[2:]=cell[2:]&cell[1:-1]&cell[:-2]
-                    mins3=np.minimum(np.minimum(P[2:],P[1:-1]),P[:-2])
-                    score3=np.max(mins3,axis=1)
-                    inn=np.flatnonzero(vn[2:])+2
-                    best_min[inn]=np.maximum(best_min[inn],score3[vn[2:]])
-                    have_min|=vn
+        # Five consecutive observations in exactly the same cell. The keyed
+        # bin dimension is retained until after the temporal mean.
+        pcs=np.concatenate([np.zeros((1,cells,SUB_HASH_BINS)),
+                            np.cumsum(P,axis=0)],axis=0)
+        vc=np.concatenate([np.zeros((1,cells),dtype=np.int64),
+                           np.cumsum(cell_valid.astype(np.int64),axis=0)],axis=0)
+        if n>=5:
+            valid5=(vc[5:]-vc[:-5])==5                         # (n-4) x cell
+            mean5=(pcs[5:]-pcs[:-5])/5.0                       # (n-4) x cell x bin
+            mean5=np.where(valid5[:,:,None],mean5,-np.inf)
+            score5=np.max(mean5,axis=(1,2))
+            good5=np.isfinite(score5)
+            if good5.any():
+                dst=np.flatnonzero(good5)+4
+                out_mean[ix[dst]]=score5[good5]
 
-        best_mean[~have_mean]=np.nan;best_min[~have_min]=np.nan
-        out_mean[ix]=best_mean;out_min[ix]=best_min
+        # Three consecutive observations in exactly the same cell/bin.
+        if n>=3:
+            valid3=cell_valid[2:]&cell_valid[1:-1]&cell_valid[:-2]
+            min3=np.minimum(np.minimum(P[2:],P[1:-1]),P[:-2])
+            min3=np.where(valid3[:,:,None],min3,-np.inf)
+            score3=np.max(min3,axis=(1,2))
+            good3=np.isfinite(score3)
+            if good3.any():
+                dst=np.flatnonzero(good3)+2
+                out_min[ix[dst]]=score3[good3]
 
     d[SUB_PEER_SERVICE_IDMEAN5_NAME]=out_mean
     d[SUB_PEER_SERVICE_IDMIN3_NAME]=out_min
