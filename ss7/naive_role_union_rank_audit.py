@@ -22,7 +22,7 @@ ROLE_MSG={
     "IGW":("SRI","PRN","SRI_SM","MT_FSM","ATI","PSI"),
     "STP":("ATI","PSI","SRI","PRN","SRI_SM","MT_FSM","SAI","UL","ISD","CL"),
 }
-VARIANTS=("max","top2","l2","max_total","stable_max","stable_top2","stable_l2","stable_max_total","count_max","count_top2","count_l2","count_max_total","composition_max","composition_top2","composition_l2")
+VARIANTS=("max","top2","l2","max_total","stable_max","stable_top2","stable_l2","stable_max_total","count_max","count_top2","count_l2","count_max_total","composition_max","composition_top2","composition_l2","dest_concentration","service_dest_max","service_dest_top2")
 SMOOTH=(1,3,5,10)
 ROLE_RAW_DAY=4.0
 
@@ -98,7 +98,22 @@ def composition_residuals(d,role):
         out[ix]=np.arcsinh(np.maximum(z,0.0))
     return out
 
+def destination_concentration_score(d):
+    """Causal target-concentration evidence from already transmitted DPC statistics."""
+    top=np.maximum(stable_shift(d,"dest_top1_ratio"),0.0)
+    ent=np.maximum(-stable_shift(d,"dest_entropy"),0.0)
+    # A persistent single-target abuse should either raise the dominant DPC
+    # share or reduce destination diversity; max avoids requiring both.
+    return np.maximum(top,ent)
+
 def raw_score(d,role,variant):
+    if variant=="dest_concentration":
+        return destination_concentration_score(d)
+    if variant in ("service_dest_max","service_dest_top2"):
+        service_variant="composition_max" if variant.endswith("_max") else "composition_top2"
+        service=raw_score(d,role,service_variant)
+        dest=destination_concentration_score(d)
+        return np.maximum(service,dest)
     stable=variant.startswith("stable_")
     count=variant.startswith("count_")
     composition=variant.startswith("composition_")
