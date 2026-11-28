@@ -15,6 +15,7 @@ from ss7 import cu_compact_channel_development as C
 from ss7.incident_calibration_study import elapsed, threshold
 
 RANK=(22101,22102)
+BASELINE_END=int(__import__("os").getenv("SS7_DEPLOY_BASELINE",str(C.WARMUP)))
 ROLE_MSG={
     "SP":("ATI","PSI","SRI_SM","MT_FSM","SAI","UL","ISD","CL"),
     "SCP":("ATI","PSI","SRI","PRN","SRI_SM","MT_FSM","SAI","UL","ISD","CL"),
@@ -84,7 +85,7 @@ def composition_residuals(d,role):
     counts=np.column_stack([reconstructed_count(d,m) for m in msgs])
     for _,g in d.groupby("nid",sort=False):
         ix=g.index.to_numpy()
-        warm=(g.t.to_numpy()<C.WARMUP)
+        warm=(g.t.to_numpy()<BASELINE_END)
         if not warm.any():continue
         den=float(total[ix][warm].sum())
         if den<=0:continue
@@ -169,7 +170,10 @@ def evaluate_pair(cal,ev,sc,se,variant,w,role):
         false_rows_day=float((se[neg]>cut).sum()/elapsed(ev)),
     )
 
-def main(root,out):
+def main(root,out,seeds=RANK):
+    global RANK
+    RANK=tuple(int(x) for x in seeds)
+    if len(RANK)!=2:raise ValueError("audit requires exactly two RANK worlds")
     frames={s:load(root,s) for s in RANK}
     rows=[]
     cache={}
@@ -207,4 +211,5 @@ if __name__=="__main__":
     ap=argparse.ArgumentParser()
     ap.add_argument("--root",type=Path,required=True)
     ap.add_argument("--output",type=Path,required=True)
-    a=ap.parse_args();a.output.mkdir(parents=True,exist_ok=True);main(a.root,a.output)
+    ap.add_argument("--seeds",type=int,nargs=2,default=list(RANK))
+    a=ap.parse_args();a.output.mkdir(parents=True,exist_ok=True);main(a.root,a.output,a.seeds)
