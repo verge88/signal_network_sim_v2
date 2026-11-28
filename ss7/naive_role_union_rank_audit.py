@@ -22,7 +22,7 @@ ROLE_MSG={
     "IGW":("SRI","PRN","SRI_SM","MT_FSM","ATI","PSI"),
     "STP":("ATI","PSI","SRI","PRN","SRI_SM","MT_FSM","SAI","UL","ISD","CL"),
 }
-VARIANTS=("max","top2","l2","max_total","stable_max","stable_top2","stable_l2","stable_max_total","count_max","count_top2","count_l2","count_max_total","composition_max","composition_top2","composition_l2","dest_concentration","service_dest_max","service_dest_top2")
+VARIANTS=("max","top2","l2","max_total","stable_max","stable_top2","stable_l2","stable_max_total","count_max","count_top2","count_l2","count_max_total","composition_max","composition_top2","composition_l2","dest_concentration","service_dest_max","service_dest_top2","commission_dest","commission_service_dest")
 SMOOTH=(1,3,5,10)
 ROLE_RAW_DAY=4.0
 
@@ -98,6 +98,25 @@ def composition_residuals(d,role):
         out[ix]=np.arcsinh(np.maximum(z,0.0))
     return out
 
+def commissioning_shift(d,col,direction=1.0):
+    """Deviation from a frozen node-local pre-attack commissioning profile."""
+    out=np.zeros(len(d),float)
+    for _,g in d.groupby("nid",sort=False):
+        ix=g.index.to_numpy()
+        v=np.asarray(g[col],float)
+        warm=g.t.to_numpy()<BASELINE_END
+        a=v[warm & np.isfinite(v)]
+        if len(a)<20:continue
+        center=float(np.median(a));q25,q75=np.quantile(a,[.25,.75])
+        scale=max(float((q75-q25)/1.349),.01)
+        z=direction*(v-center)/scale
+        out[ix]=np.arcsinh(np.maximum(np.nan_to_num(z,nan=0.0,posinf=0.0,neginf=0.0),0.0))
+    return out
+
+def commissioning_destination_score(d):
+    return np.maximum(commissioning_shift(d,"dest_top1_ratio",1.0),
+                      commissioning_shift(d,"dest_entropy",-1.0))
+
 def destination_concentration_score(d):
     """Causal target-concentration evidence from already transmitted DPC statistics."""
     top=np.maximum(stable_shift(d,"dest_top1_ratio"),0.0)
@@ -107,6 +126,11 @@ def destination_concentration_score(d):
     return np.maximum(top,ent)
 
 def raw_score(d,role,variant):
+    if variant=="commission_dest":
+        return commissioning_destination_score(d)
+    if variant=="commission_service_dest":
+        return np.maximum(raw_score(d,role,"composition_max"),
+                          commissioning_destination_score(d))
     if variant=="dest_concentration":
         return destination_concentration_score(d)
     if variant in ("service_dest_max","service_dest_top2"):
