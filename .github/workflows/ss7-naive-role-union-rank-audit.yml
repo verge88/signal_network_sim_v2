@@ -1,4 +1,5 @@
 name: SS7 naive role-union RANK audit
+# frozen RANK worlds: 22101,22102
 on:
   push:
     branches: [ss7-anti-overfit-development]
