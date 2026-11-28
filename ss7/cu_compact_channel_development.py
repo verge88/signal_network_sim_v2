@@ -40,8 +40,16 @@ COMMISSIONING_V4=os.getenv("SS7_COMMISSIONING_V4","0")=="1"
 TARGETED_ABUSE_V5=os.getenv("SS7_TARGETED_ABUSE_V5","0")=="1"
 SUBSCRIBER_KIE_V6=os.getenv("SS7_SUBSCRIBER_KIE_V6","0")=="1"
 SUBSCRIBER_KIE_V7=os.getenv("SS7_SUBSCRIBER_KIE_V7","0")=="1"
-SUBSCRIBER_SKETCH=SUBSCRIBER_KIE_V6 or SUBSCRIBER_KIE_V7
-if SUBSCRIBER_KIE_V7:
+SUBSCRIBER_KIE_V8=os.getenv("SS7_SUBSCRIBER_KIE_V8","0")=="1"
+SUBSCRIBER_SKETCH=SUBSCRIBER_KIE_V6 or SUBSCRIBER_KIE_V7 or SUBSCRIBER_KIE_V8
+if SUBSCRIBER_KIE_V8:
+    # v8 conditions the privacy-preserving subscriber sketch on the adjacent
+    # SS7 peer. RANK-only development; TEST is frozen and untouched.
+    TRAIN=(27001,27002,27003)
+    RANK=(27101,27102,27103)
+    CAL=(27201,27202)
+    TEST=(27301,27302)
+elif SUBSCRIBER_KIE_V7:
     # v7 keeps the exact v6 wire sketch but replaces raw concentration scores
     # with node-local commissioning residuals. TEST is frozen and untouched.
     TRAIN=(26001,26002,26003)
@@ -125,6 +133,8 @@ SUB_RESID_NAMES=tuple(
     for k in ("max_resid","rms_resid","chi2")
 )
 SUB_PACKED_NAME="__kie_sub_bins_packed"
+SUB_PEER_PACKED_NAME="__kie_peer_sub_bins_packed"
+SUB_PEER_RESID_NAMES=("kie_peer_sub_max_resid","kie_peer_sub_rms_resid","kie_peer_sub_chi2")
 SERVICE_GROUP={}
 for _service in F.Service:
     _gs={GROUP[F.MT_IDX[m]] for m in F.SERVICE_TEMPLATE[_service]}
@@ -140,9 +150,12 @@ def payload_bytes(topo,n,compact):
     if not compact:return 50+8*(m+2*d+N+8+2*d*m+d*d*m)
     # Fixed-layout envelope. Base state, four-group directional counts,
     # four-group matrix marginals for relays and two eight-float64 profiles.
-    # v6 additionally carries four service-group x 16 keyed subscriber-hash
-    # counters (uint32). Raw subscriber identifiers never leave the node.
-    sub_bytes=(4*len(GROUPS)*SUB_HASH_BINS) if SUBSCRIBER_SKETCH else 0
+    # Subscriber KIE carries keyed uint32 counters only; raw subscriber IDs
+    # never leave the node. v8 conditions the same sketch on the adjacent peer.
+    if SUBSCRIBER_KIE_V8:
+        sub_bytes=4*d*len(GROUPS)*SUB_HASH_BINS
+    else:
+        sub_bytes=(4*len(GROUPS)*SUB_HASH_BINS) if SUBSCRIBER_SKETCH else 0
     return 50+4*(m+2*d+N+8+2*d*len(GROUPS)+(2*d*len(GROUPS) if relay else 0))+16*8+sub_bytes
 
 def noisy_subscriber_sketch(a,rng,sigma):
@@ -152,6 +165,10 @@ def noisy_subscriber_sketch(a,rng,sigma):
 
 def subscriber_profile(a):
     a=np.asarray(a,float);out={}
+    if SUBSCRIBER_KIE_V8:
+        assert a.ndim==3 and a.shape[1:]==(len(GROUPS),SUB_HASH_BINS)
+        out[SUB_PEER_PACKED_NAME]=a.astype(np.float32,copy=False).reshape(-1).copy()
+        return out
     assert a.shape==(len(GROUPS),SUB_HASH_BINS)
     if SUBSCRIBER_KIE_V7:
         # Internal representation only: the wire format is still exactly the
@@ -227,6 +244,68 @@ def subscriber_residual_features(d):
 
     for c,v in result.items():d[c]=v
     return d.drop(columns=[SUB_PACKED_NAME])
+
+def peer_subscriber_residual_features(d):
+    """Commissioning-normalized residuals for peer-conditioned subscriber KIE.
+
+    Peer slots are stable within a node across the run. Only keyed hash-bin
+    counts are processed; no subscriber identifier or attack label is used.
+    """
+    for c in SUB_PEER_RESID_NAMES:d[c]=np.nan
+    if not SUBSCRIBER_KIE_V8:return d
+    if SUB_PEER_PACKED_NAME not in d.columns:return d
+
+    nrow=len(d)
+    result={c:np.full(nrow,np.nan,dtype=float) for c in SUB_PEER_RESID_NAMES}
+    for _,gdf in d.groupby("nid",sort=False):
+        ix=gdf.index.to_numpy();tt=gdf.t.to_numpy()
+        obj=gdf[SUB_PEER_PACKED_NAME].to_numpy()
+        valid=np.array([isinstance(v,np.ndarray) and v.size>0 and
+                        v.size%(len(GROUPS)*SUB_HASH_BINS)==0 for v in obj],dtype=bool)
+        if not valid.any():continue
+        width=int(obj[np.flatnonzero(valid)[0]].size)
+        peers=width//(len(GROUPS)*SUB_HASH_BINS)
+        X=np.full((len(gdf),peers,len(GROUPS),SUB_HASH_BINS),np.nan,dtype=float)
+        ok=valid.copy()
+        for j in np.flatnonzero(valid):
+            if obj[j].size!=width:ok[j]=False
+        if ok.any():
+            X[ok]=np.stack(obj[ok]).reshape((-1,peers,len(GROUPS),SUB_HASH_BINS))
+        warm=ok&(tt<DEPLOY_BASELINE)
+        if warm.sum()<20:continue
+
+        best=np.zeros((len(gdf),3),float)
+        any_cell=np.zeros(len(gdf),bool)
+        for pi in range(peers):
+            for grp in range(len(GROUPS)):
+                A=X[:,pi,grp,:]
+                H=np.maximum(A[warm],0.0)
+                agg=H.sum(axis=0)
+                if agg.sum()<=0:continue
+                alpha=1.0;p=(agg+alpha)/(agg.sum()+alpha*SUB_HASH_BINS)
+                def pearson(B):
+                    B=np.maximum(np.asarray(B,float),0.0)
+                    N=B.sum(axis=1,keepdims=True);E=N*p[None,:]
+                    var=E*(1.0-p[None,:])+(0.10*E)**2+1.0
+                    return (B-E)/np.sqrt(var)
+                Zw=pearson(H);center=np.median(Zw,axis=0)
+                q25,q75=np.quantile(Zw,[.25,.75],axis=0)
+                scale=np.maximum((q75-q25)/1.349,1.0)
+                cell=np.isfinite(A).all(axis=1)
+                Z=np.zeros_like(A,dtype=float)
+                if cell.any():Z[cell]=(pearson(A[cell])-center[None,:])/scale[None,:]
+                P=np.maximum(Z,0.0)
+                vals=np.column_stack((
+                    np.arcsinh(np.max(P,axis=1)),
+                    np.arcsinh(np.sqrt(np.mean(P*P,axis=1))),
+                    np.arcsinh(np.sqrt(np.sum(P*P,axis=1)))))
+                best=np.maximum(best,vals);any_cell|=cell
+        best[~any_cell]=np.nan
+        for k,c in enumerate(SUB_PEER_RESID_NAMES):result[c][ix]=best[:,k]
+
+    for c,v in result.items():d[c]=v
+    return d.drop(columns=[SUB_PEER_PACKED_NAME])
+
 
 def group_counts(a):
     out=defaultdict(int)
@@ -561,7 +640,13 @@ class IntegratedSim(O.CorrectedSim):
         for n in topo.nodes:
             st=empty(n,t);cl=empty(n,t);tt=defaultdict(int);tm=defaultdict(int)
             ct=defaultdict(int);cm=defaultdict(int);hidden=0;removed=0;observable=0
-            sub_claim=np.zeros((len(GROUPS),SUB_HASH_BINS),dtype=np.int64)
+            if SUBSCRIBER_KIE_V8:
+                peer_ids=[topo.peer(k,n) for k in topo.links_of(n)]
+                peer_pos={p:i for i,p in enumerate(peer_ids)}
+                sub_claim=np.zeros((len(peer_ids),len(GROUPS),SUB_HASH_BINS),dtype=np.int64)
+            else:
+                peer_pos={}
+                sub_claim=np.zeros((len(GROUPS),SUB_HASH_BINS),dtype=np.int64)
             e=active.get(n)
             for path,i,service,cnt,closed,owner,sub in records[n]:
                 add_record(st,tt,tm,path,i,service,cnt,closed)
@@ -595,7 +680,14 @@ class IntegratedSim(O.CorrectedSim):
                                 if cv.sum()<remain:cv[int(np.argmax(psub))]+=int(remain-cv.sum())
                     else:
                         cv=sub
-                    sub_claim[sg]+=cv
+                    if SUBSCRIBER_KIE_V8:
+                        adj=[]
+                        if i>0:adj.append(path[i-1])
+                        if i<len(path)-1:adj.append(path[i+1])
+                        for peer in adj:
+                            if peer in peer_pos:sub_claim[peer_pos[peer],sg]+=cv
+                    else:
+                        sub_claim[sg]+=cv
             st.check_identities();cl.check_identities()
             true[n]=st;claimed[n]=cl;typed[n]=ct;mat[n]=cm;subclaimed[n]=sub_claim
             # Explicit additional sensor: true offered counters sampled on
@@ -634,6 +726,7 @@ def schedule(sim,rng):
 
 def features(d):
     d=d.sort_values(["nid","t"]).reset_index(drop=True)
+    d=peer_subscriber_residual_features(d)
     d=subscriber_residual_features(d)
     for name in TEMP:d[name]=np.nan
     local_temp=[x for x in TEMP if x!="integrity_fail_rate"]
@@ -707,6 +800,8 @@ def generate(seed,days=DAYS,arm="compact"):
         row_feature_cols+=list(SUB_PROFILE_NAMES)+list(SUB_BIN_NAMES)
     elif SUBSCRIBER_KIE_V7:
         row_feature_cols+=list(SUB_RESID_NAMES)
+    elif SUBSCRIBER_KIE_V8:
+        row_feature_cols+=list(SUB_PEER_RESID_NAMES)
     for t in range(cfg.n_intervals):
         truth,claimed,typed,mat,boundary,audit,lstate,subclaimed=sim.step_true(t,eps)
         rng=book.child("measure",t);trng=extra_rng(seed,2,t);brng=extra_rng(seed,3,t)
@@ -780,6 +875,7 @@ def generate(seed,days=DAYS,arm="compact"):
             nd=sim.topo.nodes[n];e=active.get(n)
             row={c:np.nan for c in row_feature_cols}
             if SUBSCRIBER_KIE_V7:row[SUB_PACKED_NAME]=None
+            if SUBSCRIBER_KIE_V8:row[SUB_PEER_PACKED_NAME]=None
             row.update(inv.get(n,{}));row.update(extra.get(n,{}));row.update(behavior.get(n,{}))
             # Independent boundary sensor remains observable even when CU lost.
             if n in sensors and n not in fresh:
