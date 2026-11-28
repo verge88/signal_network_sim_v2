@@ -1,0 +1,63 @@
+name: SS7 commissioning-baseline RANK pilot
+on:
+  push:
+    branches: [ss7-anti-overfit-development]
+    paths:
+      - .github/workflows/ss7-commissioning-rank-pilot.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  SS7_ROLE_ABUSE_V2: "1"
+  SS7_DEPLOY_BASELINE: "180"
+jobs:
+  worlds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        seed: [23101,23102]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/cu_compact_channel_development.py ss7/naive_role_union_rank_audit.py
+      - run: python -u -m ss7.cu_compact_channel_development selftest
+      - run: python -u -m ss7.cu_compact_channel_development generate --arm compact --seed ${{ matrix.seed }} --output results/world
+      - uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-world-compact-${{ matrix.seed }}
+          path: results/world
+          retention-days: 7
+
+  audit:
+    needs: worlds
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: commissioning-world-compact-*
+          path: results/incoming
+      - run: |
+          mkdir -p results/worlds
+          mv results/incoming/commissioning-world-compact-23101 results/worlds/world-compact-23101
+          mv results/incoming/commissioning-world-compact-23102 results/worlds/world-compact-23102
+      - run: python -u -m ss7.naive_role_union_rank_audit --root results/worlds --output results/audit --seeds 23101 23102
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-commissioning-rank-pilot
+          path: results/audit
+          retention-days: 7
