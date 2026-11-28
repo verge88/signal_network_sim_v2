@@ -1,0 +1,50 @@
+name: SS7 v21 commissioning-conformal frozen-v19 RANK
+on:
+  push:
+    branches: [ss7-anti-overfit-development]
+    paths:
+      - .github/workflows/ss7-v21-commissioning-conformal-rank.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  SS7_SUBSCRIBER_KIE_V19: "1"
+  SS7_DEPLOY_BASELINE: "180"
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/v21_commissioning_conformal_rank.py
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46154614822
+          name: ss7-v19-block-logit-rank
+          path: results/v19
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 46154614822
+          pattern: v19-world-compact-391*
+          path: results/incoming
+      - run: |
+          mkdir -p results/worlds
+          for d in results/incoming/v19-world-compact-*; do
+            mv "$d" "results/worlds/${d##*/v19-}"
+          done
+      - run: python -u -m ss7.v21_commissioning_conformal_rank --root results/worlds --model results/v19/model.joblib --output results/audit --seeds 39101 39102 39103
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss7-v21-commissioning-conformal-rank
+          path: results/audit
+          retention-days: 7
