@@ -268,7 +268,8 @@ SUB_MULTIVIEW_NAMES=(
 SUB_PEER_SERVICE_BIN_CUSUM_NAME="kie_peer_service_bin_cusum"
 SUB_PEER_SERVICE_BIN_CUSUM_UNCAPPED_NAME="kie_peer_service_bin_cusum_uncapped"
 HH_TOPK=4
-CAP_BENIGN_FAIL=2e-5
+CAP_BENIGN_FAIL=float(os.getenv("SS7_CAP_BENIGN_FAIL","2e-5"))
+CAP_ATTACK_BYPASS=float(os.getenv("SS7_CAP_ATTACK_BYPASS","0.0"))
 CAP_KIE_NAMES=("kie_cap_checked","kie_cap_missing","kie_cap_missing_rate")
 CAP_DERIVED_NAMES=("kie_cap_missing_5m","kie_cap_missing_rate_5m")
 SUB_HH_PACKED_NAME="__kie_hh_packed"
@@ -1609,7 +1610,8 @@ class IntegratedSim(O.CorrectedSim):
                 if actor in topo.nodes and not topo.nodes[actor].external:
                     cap_checked[actor]+=closed
                     if owner is not None:
-                        cap_missing[actor]+=closed
+                        cap_missing[actor]+=int(caprng.binomial(
+                            closed,np.clip(1.0-CAP_ATTACK_BYPASS,0.0,1.0)))
                     else:
                         cap_missing[actor]+=int(caprng.binomial(closed,CAP_BENIGN_FAIL))
             for i,n in enumerate(path):records[n].append((path,i,f.service,cnt,closed,owner,sub))
