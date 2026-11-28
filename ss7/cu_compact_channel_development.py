@@ -49,6 +49,9 @@ else:
     CAL=(21201,21202)
     TEST=(21301,21302)
 DAYS=1.
+# Optional deployment commissioning period. Default preserves historical worlds;
+# development workflows may reserve a longer attack-free baseline explicitly.
+DEPLOY_BASELINE=int(os.getenv("SS7_DEPLOY_BASELINE",str(WARMUP+5)))
 # Anti-overfit protocol: temporally thin highly autocorrelated windows before fitting.
 # Train/cal/test remain different simulator worlds; CAL is used only for diagnostics and thresholds.
 TRAIN_STRIDE=3
@@ -419,7 +422,7 @@ def schedule(sim,rng):
     occ=defaultdict(list)
     def place(nodes,kind,length,**kwargs):
         for _ in range(5000):
-            n=int(rng.choice(nodes));a=int(rng.integers(WARMUP+5,cfg.n_intervals-length-5));b=a+length-1
+            n=int(rng.choice(nodes));a=int(rng.integers(max(WARMUP+5,DEPLOY_BASELINE),cfg.n_intervals-length-5));b=a+length-1
             if all(b+3<x or a>y+3 for x,y in occ[n]):
                 occ[n].append((a,b));eps.append(Episode(kind=kind,nid=n,t0=a,t1=b,**kwargs));return
         raise RuntimeError("no nonoverlapping slot")
