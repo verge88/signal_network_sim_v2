@@ -1,0 +1,19 @@
+name: SS7 commissioning CUSUM lint
+on:
+  push:
+    branches: [ss7-anti-overfit-development]
+    paths:
+      - .github/workflows/ss7-commissioning-cusum-lint.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m py_compile ss7/naive_commissioning_cusum_audit.py ss7/naive_role_union_rank_audit.py
