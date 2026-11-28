@@ -1,0 +1,38 @@
+name: SS7 commissioning development worlds
+on:
+  push:
+    branches: [ss7-anti-overfit-development]
+    paths:
+      - .github/workflows/ss7-commissioning-development-worlds.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  OMP_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  SS7_ROLE_ABUSE_V2: "1"
+  SS7_DEPLOY_BASELINE: "180"
+jobs:
+  worlds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        seed: [23001,23002,23003,23201,23202]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy==2.4.6 pandas==3.1.1 scipy==1.17.1 scikit-learn==1.9.1 networkx==3.6.1 joblib==1.6.0
+      - run: python -m py_compile ss7/cu_compact_channel_development.py
+      - run: python -u -m ss7.cu_compact_channel_development selftest
+      - run: python -u -m ss7.cu_compact_channel_development generate --arm compact --seed ${{ matrix.seed }} --output results/world
+      - uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-world-compact-${{ matrix.seed }}
+          path: results/world
+          retention-days: 7
